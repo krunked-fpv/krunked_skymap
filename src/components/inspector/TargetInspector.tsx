@@ -22,10 +22,12 @@ import { useSkyStore } from '../../store/useSkyStore';
 import {
   formatAltitude,
   formatAzEl,
+  formatClockTime,
   formatCoords,
   formatDistance,
   formatDoppler,
   formatHeading,
+  formatRelativeAge,
   formatShortRangeM,
   formatSpeed,
   formatVerticalRate,
@@ -70,6 +72,7 @@ export function TargetInspector() {
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
 
   const [copied, setCopied] = useState(false);
+  const [, setClockTick] = useState(0);
   const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -89,6 +92,14 @@ export function TargetInspector() {
   }, []);
 
   const isOpen = inspectorOpen && entity !== null;
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const timer = window.setInterval(() => {
+      setClockTick((t) => (t + 1) % 1_000_000);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isOpen]);
 
   const handleCopyPermalink = async () => {
     if (!entity || typeof window === 'undefined') return;
@@ -154,6 +165,12 @@ export function TargetInspector() {
 
   const accent = getCategoryAccent(entity);
   const vert = formatVerticalRate(entity.vertRateMs, units);
+  const observationClock = formatClockTime(entity.timestampMs, '--:--:--');
+  const observationAge = formatRelativeAge(entity.timestampMs, Date.now());
+  const observationLabel =
+    observationClock === '--:--:--'
+      ? '--:--:--'
+      : `${observationClock} · ${observationAge}`;
   const { azText, elText } = formatAzEl(
     entity.topocentric.azimuthDeg,
     entity.topocentric.elevationDeg,
@@ -294,8 +311,15 @@ export function TargetInspector() {
 
             <div className="telemetry-cell">
               <div className="telemetry-cell__label">HEADING / TRACK</div>
-              <div className="telemetry-cell__value tabular">
-                {formatHeading(entity.headingDeg)}
+              <div
+                className="telemetry-cell__value tabular"
+                style={
+                  entity.headingValid === false
+                    ? { color: 'var(--text-secondary)' }
+                    : undefined
+                }
+              >
+                {formatHeading(entity.headingDeg, entity.headingValid)}
               </div>
             </div>
 
@@ -309,6 +333,11 @@ export function TargetInspector() {
             <div className="telemetry-cell">
               <div className="telemetry-cell__label">ORIGIN / COUNTRY</div>
               <div className="telemetry-cell__value">{entity.country || 'Unknown'}</div>
+            </div>
+
+            <div className="telemetry-cell telemetry-cell--wide">
+              <div className="telemetry-cell__label">LAST UPDATED</div>
+              <div className="telemetry-cell__value tabular">{observationLabel}</div>
             </div>
           </div>
         </section>

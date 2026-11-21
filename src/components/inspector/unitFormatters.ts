@@ -26,7 +26,8 @@ export function compassCardinal(deg: number): string {
   return COMPASS_POINTS[idx];
 }
 
-export function formatHeading(headingDeg: number): string {
+export function formatHeading(headingDeg: number, headingValid = true): string {
+  if (headingValid === false) return 'TRACK UNKNOWN';
   if (!Number.isFinite(headingDeg)) return '—';
   const normalized = Math.round(((headingDeg % 360) + 360) % 360) % 360;
   return `${normalized.toString().padStart(3, '0')}° ${compassCardinal(normalized)}`;
@@ -133,4 +134,56 @@ export function formatDoppler(dopplerHz: number): string {
     return `${sign}${(absHz / 1000).toFixed(2)} kHz`;
   }
   return `${sign}${Math.round(absHz)} Hz`;
+}
+
+/**
+ * Formats an epoch timestamp (ms) into local `HH:MM:SS` 24-hour clock string.
+ */
+export function formatClockTime(
+  timestampMs: number | null | undefined,
+  emptyText = '--:--:--',
+): string {
+  if (
+    timestampMs === null ||
+    timestampMs === undefined ||
+    !Number.isFinite(timestampMs) ||
+    timestampMs <= 0
+  ) {
+    return emptyText;
+  }
+  const date = new Date(timestampMs);
+  if (Number.isNaN(date.getTime())) return emptyText;
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  return `${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Formats relative observation age (`Xs ago` under 1 min, `Xm Ys ago` under 1 hr).
+ */
+export function formatRelativeAge(
+  timestampMs: number | null | undefined,
+  nowMs: number = Date.now(),
+): string {
+  if (
+    timestampMs === null ||
+    timestampMs === undefined ||
+    !Number.isFinite(timestampMs) ||
+    timestampMs <= 0
+  ) {
+    return '—';
+  }
+  const ageSec = Math.max(0, Math.round((nowMs - timestampMs) / 1000));
+  if (ageSec < 60) {
+    return `${ageSec}s ago`;
+  }
+  if (ageSec < 3600) {
+    const mins = Math.floor(ageSec / 60);
+    const secs = ageSec % 60;
+    return `${mins}m ${secs}s ago`;
+  }
+  const hours = Math.floor(ageSec / 3600);
+  const mins = Math.floor((ageSec % 3600) / 60);
+  return `${hours}h ${mins}m ago`;
 }

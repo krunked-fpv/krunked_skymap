@@ -58,9 +58,13 @@ body,
 #root {
   margin: 0;
   padding: 0;
-  width: 100%;
-  height: 100%;
+  width: 100dvw;
+  height: 100dvh;
+  max-width: 100dvw;
+  max-height: 100dvh;
   overflow: hidden;
+  overscroll-behavior: none;
+  overscroll-behavior-y: none;
   background-color: var(--bg-void);
   color: var(--text-primary);
   font-family: var(--font-sans);
@@ -86,6 +90,8 @@ select {
 .cockpit-scroll {
   scrollbar-width: thin;
   scrollbar-color: rgba(120, 190, 255, 0.24) transparent;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .cockpit-scroll::-webkit-scrollbar {
@@ -119,6 +125,7 @@ select {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  overscroll-behavior: none;
   background:
     radial-gradient(ellipse 80% 45% at 50% -10%, rgba(34, 211, 238, 0.08), transparent 65%),
     radial-gradient(ellipse 55% 40% at 85% 105%, rgba(192, 132, 252, 0.06), transparent 60%),
@@ -223,12 +230,17 @@ select {
   z-index: 40;
   flex-shrink: 0;
   width: 100%;
+  max-width: 100%;
   min-height: var(--topbar-height);
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 6px 12px;
+  padding:
+    max(6px, env(safe-area-inset-top))
+    max(12px, env(safe-area-inset-right))
+    6px
+    max(12px, env(safe-area-inset-left));
   background: var(--bg-panel-strong);
   backdrop-filter: var(--glass-blur);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -416,11 +428,49 @@ select {
   box-shadow: 0 0 7px var(--cat-balloon);
 }
 
+.topbar-feed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-hairline);
+  background: rgba(11, 17, 30, 0.78);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-feed-pill__status {
+  font-weight: 700;
+  letter-spacing: 0.05em;
+}
+
+.topbar-feed-pill__sep {
+  opacity: 0.5;
+}
+
+.topbar-feed-pill__count {
+  color: var(--text-bright);
+  font-weight: 700;
+}
+
+.topbar-feed-pill__time {
+  color: var(--text-secondary);
+}
+
 .topbar-controls {
   display: flex;
   align-items: center;
   gap: 7px;
   flex-shrink: 0;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .segmented-control {
@@ -541,6 +591,64 @@ select {
   box-shadow: 0 0 7px var(--accent-sky);
 }
 
+.pwa-install-pill {
+  display: inline-flex;
+  align-items: stretch;
+  max-width: 100%;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: rgba(56, 189, 248, 0.11);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.pwa-install-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 32px;
+  padding: 4px 9px;
+  border: none;
+  background: transparent;
+  color: var(--accent-sky);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  white-space: nowrap;
+  touch-action: manipulation;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.pwa-install-btn:hover {
+  background: rgba(56, 189, 248, 0.2);
+  color: var(--text-bright);
+}
+
+.pwa-dismiss-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0 7px;
+  border: none;
+  border-left: 1px solid rgba(56, 189, 248, 0.26);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  touch-action: manipulation;
+  transition: background 140ms ease, color 140ms ease;
+}
+
+.pwa-dismiss-btn:hover {
+  background: rgba(239, 68, 68, 0.18);
+  color: var(--text-bright);
+}
+
 /* ==========================================================================
    ControlDock (Floating Glass Sidebar on Left of Stage)
    ========================================================================== */
@@ -548,8 +656,8 @@ select {
 .control-dock-wrap {
   position: absolute;
   top: 12px;
-  left: 12px;
-  bottom: 12px;
+  left: max(12px, env(safe-area-inset-left));
+  bottom: max(12px, env(safe-area-inset-bottom));
   z-index: 25;
   display: flex;
   align-items: flex-start;
@@ -1003,6 +1111,24 @@ select {
   color: #6ee7b7;
 }
 
+.feed-pill--delayed {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.42);
+  color: #fcd34d;
+}
+
+.feed-pill--rate-limited {
+  background: rgba(249, 115, 22, 0.16);
+  border-color: rgba(249, 115, 22, 0.45);
+  color: #fdba74;
+}
+
+.feed-pill--offline {
+  background: rgba(244, 63, 94, 0.16);
+  border-color: rgba(244, 63, 94, 0.42);
+  color: #fda4af;
+}
+
 .feed-pill--cached {
   background: rgba(56, 189, 248, 0.14);
   border-color: rgba(56, 189, 248, 0.34);
@@ -1031,6 +1157,85 @@ select {
   background: rgba(100, 116, 139, 0.16);
   border-color: rgba(100, 116, 139, 0.3);
   color: #94a3b8;
+}
+
+.dock-feed-diag {
+  margin-top: 2px;
+  padding: 8px 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-hairline);
+  background: rgba(8, 14, 26, 0.78);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dock-feed-diag__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.dock-feed-diag__title {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+}
+
+.dock-feed-diag__meta {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  align-items: center;
+}
+
+.dock-feed-diag__key {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.dock-feed-diag__val {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-primary);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dock-feed-diag__notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(245, 158, 11, 0.34);
+  background: rgba(245, 158, 11, 0.1);
+  color: #fde68a;
+  font-size: 10px;
+  line-height: 1.38;
+}
+
+.dock-feed-diag__notice.is-critical {
+  border-color: rgba(239, 68, 68, 0.38);
+  background: rgba(239, 68, 68, 0.12);
+  color: #fecaca;
+}
+
+.dock-feed-diag__error-detail {
+  display: block;
+  margin-top: 2px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  opacity: 0.9;
+  word-break: break-word;
 }
 
 .countdown-ring-wrap {
@@ -1393,7 +1598,7 @@ select {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 8px;
-  padding: 10px 14px 12px;
+  padding: 10px 14px max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid var(--border-hairline);
   background: rgba(10, 16, 28, 0.88);
   flex-shrink: 0;
@@ -1444,7 +1649,11 @@ select {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
+  padding:
+    max(16px, env(safe-area-inset-top))
+    max(16px, env(safe-area-inset-right))
+    max(16px, env(safe-area-inset-bottom))
+    max(16px, env(safe-area-inset-left));
   background: rgba(3, 6, 12, 0.72);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
@@ -1597,25 +1806,50 @@ select {
 }
 
 /* ==========================================================================
+   Compact Desktop / Tablet Wrapping (<= 1360px)
+   ========================================================================== */
+
+@media (max-width: 1360px) {
+  .top-telemetry-bar {
+    flex-wrap: wrap;
+    gap: 6px 10px;
+  }
+
+  .topbar-brand-group,
+  .topbar-counters,
+  .topbar-controls {
+    max-width: 100%;
+    min-width: 0;
+  }
+}
+
+/* ==========================================================================
    Responsive Mobile Breakpoint (<= 860px)
    Zero horizontal overflow, wrapped TopTelemetryBar, collapsible ControlDock,
-   and 55dvh bottom-sheet TargetInspector.
+   >= 32px touch targets, safe-area compliance, and 55dvh bottom-sheet TargetInspector.
    ========================================================================== */
 
 @media (max-width: 860px) {
   .top-telemetry-bar {
     flex-wrap: wrap;
     gap: 6px 8px;
-    padding: 6px 10px;
+    padding:
+      max(6px, env(safe-area-inset-top))
+      max(10px, env(safe-area-inset-right))
+      6px
+      max(10px, env(safe-area-inset-left));
   }
 
   .topbar-brand-group {
     width: 100%;
     justify-content: space-between;
+    gap: 6px;
   }
 
   .topbar-observer-pill {
-    max-width: 54%;
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: none;
   }
 
   .topbar-observer-coords {
@@ -1624,18 +1858,48 @@ select {
 
   .topbar-counters {
     width: 100%;
-    gap: 4px;
+    min-width: 0;
+    gap: 5px;
   }
 
   .topbar-controls {
     width: 100%;
+    min-width: 0;
     flex-wrap: wrap;
-    justify-content: space-between;
-    gap: 5px;
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .counter-badge {
+    min-height: 32px;
+    padding: 4px 8px;
+    touch-action: manipulation;
+  }
+
+  .segmented-control,
+  .audio-control-group {
+    min-height: 32px;
+    max-width: 100%;
+  }
+
+  .segmented-btn,
+  .hud-icon-btn,
+  .odid-trigger-btn,
+  .pwa-install-btn {
+    min-height: 32px;
+    touch-action: manipulation;
+  }
+
+  .pwa-dismiss-btn {
+    min-width: 32px;
+    min-height: 32px;
+    touch-action: manipulation;
   }
 
   .audio-slider {
-    width: 40px;
+    width: 44px;
+    min-height: 24px;
+    touch-action: manipulation;
   }
 
   .skymap-stage,
@@ -1655,14 +1919,31 @@ select {
 
   .control-dock-wrap {
     top: 8px;
-    left: 8px;
-    right: 8px;
-    bottom: 8px;
+    left: max(8px, env(safe-area-inset-left));
+    right: max(8px, env(safe-area-inset-right));
+    bottom: max(8px, env(safe-area-inset-bottom));
   }
 
   .control-dock {
-    width: min(336px, calc(100dvw - 16px));
-    max-height: calc(100% - 4px);
+    width: min(350px, 100%);
+    max-width: 100%;
+    max-height: 100%;
+  }
+
+  .control-dock-collapsed-pill,
+  .control-dock__collapse-btn,
+  .dock-gps-btn,
+  .dock-scope-btn,
+  .layer-row,
+  .sat-chip,
+  .dock-sweep-btn {
+    min-height: 32px;
+    touch-action: manipulation;
+  }
+
+  .dock-input,
+  .dock-select {
+    min-height: 34px;
   }
 
   .target-inspector {
@@ -1672,7 +1953,7 @@ select {
     bottom: 0;
     width: 100%;
     max-width: 100%;
-    max-height: 55dvh;
+    max-height: calc(55dvh + env(safe-area-inset-bottom));
     border-radius: 14px 14px 0 0;
     border-bottom: none;
     transform: translateY(105%);
@@ -1690,6 +1971,27 @@ select {
     background: rgba(148, 163, 184, 0.35);
     margin: 7px auto 0;
     flex-shrink: 0;
+  }
+
+  .target-inspector__footer {
+    padding:
+      10px
+      max(14px, env(safe-area-inset-right))
+      max(12px, env(safe-area-inset-bottom))
+      max(14px, env(safe-area-inset-left));
+  }
+
+  .inspector-close-btn {
+    width: 34px;
+    height: 34px;
+    touch-action: manipulation;
+  }
+
+  .inspector-action-btn,
+  .modal-switch-btn,
+  .modal-btn {
+    min-height: 36px;
+    touch-action: manipulation;
   }
 
   .modal-url-row {
@@ -1743,4 +2045,9 @@ select {
 .maplibregl-ctrl-attrib-button {
   background-color: rgba(11, 17, 30, 0.9) !important;
   filter: invert(0.82);
+}
+
+[data-layout='map'] .maplibregl-ctrl-bottom-right {
+  bottom: env(safe-area-inset-bottom);
+  right: env(safe-area-inset-right);
 }
