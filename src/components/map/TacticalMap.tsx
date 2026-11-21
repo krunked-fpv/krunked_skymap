@@ -40,6 +40,102 @@ interface HoverTooltipState {
 }
 
 const DEG_TO_RAD = Math.PI / 180;
+const MONO_FONT =
+  "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace";
+
+interface LabelBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+function boxesOverlap(a: LabelBox, b: LabelBox): boolean {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function overlapsAny(box: LabelBox, existing: LabelBox[]): boolean {
+  for (let i = 0; i < existing.length; i += 1) {
+    if (boxesOverlap(box, existing[i])) return true;
+  }
+  return false;
+}
+
+function traceRoundedRect(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  r: number
+): void {
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(x, y, w, h, r);
+    return;
+  }
+  const radius = Math.min(r, w / 2, h / 2);
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+
+function isAlertEntity(entity: SkyEntity): boolean {
+  return Boolean(
+    entity.emergencyFlag ||
+      ((entity.category === 'flight' || entity.category === 'military') &&
+        (entity.squawk === '7700' || entity.squawk === '7600' || entity.squawk === '7500')) ||
+      (entity.category === 'drone' && (entity.ceilingBreach || entity.tfrBreach))
+  );
+}
+
+function getEntitySortKey(
+  entity: SkyEntity,
+  isSelected: boolean,
+  isHovered: boolean,
+  isAlert: boolean
+): number {
+  if (isSelected) return 1000;
+  if (isHovered) return 900;
+  if (isAlert) return 800;
+  switch (entity.category) {
+    case 'military':
+      return 500;
+    case 'flight':
+      return entity.isMilitary ? 500 : 400;
+    case 'balloon':
+      return 350;
+    case 'drone':
+      return 300;
+    case 'satellite':
+      return entity.group === 'starlink' ? 100 : 250;
+  }
+}
+
+function getLabelPriority(
+  entity: SkyEntity,
+  isSelected: boolean,
+  isHovered: boolean,
+  isAlert: boolean
+): number {
+  if (isSelected) return 1000;
+  if (isHovered) return 900;
+  if (isAlert) return 800;
+  switch (entity.category) {
+    case 'military':
+      return 500;
+    case 'flight':
+      return entity.isMilitary ? 500 : 400;
+    case 'balloon':
+      return 460;
+    case 'drone':
+      return 430;
+    case 'satellite':
+      return entity.group === 'starlink' ? 100 : 250;
+  }
+}
 
 const EMPTY_FC: GeoJSON.FeatureCollection = {
   type: 'FeatureCollection',
@@ -390,23 +486,21 @@ function buildEntitiesAndOperatorsFc(
   const phase = (Math.sin(nowMs * 0.0065) + 1) * 0.5;
   const entityFeatures: GeoJSON.Feature<GeoJSON.Point>[] = [];
   const operatorFeatures: GeoJSON.Feature<GeoJSON.Point>[] = [];
+  const seenIds = new Set<string>();
 
   for (const entity of liveKinematicsRegistry.entities.values()) {
     if (!layers[entity.category]) continue;
+    if (seenIds.has(entity.id)) continue;
     if (!Number.isFinite(entity.lat) || !Number.isFinite(entity.lon)) continue;
+    seenIds.add(entity.id);
 
     const isSelected = entity.id === selectedId;
     const isHovered = entity.id === hoveredId;
-    const isAlert = Boolean(
-      entity.emergencyFlag ||
-        ((entity.category === 'flight' || entity.category === 'military') &&
-          (entity.squawk === '7700' || entity.squawk === '7600' || entity.squawk === '7500')) ||
-        (entity.category === 'drone' && (entity.ceilingBreach || entity.tfrBreach))
-    );
+    const isAlert = isAlertEntity(entity);
 
     const color = resolveEntityColor(entity);
     const headingDeg =
-      entity.category === 'balloon'
+      entity.category === 'balloon' || entity.headingValid === false
         ? 0
         : Number.isFinite(entity.headingDeg)
           ? entity.headingDeg
@@ -416,6 +510,8 @@ function buildEntitiesAndOperatorsFc(
     if (entity.category === 'flight' && entity.airframeClass === 'heavy') iconScale = 0.94;
     if (entity.category === 'military') iconScale = 0.92;
     if (isSelected || isHovered) iconScale += 0.18;
+
+    const sortKey = getEntitySortKey(entity, isSelected, isHovered, isAlert);
 
     entityFeatures.push({
       type: 'Feature',
@@ -431,6 +527,7 @@ function buildEntitiesAndOperatorsFc(
         isAlert,
         belowHorizon: entity.topocentric.belowHorizon,
         iconScale,
+        sortKey,
         pulseRadius: isSelected ? 18 + phase * 6 : 15 + phase * 3,
         pulseOpacity: isSelected ? 0.95 - phase * 0.35 : 0.72 - phase * 0.25,
         alertRadius: 17 + phase * 6,
@@ -471,10 +568,13 @@ function buildTrailsAndVectorsFc(
   layers: Record<SkyEntity['category'], boolean>
 ): GeoJSON.FeatureCollection {
   const trailFeatures: GeoJSON.Feature[] = [];
+  const seenIds = new Set<string>();
 
   for (const entity of liveKinematicsRegistry.entities.values()) {
     if (!layers[entity.category]) continue;
+    if (seenIds.has(entity.id)) continue;
     if (!Number.isFinite(entity.lat) || !Number.isFinite(entity.lon)) continue;
+    seenIds.add(entity.id);
 
     const color = resolveEntityColor(entity);
 
@@ -501,6 +601,7 @@ function buildTrailsAndVectorsFc(
       entity.category === 'flight' || entity.category === 'military' ? !entity.onGround : true;
     if (
       isAirborne &&
+      entity.headingValid !== false &&
       Number.isFinite(entity.speedMs) &&
       entity.speedMs > 2 &&
       Number.isFinite(entity.headingDeg)
@@ -772,6 +873,8 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     layout: {
       'icon-image': 'sprite-operator',
       'icon-size': 0.72,
+      'icon-anchor': 'center',
+      'icon-pitch-alignment': 'map',
       'icon-allow-overlap': true,
       'icon-ignore-placement': true,
     },
@@ -783,6 +886,8 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     layout: {
       'icon-image': 'sprite-observer',
       'icon-size': 0.9,
+      'icon-anchor': 'center',
+      'icon-pitch-alignment': 'map',
       'icon-allow-overlap': true,
       'icon-ignore-placement': true,
     },
@@ -800,6 +905,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
       'circle-stroke-color': ['get', 'color'],
       'circle-stroke-width': 1.8,
       'circle-stroke-opacity': ['coalesce', ['get', 'alertOpacity'], 0.8],
+      'circle-pitch-alignment': 'map',
     },
   });
   map.addLayer({
@@ -813,6 +919,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
       'circle-stroke-color': ['case', ['==', ['get', 'isSelected'], true], '#F8FAFC', ['get', 'color']],
       'circle-stroke-width': ['case', ['==', ['get', 'isSelected'], true], 2.2, 1.5],
       'circle-stroke-opacity': ['coalesce', ['get', 'pulseOpacity'], 0.9],
+      'circle-pitch-alignment': 'map',
     },
   });
   map.addLayer({
@@ -821,9 +928,22 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     source: SOURCE_IDS.entities,
     layout: {
       'icon-image': ['get', 'sprite'],
-      'icon-size': ['coalesce', ['get', 'iconScale'], 0.85],
+      'icon-size': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        4,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.68],
+        8,
+        ['coalesce', ['get', 'iconScale'], 0.85],
+        12,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 1.15],
+      ],
       'icon-rotate': ['get', 'headingDeg'],
       'icon-rotation-alignment': 'map',
+      'icon-anchor': 'center',
+      'icon-pitch-alignment': 'map',
+      'symbol-sort-key': ['get', 'sortKey'],
       'icon-allow-overlap': true,
       'icon-ignore-placement': true,
     },
@@ -835,14 +955,22 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
 
 export function TacticalMap({ className }: TacticalMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const labelCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const scaleControlRef = useRef<maplibregl.ScaleControl | null>(null);
+  const drawMapLabelsRef = useRef<(() => void) | null>(null);
   const mapLoadedRef = useRef(false);
   const isPointerDownRef = useRef(false);
   const lastEaseMsRef = useRef(0);
+  const labelMetricsRef = useRef<{ width: number; height: number; dpr: number }>({
+    width: 0,
+    height: 0,
+    dpr: 1,
+  });
 
   const observer = useSkyStore((s) => s.observer);
   const radiusKm = useSkyStore((s) => s.radiusKm);
+  const recenterNonce = useSkyStore((s) => s.recenterNonce);
   const layers = useSkyStore((s) => s.layers);
   const airspace = useSkyStore((s) => s.airspace);
   const selectedId = useSkyStore((s) => s.selectedId);
@@ -851,6 +979,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
   const units = useSkyStore((s) => s.units);
   const layout = useSkyStore((s) => s.layout);
   const counts = useSkyStore((s) => s.counts);
+  const mapLabelsEnabled = useSkyStore((s) => s.mapLabelsEnabled);
+  const setMapLabelsEnabled = useSkyStore((s) => s.setMapLabelsEnabled);
 
   const [webglError, setWebglError] = useState<string | null>(null);
   const [hoverTip, setHoverTip] = useState<HoverTooltipState | null>(null);
@@ -860,6 +990,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
     lat: observer.lat,
     lon: observer.lon,
   });
+  const prevRadiusRef = useRef<number>(radiusKm);
+  const prevRecenterNonceRef = useRef<number>(recenterNonce);
 
   // Initialize MapLibre once
   useEffect(() => {
@@ -875,6 +1007,12 @@ export function TacticalMap({ className }: TacticalMapProps) {
     let map: maplibregl.Map;
     const initialState = useSkyStore.getState();
     const mountObserver = { lat: initialState.observer.lat, lon: initialState.observer.lon };
+    const mountRadiusKm = initialState.radiusKm;
+    const mountRecenterNonce = initialState.recenterNonce;
+
+    prevObserverRef.current = mountObserver;
+    prevRadiusRef.current = mountRadiusKm;
+    prevRecenterNonceRef.current = mountRecenterNonce;
 
     try {
       map = new maplibregl.Map({
@@ -884,6 +1022,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
         zoom: zoomForRadiusKm(initialState.radiusKm, initialState.observer.lat),
         minZoom: 1.5,
         maxZoom: 18,
+        pitch: 0,
+        maxPitch: 0,
+        touchPitch: false,
         pitchWithRotate: false,
         dragRotate: true,
         attributionControl: { compact: true },
@@ -906,6 +1047,234 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
     map.addControl(new maplibregl.NavigationControl({ showCompass: true, showZoom: true }), 'bottom-right');
     map.addControl(scaleControl, 'bottom-right');
+
+    const syncLabelCanvasSize = (w: number, h: number) => {
+      const labelCanvas = labelCanvasRef.current;
+      if (!labelCanvas) return;
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const targetW = Math.max(0, Math.round(w * dpr));
+      const targetH = Math.max(0, Math.round(h * dpr));
+      if (labelCanvas.width !== targetW || labelCanvas.height !== targetH) {
+        labelCanvas.width = targetW;
+        labelCanvas.height = targetH;
+      }
+      labelMetricsRef.current = { width: w, height: h, dpr };
+    };
+
+    const initialRect = container.getBoundingClientRect();
+    syncLabelCanvasSize(initialRect.width, initialRect.height);
+
+    const drawMapLabels = () => {
+      const labelCanvas = labelCanvasRef.current;
+      if (!labelCanvas) return;
+      const ctx = labelCanvas.getContext('2d');
+      if (!ctx) return;
+
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      if (
+        labelMetricsRef.current.dpr !== dpr &&
+        labelMetricsRef.current.width > 0 &&
+        labelMetricsRef.current.height > 0
+      ) {
+        syncLabelCanvasSize(labelMetricsRef.current.width, labelMetricsRef.current.height);
+      }
+
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, labelCanvas.width, labelCanvas.height);
+      ctx.restore();
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const activeMap = mapRef.current;
+      const state = useSkyStore.getState();
+      const { width, height } = labelMetricsRef.current;
+      if (
+        !activeMap ||
+        !mapLoadedRef.current ||
+        state.layout === 'dome' ||
+        (typeof document !== 'undefined' && document.hidden) ||
+        width <= 0 ||
+        height <= 0
+      ) {
+        return;
+      }
+
+      const zoom = activeMap.getZoom();
+      const maxAutoLabels = zoom < 5.5 ? 0 : zoom < 7.5 ? 10 : zoom < 9.5 ? 22 : 42;
+
+      interface LabelCandidate {
+        entity: SkyEntity;
+        px: number;
+        py: number;
+        priority: number;
+        isSelected: boolean;
+        isHovered: boolean;
+        isAlert: boolean;
+        color: string;
+      }
+
+      const seenIds = new Set<string>();
+      const candidates: LabelCandidate[] = [];
+      const spriteBoxes: LabelBox[] = [];
+
+      for (const entity of liveKinematicsRegistry.entities.values()) {
+        if (!state.layers[entity.category]) continue;
+        if (seenIds.has(entity.id)) continue;
+        if (!Number.isFinite(entity.lat) || !Number.isFinite(entity.lon)) continue;
+        seenIds.add(entity.id);
+
+        const pt = activeMap.project([normalizeLonDeg(entity.lon), entity.lat]);
+        if (
+          !Number.isFinite(pt.x) ||
+          !Number.isFinite(pt.y) ||
+          pt.x < 0 ||
+          pt.x > width ||
+          pt.y < 0 ||
+          pt.y > height
+        ) {
+          continue;
+        }
+
+        // Reserve each sprite's central 22x22 icon bounding box
+        spriteBoxes.push({ x: pt.x - 11, y: pt.y - 11, w: 22, h: 22 });
+
+        const isSelected = entity.id === state.selectedId;
+        const isHovered = entity.id === state.hoveredId;
+        const isAlert = isAlertEntity(entity);
+
+        if (!state.mapLabelsEnabled && !isSelected && !isHovered) {
+          continue;
+        }
+        if (state.mapLabelsEnabled && zoom < 5.5 && !isSelected && !isHovered && !isAlert) {
+          continue;
+        }
+
+        candidates.push({
+          entity,
+          px: pt.x,
+          py: pt.y,
+          priority: getLabelPriority(entity, isSelected, isHovered, isAlert),
+          isSelected,
+          isHovered,
+          isAlert,
+          color: resolveEntityColor(entity),
+        });
+      }
+
+      if (candidates.length === 0) return;
+
+      candidates.sort((a, b) => b.priority - a.priority);
+
+      const placedLabelBoxes: LabelBox[] = [];
+      let autoDrawn = 0;
+
+      ctx.save();
+      ctx.font = `600 9.5px ${MONO_FONT}`;
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+
+      for (const item of candidates) {
+        const mustShow = item.isSelected || item.isHovered;
+        const zoomAlertBypass = state.mapLabelsEnabled && zoom < 5.5 && item.isAlert;
+        if (!mustShow && !zoomAlertBypass && autoDrawn >= maxAutoLabels) {
+          continue;
+        }
+
+        const rawCallsign = item.entity.callsign || item.entity.id;
+        const callsignText =
+          rawCallsign.length > 18 ? `${rawCallsign.slice(0, 17)}…` : rawCallsign;
+        const altText = formatAltitudeCompact(item.entity, state.units);
+        const vRate = item.entity.vertRateMs;
+        const vRateChevron =
+          Number.isFinite(vRate) && Math.abs(vRate) >= 1.5 ? (vRate > 0 ? ' ↑' : ' ↓') : '';
+
+        const metaText = ` · ${altText}`;
+        const fullText = `${callsignText}${metaText}${vRateChevron}`;
+        const callsignW = ctx.measureText(callsignText).width;
+        const metaW = ctx.measureText(metaText).width;
+        const fullW = ctx.measureText(fullText).width;
+        const boxW = Math.ceil(fullW) + 10;
+        const boxH = 15;
+        const offset = 14;
+
+        const slots: Array<{ x: number; y: number }> = [
+          { x: item.px + offset, y: item.py - boxH / 2 },
+          { x: item.px - offset - boxW, y: item.py - boxH / 2 },
+          { x: item.px - boxW / 2, y: item.py - offset - boxH },
+          { x: item.px - boxW / 2, y: item.py + offset },
+        ];
+
+        let chosenBox: LabelBox | null = null;
+        for (const slot of slots) {
+          if (
+            slot.x < 6 ||
+            slot.x + boxW > width - 6 ||
+            slot.y < 6 ||
+            slot.y + boxH > height - 6
+          ) {
+            continue;
+          }
+          const candidateBox: LabelBox = { x: slot.x, y: slot.y, w: boxW, h: boxH };
+          if (
+            !overlapsAny(candidateBox, spriteBoxes) &&
+            !overlapsAny(candidateBox, placedLabelBoxes)
+          ) {
+            chosenBox = candidateBox;
+            break;
+          }
+        }
+
+        if (!chosenBox) {
+          if (!mustShow) continue;
+          const preferLeft = item.px + offset + boxW > width - 6;
+          const fx = Math.max(
+            6,
+            Math.min(width - boxW - 6, preferLeft ? item.px - offset - boxW : item.px + offset)
+          );
+          const fy = Math.max(6, Math.min(height - boxH - 6, item.py - boxH / 2));
+          chosenBox = { x: fx, y: fy, w: boxW, h: boxH };
+        }
+
+        placedLabelBoxes.push(chosenBox);
+        if (!mustShow) {
+          autoDrawn += 1;
+        }
+
+        const { x: lx, y: ly } = chosenBox;
+        ctx.fillStyle = mustShow
+          ? 'rgba(9, 15, 28, 0.94)'
+          : item.isAlert
+            ? 'rgba(28, 10, 16, 0.90)'
+            : 'rgba(6, 11, 20, 0.84)';
+        ctx.strokeStyle = mustShow || item.isAlert ? item.color : 'rgba(120, 190, 255, 0.24)';
+        ctx.lineWidth = mustShow || item.isAlert ? 1.1 : 0.8;
+        ctx.beginPath();
+        traceRoundedRect(ctx, lx, ly, boxW, boxH, 3.5);
+        ctx.fill();
+        ctx.stroke();
+
+        const tx = lx + 5;
+        const ty = ly + boxH / 2 + 0.5;
+        ctx.fillStyle = mustShow
+          ? '#F8FAFC'
+          : item.entity.topocentric.belowHorizon
+            ? '#94A3B8'
+            : '#E2E8F0';
+        ctx.fillText(callsignText, tx, ty);
+
+        ctx.fillStyle = item.isAlert ? '#FCA5A5' : '#94A3B8';
+        ctx.fillText(metaText, tx + callsignW, ty);
+
+        if (vRateChevron) {
+          ctx.fillStyle = vRate > 0 ? '#34D399' : '#F59E0B';
+          ctx.fillText(vRateChevron, tx + callsignW + metaW, ty);
+        }
+      }
+
+      ctx.restore();
+    };
+
+    drawMapLabelsRef.current = drawMapLabels;
 
     const handleCanvasContextLost = (ev: Event) => {
       ev.preventDefault();
@@ -955,19 +1324,26 @@ export function TacticalMap({ className }: TacticalMapProps) {
       isPointerDownRef.current = false;
     };
 
-    map.on('error', (ev) => {
+    const handleMapError = (ev: maplibregl.MapEventType['error']) => {
       // Swallow tile/network errors quietly without throwing uncaught exceptions.
       const msg = ev?.error?.message ?? '';
       if (!mapLoadedRef.current && /webgl/i.test(msg)) {
         setWebglError(msg || 'WebGL context initialization failed.');
       }
-    });
+    };
+
+    map.on('error', handleMapError);
     map.on('dragstart', handleDragStart);
     map.on('dragend', handleDragEnd);
     map.on('touchstart', handleDragStart);
     map.on('touchend', handleDragEnd);
+    map.on('move', drawMapLabels);
+    map.on('zoom', drawMapLabels);
+    map.on('rotate', drawMapLabels);
+    map.on('resize', drawMapLabels);
 
     let layersInitialized = false;
+    let contextLostListenerAttached = false;
     const initMapLayers = () => {
       if (cancelled || layersInitialized) return;
       layersInitialized = true;
@@ -977,10 +1353,19 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
       const canvas = map.getCanvas();
       canvas.addEventListener('webglcontextlost', handleCanvasContextLost);
+      contextLostListenerAttached = true;
 
       const st = useSkyStore.getState();
+      const shiftFromMountKm = haversineDistanceKm(
+        mountObserver.lat,
+        mountObserver.lon,
+        st.observer.lat,
+        st.observer.lon
+      );
       if (
-        haversineDistanceKm(mountObserver.lat, mountObserver.lon, st.observer.lat, st.observer.lon) > 1
+        shiftFromMountKm > 0.01 ||
+        st.radiusKm !== mountRadiusKm ||
+        st.recenterNonce !== mountRecenterNonce
       ) {
         map.jumpTo({
           center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
@@ -988,6 +1373,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
         });
       }
       prevObserverRef.current = { lat: st.observer.lat, lon: st.observer.lon };
+      prevRadiusRef.current = st.radiusKm;
+      prevRecenterNonceRef.current = st.recenterNonce;
+
       (map.getSource(SOURCE_IDS.uasfm) as maplibregl.GeoJSONSource | undefined)?.setData(
         st.airspace.uasfm ?? EMPTY_FC
       );
@@ -1025,12 +1413,17 @@ export function TacticalMap({ className }: TacticalMapProps) {
       map.on('mousemove', LAYER_IDS.entitiesSymbol, handleMouseMove);
       map.on('mouseleave', LAYER_IDS.entitiesSymbol, handleMouseLeave);
       map.on('click', LAYER_IDS.entitiesSymbol, handleClick);
+
+      drawMapLabels();
     };
 
     map.on('style.load', initMapLayers);
     map.on('load', initMapLayers);
 
-    const resizeObserver = new ResizeObserver(() => {
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        syncLabelCanvasSize(entry.contentRect.width, entry.contentRect.height);
+      }
       if (mapRef.current) {
         try {
           mapRef.current.resize();
@@ -1038,8 +1431,16 @@ export function TacticalMap({ className }: TacticalMapProps) {
           // Ignore transient resize errors during teardown
         }
       }
+      drawMapLabels();
     });
     resizeObserver.observe(container);
+
+    const handleWindowResize = () => {
+      const rect = container.getBoundingClientRect();
+      syncLabelCanvasSize(rect.width, rect.height);
+      drawMapLabels();
+    };
+    window.addEventListener('resize', handleWindowResize);
 
     // 60fps GeoJSON update loop reading directly from liveKinematicsRegistry
     let rafId = 0;
@@ -1047,6 +1448,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
     let lastLayersKey = '';
     let lastSelectedId: string | null = null;
     let lastHoveredId: string | null = null;
+    let lastMapLabelsEnabled = initialState.mapLabelsEnabled;
+    let lastUnits = initialState.units;
+    let lastLayout = initialState.layout;
     let lastOrbitOverlayRef: typeof liveKinematicsRegistry.orbitOverlay | undefined = undefined;
     let lastTrailSyncMs = 0;
     let lastPulseSyncMs = 0;
@@ -1062,6 +1466,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
       const state = useSkyStore.getState();
       if (state.layout === 'dome') {
         lastEntityVersion = -1;
+        if (lastLayout !== 'dome') {
+          lastLayout = 'dome';
+          drawMapLabels();
+        }
         if (hoverCoordsRef.current !== null) {
           hoverCoordsRef.current = null;
           setHoverTip(null);
@@ -1070,12 +1478,17 @@ export function TacticalMap({ className }: TacticalMapProps) {
         return;
       }
 
+      const layoutChanged = state.layout !== lastLayout;
+      lastLayout = state.layout;
+
       const layersKey = `${state.layers.flight}-${state.layers.military}-${state.layers.satellite}-${state.layers.balloon}-${state.layers.drone}`;
       const versionChanged = liveKinematicsRegistry.version !== lastEntityVersion;
       const stateChanged =
         layersKey !== lastLayersKey ||
         state.selectedId !== lastSelectedId ||
         state.hoveredId !== lastHoveredId;
+      const labelsChanged = state.mapLabelsEnabled !== lastMapLabelsEnabled;
+      const unitsChanged = state.units !== lastUnits;
 
       const hasHighlight = state.selectedId !== null || state.hoveredId !== null;
       const pulseTickDue = nowMs - lastPulseSyncMs >= 45;
@@ -1109,6 +1522,12 @@ export function TacticalMap({ className }: TacticalMapProps) {
         (
           activeMap.getSource(SOURCE_IDS.entityTrails) as maplibregl.GeoJSONSource | undefined
         )?.setData(buildTrailsAndVectorsFc(state.layers));
+      }
+
+      if (versionChanged || stateChanged || labelsChanged || unitsChanged || layoutChanged) {
+        lastMapLabelsEnabled = state.mapLabelsEnabled;
+        lastUnits = state.units;
+        drawMapLabels();
       }
 
       // Orbit overlay update (on overlay change, layer toggle, or every ~120ms for moving footprint)
@@ -1170,10 +1589,30 @@ export function TacticalMap({ className }: TacticalMapProps) {
       cancelled = true;
       window.cancelAnimationFrame(rafId);
       resizeObserver.disconnect();
+      window.removeEventListener('resize', handleWindowResize);
+      drawMapLabelsRef.current = null;
       mapLoadedRef.current = false;
       scaleControlRef.current = null;
       try {
-        map.getCanvas().removeEventListener('webglcontextlost', handleCanvasContextLost);
+        map.off('error', handleMapError);
+        map.off('dragstart', handleDragStart);
+        map.off('dragend', handleDragEnd);
+        map.off('touchstart', handleDragStart);
+        map.off('touchend', handleDragEnd);
+        map.off('move', drawMapLabels);
+        map.off('zoom', drawMapLabels);
+        map.off('rotate', drawMapLabels);
+        map.off('resize', drawMapLabels);
+        map.off('style.load', initMapLayers);
+        map.off('load', initMapLayers);
+        if (layersInitialized) {
+          map.off('mousemove', LAYER_IDS.entitiesSymbol, handleMouseMove);
+          map.off('mouseleave', LAYER_IDS.entitiesSymbol, handleMouseLeave);
+          map.off('click', LAYER_IDS.entitiesSymbol, handleClick);
+        }
+        if (contextLostListenerAttached) {
+          map.getCanvas().removeEventListener('webglcontextlost', handleCanvasContextLost);
+        }
         map.remove();
       } catch {
         // Ignore teardown issues
@@ -1182,29 +1621,37 @@ export function TacticalMap({ className }: TacticalMapProps) {
     };
   }, []);
 
-  // Sync observer, scan ring, and flyTo on observer shifts > 1km
+  // Sync observer, scan ring, and recenter on observer shifts, radiusKm changes, or recenterNonce
   useEffect(() => {
     const map = mapRef.current;
-    if (map && mapLoadedRef.current) {
-      (map.getSource(SOURCE_IDS.scanRing) as maplibregl.GeoJSONSource | undefined)?.setData(
-        buildScanRingFc(observer.lat, observer.lon, radiusKm)
-      );
-      (map.getSource(SOURCE_IDS.observer) as maplibregl.GeoJSONSource | undefined)?.setData(
-        buildObserverFc(observer.lat, observer.lon, observer.label)
-      );
+    if (!map || !mapLoadedRef.current) return;
 
-      const shiftKm = haversineDistanceKm(
-        prevObserverRef.current.lat,
-        prevObserverRef.current.lon,
-        observer.lat,
-        observer.lon
-      );
+    (map.getSource(SOURCE_IDS.scanRing) as maplibregl.GeoJSONSource | undefined)?.setData(
+      buildScanRingFc(observer.lat, observer.lon, radiusKm)
+    );
+    (map.getSource(SOURCE_IDS.observer) as maplibregl.GeoJSONSource | undefined)?.setData(
+      buildObserverFc(observer.lat, observer.lon, observer.label)
+    );
+
+    const shiftKm = haversineDistanceKm(
+      prevObserverRef.current.lat,
+      prevObserverRef.current.lon,
+      observer.lat,
+      observer.lon
+    );
+    const radiusChanged = radiusKm !== prevRadiusRef.current;
+    const nonceChanged = recenterNonce !== prevRecenterNonceRef.current;
+    const observerShifted =
+      Math.abs(observer.lat - prevObserverRef.current.lat) > 1e-6 ||
+      Math.abs(normalizeLonDeg(observer.lon - prevObserverRef.current.lon)) > 1e-6;
+
+    if (nonceChanged || radiusChanged || observerShifted) {
       if (shiftKm > 250) {
         map.jumpTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
         });
-      } else if (shiftKm > 1) {
+      } else {
         map.flyTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
@@ -1213,8 +1660,16 @@ export function TacticalMap({ className }: TacticalMapProps) {
         });
       }
     }
+
     prevObserverRef.current = { lat: observer.lat, lon: observer.lon };
-  }, [observer.lat, observer.lon, observer.label, radiusKm]);
+    prevRadiusRef.current = radiusKm;
+    prevRecenterNonceRef.current = recenterNonce;
+  }, [observer.lat, observer.lon, observer.label, radiusKm, recenterNonce]);
+
+  // Redraw overlay labels immediately when label toggle or unit formatting changes
+  useEffect(() => {
+    drawMapLabelsRef.current?.();
+  }, [mapLabelsEnabled, units]);
 
   // Sync FAA UASFM & SUA airspace collections
   useEffect(() => {
@@ -1266,6 +1721,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const timer = window.setTimeout(() => {
       try {
         map.resize();
+        drawMapLabelsRef.current?.();
       } catch {
         // Ignore if unmounted
       }
@@ -1304,8 +1760,72 @@ export function TacticalMap({ className }: TacticalMapProps) {
         style={{
           width: '100%',
           height: '100%',
+          touchAction: 'none',
         }}
       />
+
+      <canvas
+        ref={labelCanvasRef}
+        aria-hidden="true"
+        style={{
+          position: 'absolute',
+          inset: 0,
+          width: '100%',
+          height: '100%',
+          pointerEvents: 'none',
+          zIndex: 5,
+        }}
+      />
+
+      {!webglError && (
+        <button
+          type="button"
+          aria-pressed={mapLabelsEnabled}
+          aria-label="Toggle map callsign labels"
+          onClick={() => setMapLabelsEnabled(!mapLabelsEnabled)}
+          style={{
+            position: 'absolute',
+            left: '50%',
+            bottom: 'max(10px, env(safe-area-inset-bottom))',
+            transform: 'translateX(-50%)',
+            zIndex: 15,
+            display: 'inline-flex',
+            alignItems: 'center',
+            gap: 6,
+            padding: '5px 10px',
+            borderRadius: 6,
+            border: mapLabelsEnabled
+              ? '1px solid rgba(34, 211, 238, 0.5)'
+              : '1px solid rgba(120, 190, 255, 0.16)',
+            backgroundColor: mapLabelsEnabled
+              ? 'rgba(34, 211, 238, 0.12)'
+              : 'rgba(11, 17, 30, 0.82)',
+            color: mapLabelsEnabled ? '#E0F2FE' : '#94A3B8',
+            fontFamily: MONO_FONT,
+            fontSize: 10,
+            fontWeight: 600,
+            letterSpacing: '0.06em',
+            cursor: 'pointer',
+            backdropFilter: 'blur(8px)',
+            WebkitBackdropFilter: 'blur(8px)',
+            outline: 'none',
+            touchAction: 'manipulation',
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 6,
+              height: 6,
+              borderRadius: '50%',
+              backgroundColor: mapLabelsEnabled ? '#38BDF8' : '#475569',
+              boxShadow: mapLabelsEnabled ? '0 0 6px #38BDF8' : 'none',
+              flexShrink: 0,
+            }}
+          />
+          <span>LABELS</span>
+        </button>
+      )}
 
       {webglError && (
         <div
@@ -1313,6 +1833,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
           style={{
             position: 'absolute',
             inset: 0,
+            zIndex: 10,
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
