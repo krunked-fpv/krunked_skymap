@@ -1,22 +1,33 @@
 import { defineConfig, type ProxyOptions } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const configureAdsbProxy: NonNullable<ProxyOptions['configure']> = (proxy) => {
+  proxy.on('proxyReq', (proxyReq) => {
+    proxyReq.removeHeader('origin');
+    proxyReq.removeHeader('referer');
+    proxyReq.setHeader(
+      'User-Agent',
+      'KrunkedSkyMap/2.0 (+https://github.com/krunked-fpv/krunked_skymap)'
+    );
+  });
+};
+
+function createAdsbProxyEntry(prefix: string, target: string): ProxyOptions {
+  return {
+    target,
+    changeOrigin: true,
+    rewrite: (path) => (path.startsWith(prefix) ? path.slice(prefix.length) : path),
+    configure: configureAdsbProxy,
+  };
+}
+
 const adsbApiProxy: Record<string, string | ProxyOptions> = {
-  '/api-proxy/adsb-lol': {
-    target: 'https://api.adsb.lol',
-    changeOrigin: true,
-    rewrite: (path) => path.replace(/^\/api-proxy\/adsb-lol/, ''),
-  },
-  '/api-proxy/adsb-fi': {
-    target: 'https://opendata.adsb.fi',
-    changeOrigin: true,
-    rewrite: (path) => path.replace(/^\/api-proxy\/adsb-fi/, ''),
-  },
-  '/api-proxy/airplanes-live': {
-    target: 'https://api.airplanes.live',
-    changeOrigin: true,
-    rewrite: (path) => path.replace(/^\/api-proxy\/airplanes-live/, ''),
-  },
+  '/api-proxy/adsb-lol': createAdsbProxyEntry('/api-proxy/adsb-lol', 'https://api.adsb.lol'),
+  '/api-proxy/adsb-fi': createAdsbProxyEntry('/api-proxy/adsb-fi', 'https://opendata.adsb.fi'),
+  '/api-proxy/airplanes-live': createAdsbProxyEntry(
+    '/api-proxy/airplanes-live',
+    'https://api.airplanes.live'
+  ),
 };
 
 export default defineConfig({
