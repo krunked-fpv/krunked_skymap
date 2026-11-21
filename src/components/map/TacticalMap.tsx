@@ -1012,8 +1012,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
     });
     scaleControlRef.current = scaleControl;
 
-    map.addControl(new maplibregl.NavigationControl({ showCompass: true, showZoom: true }), 'bottom-left');
-    map.addControl(scaleControl, 'bottom-left');
+    map.addControl(new maplibregl.NavigationControl({ showCompass: true, showZoom: true }), 'bottom-right');
+    map.addControl(scaleControl, 'bottom-right');
 
     const handleCanvasContextLost = (ev: Event) => {
       ev.preventDefault();
