@@ -28,6 +28,7 @@ import {
   type SkyCategory,
 } from '../../types/sky-contracts';
 import { useSkyStore } from '../../store/useSkyStore';
+import { formatClockTime } from '../inspector/unitFormatters';
 
 export interface LocationSearchResult {
   lat: number;
@@ -67,7 +68,7 @@ const SAT_GROUP_CHIPS: Array<{ group: SatelliteGroup; label: string }> = [
 const RING_RADIUS = 8.5;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
-const STATUS_LABEL: Record<FeedHealthStatus, string> = {
+export const STATUS_LABEL: Record<FeedHealthStatus, string> = {
   idle: 'IDLE',
   loading: 'SYNCING',
   live: 'LIVE',
@@ -78,6 +79,21 @@ const STATUS_LABEL: Record<FeedHealthStatus, string> = {
   fallback: 'SEEDED',
   error: 'ERROR',
 };
+
+function getDegradedFeedNotice(status: FeedHealthStatus): string | null {
+  switch (status) {
+    case 'rate-limited':
+      return 'Upstream ADS-B rate limit reached. Live telemetry is degraded; no synthetic fallback aircraft are shown.';
+    case 'offline':
+      return 'Network offline. Live ADS-B telemetry is unavailable; no synthetic fallback aircraft are shown.';
+    case 'delayed':
+      return 'Live ADS-B refresh is delayed. Showing recent verified observations only; no synthetic fallback aircraft are shown.';
+    case 'error':
+      return 'Live ADS-B telemetry is currently unavailable. No synthetic fallback aircraft are shown.';
+    default:
+      return null;
+  }
+}
 
 function formatCountdownShort(sec: number): string {
   if (sec <= 0) return '0s';
@@ -589,6 +605,65 @@ export function ControlDock({
                 );
               })}
             </div>
+
+            {(() => {
+              const flightsFeed = feeds.flights;
+              const liveAircraftCount = counts.flight + counts.military;
+              const lastUpdatedText = formatClockTime(flightsFeed.lastUpdatedMs, 'Never');
+              const degradedNotice = getDegradedFeedNotice(flightsFeed.status);
+              const isCritical =
+                flightsFeed.status === 'offline' || flightsFeed.status === 'error';
+
+              return (
+                <div className="dock-feed-diag" data-testid="dock-feed-diagnostics">
+                  <div className="dock-feed-diag__header">
+                    <span className="dock-feed-diag__title">LIVE FEED DIAGNOSTICS</span>
+                    <span className={`feed-pill feed-pill--${flightsFeed.status}`}>
+                      {STATUS_LABEL[flightsFeed.status]}
+                    </span>
+                  </div>
+
+                  <div className="dock-feed-diag__meta">
+                    <span className="dock-feed-diag__key">ADS-B Targets</span>
+                    <span className="dock-feed-diag__val tabular">
+                      {liveAircraftCount} verified live
+                    </span>
+
+                    <span className="dock-feed-diag__key">Last Updated</span>
+                    <span className="dock-feed-diag__val tabular">{lastUpdatedText}</span>
+
+                    <span className="dock-feed-diag__key">Provider</span>
+                    <span
+                      className="dock-feed-diag__val tabular"
+                      title={flightsFeed.provider || 'adsb-cascade'}
+                    >
+                      {flightsFeed.provider || 'adsb-cascade'}
+                    </span>
+                  </div>
+
+                  {degradedNotice && (
+                    <div
+                      className={`dock-feed-diag__notice${isCritical ? ' is-critical' : ''}`}
+                      role="status"
+                    >
+                      <AlertTriangle
+                        size={12}
+                        style={{ flexShrink: 0, marginTop: 1 }}
+                        aria-hidden="true"
+                      />
+                      <div>
+                        <span>{degradedNotice}</span>
+                        {flightsFeed.errorMsg && (
+                          <span className="dock-feed-diag__error-detail">
+                            {flightsFeed.errorMsg}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </section>
 
           {/* Satellite Subfilters */}

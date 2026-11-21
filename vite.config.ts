@@ -12,6 +12,11 @@ const adsbApiProxy: Record<string, string | ProxyOptions> = {
     changeOrigin: true,
     rewrite: (path) => path.replace(/^\/api-proxy\/adsb-fi/, ''),
   },
+  '/api-proxy/airplanes-live': {
+    target: 'https://api.airplanes.live',
+    changeOrigin: true,
+    rewrite: (path) => path.replace(/^\/api-proxy\/airplanes-live/, ''),
+  },
 };
 
 export default defineConfig({

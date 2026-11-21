@@ -8,16 +8,12 @@ const TLE_DIR = path.join(DATA_DIR, 'tle');
 
 const FETCH_TIMEOUT_MS = 12_000;
 const STARLINK_MAX_ENTRIES = 600;
-const FLIGHTS_MAX_ENTRIES = 160;
-const ORIGIN = { lat: 38.8512, lon: -77.0402 };
 
 const CELESTRAK_GROUP_URLS = {
   stations: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle',
   visual: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=visual&FORMAT=tle',
   starlink: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=starlink&FORMAT=tle',
 };
-
-const ADSB_LIVE_URL = `https://api.adsb.lol/v2/point/${ORIGIN.lat}/${ORIGIN.lon}/100`;
 
 const FAA_UASFM_URL =
   'https://services6.arcgis.com/ssFJjBXIUyZDrSYZ/ArcGIS/rest/services/FAA_UAS_FacilityMap_Data/FeatureServer/0/query' +
@@ -130,19 +126,6 @@ STARLINK-1166
 1 45060U 20006S   26323.66671296  .00295319  45751-4  70983-3 0  9997
 2 45060  53.0278  96.0712 0001912 302.3919 138.4121 15.96009620  5875`,
 };
-
-const BASELINE_FLIGHTS = [
-  { dLat: 0.0824, dLon: -0.1142, alt_baro: 4200, alt_geom: 4325, gs: 218.4, track: 184.2, baro_rate: -960, flight: 'AAL1421', hex: 'a12b34', r: 'N912AA', t: 'A319', dbFlags: 0, squawk: '2140', category: 'A3' },
-  { dLat: -0.145, dLon: 0.212, alt_baro: 11800, alt_geom: 12050, gs: 312.5, track: 35.1, baro_rate: 1472, flight: 'UAL418', hex: 'a45d92', r: 'N37518', t: 'B739', dbFlags: 0, squawk: '3412', category: 'A3' },
-  { dLat: 0.241, dLon: -0.318, alt_baro: 34000, alt_geom: 34950, gs: 468.2, track: 72.6, baro_rate: 0, flight: 'DAL882', hex: 'a7c811', r: 'N822DN', t: 'B739', dbFlags: 0, squawk: '1521', category: 'A3' },
-  { dLat: -0.312, dLon: -0.194, alt_baro: 28500, alt_geom: 29400, gs: 442.0, track: 256.8, baro_rate: -640, flight: 'JIA5473', hex: 'a6652b', r: 'N511AE', t: 'CRJ7', dbFlags: 0, squawk: '3624', category: 'A2' },
-  { dLat: 0.165, dLon: 0.278, alt_baro: 18400, alt_geom: 18925, gs: 355.8, track: 144.3, baro_rate: 1920, flight: 'SWA2104', hex: 'a91f44', r: 'N8721J', t: 'B38M', dbFlags: 0, squawk: '4215', category: 'A3' },
-  { dLat: -0.068, dLon: -0.052, alt_baro: 1500, alt_geom: 1625, gs: 112.0, track: 318.0, baro_rate: 0, flight: 'PAT21', hex: 'ae104f', r: '19-21041', t: 'UH60', dbFlags: 1, squawk: '0342', category: 'A7' },
-  { dLat: 0.415, dLon: 0.104, alt_baro: 24000, alt_geom: 24750, gs: 388.4, track: 205.5, baro_rate: -512, flight: 'RCH409', hex: 'ae5c12', r: '08-8194', t: 'C17', dbFlags: 1, squawk: '5107', category: 'A5' },
-  { dLat: -0.228, dLon: 0.412, alt_baro: 37000, alt_geom: 38100, gs: 486.7, track: 54.9, baro_rate: 0, flight: 'BAW216', hex: '40768a', r: 'G-ZBKB', t: 'B789', dbFlags: 0, squawk: '2204', category: 'A5' },
-  { dLat: 0.044, dLon: -0.342, alt_baro: 6800, alt_geom: 7025, gs: 234.1, track: 98.4, baro_rate: -832, flight: 'RPA4512', hex: 'a24720', r: 'N246JQ', t: 'E75L', dbFlags: 0, squawk: '1702', category: 'A3' },
-  { dLat: -0.442, dLon: -0.285, alt_baro: 9400, alt_geom: 9675, gs: 176.2, track: 19.8, baro_rate: 512, flight: 'N418CP', hex: 'a4f310', r: 'N418CP', t: 'PC12', dbFlags: 0, squawk: '1200', category: 'A1' },
-];
 
 const BASELINE_AIRSPACE = {
   uasfm: {
@@ -390,77 +373,6 @@ async function seedTleGroup(group) {
   console.log(`[tle:${group}] wrote ${baselineEntries.length} baseline entries -> ${outPath}`);
 }
 
-function normalizeFlightRecord(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-  if (typeof raw.lat !== 'number' || !Number.isFinite(raw.lat)) return null;
-  if (typeof raw.lon !== 'number' || !Number.isFinite(raw.lon)) return null;
-  if (typeof raw.hex !== 'string' || raw.hex.trim().length === 0) return null;
-
-  return {
-    dLat: Number((raw.lat - ORIGIN.lat).toFixed(6)),
-    dLon: Number((raw.lon - ORIGIN.lon).toFixed(6)),
-    alt_baro:
-      raw.alt_baro === 'ground' || (typeof raw.alt_baro === 'number' && Number.isFinite(raw.alt_baro))
-        ? raw.alt_baro
-        : null,
-    alt_geom: typeof raw.alt_geom === 'number' && Number.isFinite(raw.alt_geom) ? raw.alt_geom : null,
-    gs: typeof raw.gs === 'number' && Number.isFinite(raw.gs) ? raw.gs : null,
-    track: typeof raw.track === 'number' && Number.isFinite(raw.track) ? raw.track : null,
-    baro_rate:
-      typeof raw.baro_rate === 'number' && Number.isFinite(raw.baro_rate) ? raw.baro_rate : null,
-    flight: typeof raw.flight === 'string' ? raw.flight.trim() : '',
-    hex: raw.hex.trim().toLowerCase(),
-    r: typeof raw.r === 'string' ? raw.r.trim() : '',
-    t: typeof raw.t === 'string' ? raw.t.trim() : '',
-    dbFlags: typeof raw.dbFlags === 'number' && Number.isFinite(raw.dbFlags) ? raw.dbFlags : 0,
-    squawk: typeof raw.squawk === 'string' ? raw.squawk.trim() : '',
-    category: typeof raw.category === 'string' ? raw.category.trim() : '',
-  };
-}
-
-async function seedFlights() {
-  const outPath = path.join(DATA_DIR, 'fallback-flights.json');
-  let records = [];
-  let source = 'embedded-baseline';
-
-  try {
-    const response = await fetchWithTimeout(ADSB_LIVE_URL, 'application/json');
-    const payload = await response.json();
-    if (Array.isArray(payload?.ac)) {
-      records = payload.ac
-        .map(normalizeFlightRecord)
-        .filter(Boolean)
-        .sort((a, b) => a.dLat * a.dLat + a.dLon * a.dLon - (b.dLat * b.dLat + b.dLon * b.dLon))
-        .slice(0, FLIGHTS_MAX_ENTRIES);
-      if (records.length > 0) {
-        source = 'adsb.lol';
-      }
-    }
-  } catch (err) {
-    console.warn(`[flights] ADS-B fetch failed: ${err.message}`);
-  }
-
-  if (records.length === 0) {
-    const existing = await readExistingJson(outPath);
-    if (Array.isArray(existing?.ac) && existing.ac.length > BASELINE_FLIGHTS.length) {
-      console.log(`[flights] preserved existing snapshot (${existing.ac.length} records) -> ${outPath}`);
-      return;
-    }
-    records = BASELINE_FLIGHTS;
-  }
-
-  const output = {
-    origin: ORIGIN,
-    generatedAt: new Date().toISOString(),
-    source,
-    count: records.length,
-    ac: records,
-  };
-
-  await writeFile(outPath, `${JSON.stringify(output, null, 2)}\n`, 'utf8');
-  console.log(`[flights] wrote ${records.length} records (${source}) -> ${outPath}`);
-}
-
 function isValidFeatureCollection(data) {
   return Boolean(data && data.type === 'FeatureCollection' && Array.isArray(data.features));
 }
@@ -513,7 +425,6 @@ async function main() {
   await seedTleGroup('stations');
   await seedTleGroup('visual');
   await seedTleGroup('starlink');
-  await seedFlights();
   await seedAirspace();
 }
 

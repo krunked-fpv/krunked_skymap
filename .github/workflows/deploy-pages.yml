@@ -32,7 +32,10 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Refresh static ephemeris and fallback snapshots
+      - name: Generate PWA icons
+        run: node scripts/generate-pwa-icons.mjs
+
+      - name: Refresh static CelesTrak ephemeris and FAA airspace snapshots
         run: node scripts/refresh-ephemeris.mjs || true
 
       - name: Run TypeScript typecheck

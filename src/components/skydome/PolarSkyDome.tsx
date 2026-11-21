@@ -1,4 +1,12 @@
-import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type MouseEvent,
+  type TouchEvent,
+} from 'react';
 import {
   BREACH_COLOR,
   CATEGORY_COLORS,
@@ -7,9 +15,12 @@ import {
   SATELLITE_SUNLIT_COLOR,
   type SatelliteOrbitOverlay,
   type SkyEntity,
+  type UnitSystem,
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
+import { tacticalAudio } from '../../audio/tacticalAudio';
 import { computeTopocentricLookAngles, greatCircleDestination } from '../../math/geodesy';
+import { formatAltitude } from '../../math/units';
 
 export interface PolarSkyDomeProps {
   className?: string;
@@ -19,10 +30,15 @@ const EL_MAX = 90;
 const EL_MIN = -5;
 const EL_SPAN = EL_MAX - EL_MIN; // 95 deg linear projection
 const HIT_RADIUS_PX = 13;
+const TOUCH_HIT_RADIUS_PX = 20;
+const TOUCH_DRAG_THRESHOLD_PX = 10;
 const SWEEP_DEG_PER_MS = 0.045; // 1 revolution ~ 8s
 const PULSE_WAVE_DURATION_MS = 950;
 const TRAIL_SAMPLE_INTERVAL_MS = 450;
 const MAX_TRAIL_SAMPLES = 10;
+const MAX_FLIGHT_TRAIL_AGE_MS = 120_000;
+const MAX_BALLOON_TRAIL_AGE_MS = 1_800_000;
+const MAX_TRAIL_SEGMENT_RATIO = 0.45;
 
 interface PolarPoint {
   azDeg: number;
@@ -758,6 +774,43 @@ function overlapsExistingLabel(box: LabelBox, existing: LabelBox[]): boolean {
   return false;
 }
 
+function formatCompactDomeAltitude(entity: SkyEntity, units: UnitSystem): string {
+  if (!Number.isFinite(entity.altM)) return '';
+  if (entity.category === 'satellite') {
+    return `${Math.round(entity.altM / 1000)} km`;
+  }
+  const formatted = formatAltitude(entity.altM, units);
+  return formatted === '---' ? '' : formatted;
+}
+
+function resolveLabelBox(
+  x: number,
+  y: number,
+  boxW: number,
+  boxH: number,
+  canvasW: number,
+  canvasH: number,
+  placed: LabelBox[],
+  mustShow: boolean
+): LabelBox | null {
+  const clampX = (rawX: number) => Math.max(6, Math.min(canvasW - boxW - 6, rawX));
+  const clampY = (rawY: number) => Math.max(6, Math.min(canvasH - boxH - 6, rawY));
+
+  const candidates: LabelBox[] = [
+    { x: clampX(x + 10), y: clampY(y - boxH / 2), w: boxW, h: boxH },
+    { x: clampX(x - boxW - 10), y: clampY(y - boxH / 2), w: boxW, h: boxH },
+    { x: clampX(x - boxW / 2), y: clampY(y - boxH - 10), w: boxW, h: boxH },
+    { x: clampX(x - boxW / 2), y: clampY(y + 10), w: boxW, h: boxH },
+  ];
+
+  for (const candidate of candidates) {
+    if (!overlapsExistingLabel(candidate, placed)) {
+      return candidate;
+    }
+  }
+  return mustShow ? candidates[0] : null;
+}
+
 export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -777,12 +830,16 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const lastTrailSampleRef = useRef<Map<string, number>>(new Map());
   const lastObserverKeyRef = useRef<string>('');
   const pointerInsideRef = useRef<boolean>(false);
+  const touchStartRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const lastTouchEndMsRef = useRef<number>(-Infinity);
   const sweepAzRef = useRef<number>(0);
   const lastFrameMsRef = useRef<number>(0);
   const pulseWaveStartRef = useRef<number | null>(null);
 
   const [isCompact, setIsCompact] = useState(false);
 
+  const layout = useSkyStore((s) => s.layout);
+  const units = useSkyStore((s) => s.units);
   const sweepEnabled = useSkyStore((s) => s.sweepEnabled);
   const setSweepEnabled = useSkyStore((s) => s.setSweepEnabled);
   const domeLabelsEnabled = useSkyStore((s) => s.domeLabelsEnabled);
@@ -790,7 +847,38 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
   const sweepPulseCounter = useSkyStore((s) => s.sweepPulseCounter);
 
+  const unitsRef = useRef<UnitSystem>(units);
+  unitsRef.current = units;
+
   const prevPulseCounterRef = useRef<number>(sweepPulseCounter);
+
+  const updateCanvasSize = useCallback((width: number, height: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    if (width <= 0 || height <= 0) {
+      metricsRef.current = { ...metricsRef.current, width: 0, height: 0 };
+      return;
+    }
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    const targetW = Math.round(width * dpr);
+    const targetH = Math.round(height * dpr);
+    if (canvas.width !== targetW || canvas.height !== targetH) {
+      canvas.width = targetW;
+      canvas.height = targetH;
+    }
+    const minDim = Math.min(width, height);
+    const padding = Math.max(24, Math.min(44, minDim * 0.1));
+    const outerRadius = Math.max(36, minDim / 2 - padding);
+    metricsRef.current = {
+      width,
+      height,
+      dpr,
+      cx: width / 2,
+      cy: height / 2,
+      outerRadius,
+    };
+    setIsCompact(minDim < 360 || width < 420);
+  }, []);
 
   useEffect(() => {
     if (sweepPulseCounter > prevPulseCounterRef.current) {
@@ -803,35 +891,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   useEffect(() => {
     const container = containerRef.current;
+    if (!container) return;
+    const syncLayoutSize = () => {
+      const rect = container.getBoundingClientRect();
+      updateCanvasSize(rect.width, rect.height);
+    };
+    syncLayoutSize();
+    const rafId = requestAnimationFrame(syncLayoutSize);
+    return () => cancelAnimationFrame(rafId);
+  }, [layout, updateCanvasSize]);
+
+  useEffect(() => {
+    const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
     canvas.style.cursor = 'crosshair';
-
-    const updateCanvasSize = (width: number, height: number) => {
-      if (width <= 0 || height <= 0) {
-        metricsRef.current = { ...metricsRef.current, width: 0, height: 0 };
-        return;
-      }
-      const dpr = Math.max(1, window.devicePixelRatio || 1);
-      const targetW = Math.round(width * dpr);
-      const targetH = Math.round(height * dpr);
-      if (canvas.width !== targetW || canvas.height !== targetH) {
-        canvas.width = targetW;
-        canvas.height = targetH;
-      }
-      const minDim = Math.min(width, height);
-      const padding = Math.max(24, Math.min(44, minDim * 0.1));
-      const outerRadius = Math.max(36, minDim / 2 - padding);
-      metricsRef.current = {
-        width,
-        height,
-        dpr,
-        cx: width / 2,
-        cy: height / 2,
-        outerRadius,
-      };
-      setIsCompact(minDim < 360 || width < 420);
-    };
 
     const initialRect = container.getBoundingClientRect();
     updateCanvasSize(initialRect.width, initialRect.height);
@@ -874,6 +948,17 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       const state = useSkyStore.getState();
       if (state.layout === 'map') return;
 
+      const currentDpr = Math.max(1, window.devicePixelRatio || 1);
+      if (metrics.dpr !== currentDpr) {
+        const targetW = Math.round(metrics.width * currentDpr);
+        const targetH = Math.round(metrics.height * currentDpr);
+        if (canvas.width !== targetW || canvas.height !== targetH) {
+          canvas.width = targetW;
+          canvas.height = targetH;
+        }
+        metrics.dpr = currentDpr;
+      }
+
       if (state.sweepEnabled) {
         sweepAzRef.current = (sweepAzRef.current + dtMs * SWEEP_DEG_PER_MS) % 360;
       }
@@ -886,12 +971,14 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         lastTrailSampleRef.current.clear();
       }
 
-      if (
-        pulseWaveStartMsExpired(pulseWaveStartRef.current, nowMs)
-      ) {
+      if (pulseWaveStartMsExpired(pulseWaveStartRef.current, nowMs)) {
         pulseWaveStartRef.current = null;
       }
 
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.restore();
       ctx.setTransform(metrics.dpr, 0, 0, metrics.dpr, 0, 0);
 
       // 1. Radar background, OTH skirt, sweep beam, spokes, elevation rings, beacons
@@ -932,6 +1019,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       }> = [];
 
       const activeIds = new Set<string>();
+      const epochNowMs = Date.now();
 
       liveKinematicsRegistry.entities.forEach((entity) => {
         if (!state.layers[entity.category]) return;
@@ -954,7 +1042,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
         // Update fallback polar trail cache when entity lacks geographic trail points
         if (entity.trail.length === 0) {
-          const lastSample = lastTrailSampleRef.current.get(entity.id) ?? 0;
+          const lastSample = lastTrailSampleRef.current.get(entity.id) ?? -Infinity;
           if (nowMs - lastSample >= TRAIL_SAMPLE_INTERVAL_MS) {
             lastTrailSampleRef.current.set(entity.id, nowMs);
             let pts = polarTrailsRef.current.get(entity.id);
@@ -963,10 +1051,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
               polarTrailsRef.current.set(entity.id, pts);
             }
             pts.push({ azDeg, elDeg, ts: nowMs });
-            if (pts.length > MAX_TRAIL_SAMPLES) {
+            const maxAge =
+              entity.category === 'balloon' ? MAX_BALLOON_TRAIL_AGE_MS : MAX_FLIGHT_TRAIL_AGE_MS;
+            while (pts.length > MAX_TRAIL_SAMPLES || (pts.length > 0 && nowMs - pts[0].ts > maxAge)) {
               pts.shift();
             }
           }
+        } else {
+          polarTrailsRef.current.delete(entity.id);
+          lastTrailSampleRef.current.delete(entity.id);
         }
 
         visible.push({
@@ -984,20 +1077,23 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         });
       });
 
-      // Prune stale trail cache entries
-      if (polarTrailsRef.current.size > activeIds.size + 40) {
-        polarTrailsRef.current.forEach((_, key) => {
-          if (!activeIds.has(key)) {
-            polarTrailsRef.current.delete(key);
-            lastTrailSampleRef.current.delete(key);
-          }
-        });
+      // Immediately prune stale trail cache entries for dead or hidden targets
+      for (const key of polarTrailsRef.current.keys()) {
+        if (!activeIds.has(key)) {
+          polarTrailsRef.current.delete(key);
+        }
+      }
+      for (const key of lastTrailSampleRef.current.keys()) {
+        if (!activeIds.has(key)) {
+          lastTrailSampleRef.current.delete(key);
+        }
       }
 
       // Draw lowest priority first so selected/hovered/alerts sit on top
       visible.sort((a, b) => a.priority - b.priority);
 
       const nextHits: RenderedTargetHit[] = [];
+      const maxTrailJumpPx = metrics.outerRadius * MAX_TRAIL_SEGMENT_RATIO;
 
       for (const item of visible) {
         const {
@@ -1031,11 +1127,17 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         ctx.save();
         ctx.globalAlpha = baseAlpha;
 
-        // Polar breadcrumb trail segment (bounded to last few samples)
+        const maxTrailAgeMs =
+          entity.category === 'balloon' ? MAX_BALLOON_TRAIL_AGE_MS : MAX_FLIGHT_TRAIL_AGE_MS;
+
+        // Polar breadcrumb trail segment (bounded to last few fresh samples)
         if (entity.trail.length > 0) {
           const slice = entity.trail.slice(-MAX_TRAIL_SAMPLES);
           const projected: Array<{ x: number; y: number }> = [];
           for (const tp of slice) {
+            if (!Number.isFinite(tp.ts) || epochNowMs - tp.ts > maxTrailAgeMs) {
+              continue;
+            }
             const look = computeTopocentricLookAngles(
               state.observer,
               { lat: tp.lat, lon: tp.lon, altM: tp.altM },
@@ -1053,22 +1155,32 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             }
           }
           projected.push({ x, y });
-          drawPolarTrail(ctx, projected, color);
+          drawPolarTrail(ctx, projected, color, maxTrailJumpPx);
         } else {
           const cached = polarTrailsRef.current.get(entity.id);
-          if (cached && cached.length > 1) {
-            const projected = cached.map((pt) => {
-              const p = azElToCanvas(
-                pt.azDeg,
-                pt.elDeg,
-                metrics.cx,
-                metrics.cy,
-                metrics.outerRadius
-              );
-              return { x: p.x, y: p.y };
-            });
-            projected.push({ x, y });
-            drawPolarTrail(ctx, projected, color);
+          if (cached && cached.length > 0) {
+            const fresh = cached.filter((pt) => nowMs - pt.ts <= maxTrailAgeMs);
+            if (fresh.length !== cached.length) {
+              if (fresh.length === 0) {
+                polarTrailsRef.current.delete(entity.id);
+              } else {
+                polarTrailsRef.current.set(entity.id, fresh);
+              }
+            }
+            if (fresh.length > 1) {
+              const projected = fresh.map((pt) => {
+                const p = azElToCanvas(
+                  pt.azDeg,
+                  pt.elDeg,
+                  metrics.cx,
+                  metrics.cy,
+                  metrics.outerRadius
+                );
+                return { x: p.x, y: p.y };
+              });
+              projected.push({ x, y });
+              drawPolarTrail(ctx, projected, color, maxTrailJumpPx);
+            }
           }
         }
 
@@ -1099,7 +1211,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         );
 
         const tickLen =
-          entity.category === 'drone' || entity.category === 'balloon'
+          entity.headingValid === false
+            ? 0
+            : entity.category === 'drone' || entity.category === 'balloon'
             ? entity.speedMs > 1
               ? 8.5
               : 0
@@ -1107,7 +1221,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             ? 11.5
             : 10;
 
-        if (tickLen > 0) {
+        if (entity.headingValid !== false && tickLen > 0) {
           ctx.beginPath();
           ctx.moveTo(x, y);
           ctx.lineTo(x + Math.cos(headingAngle) * tickLen, y + Math.sin(headingAngle) * tickLen);
@@ -1165,12 +1279,13 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       // 4. Target callsign labels (highest priority first with non-overlapping collision boxes)
       const placedLabels: LabelBox[] = [];
       ctx.save();
-      ctx.font = `600 9.5px ${MONO_FONT}`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
 
       let labelsDrawn = 0;
-      const maxAutoLabels = metrics.width < 420 ? 14 : 26;
+      const compactDome = metrics.width < 420 || metrics.height < 360;
+      const maxAutoLabels = metrics.width < 420 ? 12 : 26;
+      const activeUnits = state.units ?? unitsRef.current;
 
       for (let i = visible.length - 1; i >= 0; i -= 1) {
         const item = visible[i];
@@ -1178,39 +1293,60 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         if (!mustShow && !state.domeLabelsEnabled) continue;
         if (!mustShow && labelsDrawn >= maxAutoLabels) continue;
 
-        const labelText = mustShow
-          ? `${item.entity.callsign} · ${item.elDeg.toFixed(0)}°`
+        const isHighPriority =
+          mustShow || item.isEmergency || item.isBreach || item.priority >= 58;
+        const elRounded = Math.round(item.elDeg);
+        const elStr = `${elRounded === 0 ? 0 : elRounded}°`;
+        const altStr = isHighPriority ? formatCompactDomeAltitude(item.entity, activeUnits) : '';
+        const labelText = isHighPriority
+          ? altStr
+            ? `${item.entity.callsign} · ${altStr} · ${elStr}`
+            : `${item.entity.callsign} · ${elStr}`
           : item.entity.callsign;
+
+        ctx.font = mustShow
+          ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
+          : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
+
         const textW = ctx.measureText(labelText).width;
-        const boxW = textW + 8;
-        const boxH = 14;
+        const boxW = textW + 10;
+        const boxH = 15;
 
-        let lx = item.x + 10;
-        let ly = item.y - boxH / 2;
-        if (lx + boxW > metrics.width - 6) {
-          lx = item.x - boxW - 10;
-        }
-        lx = Math.max(6, Math.min(metrics.width - boxW - 6, lx));
-        ly = Math.max(6, Math.min(metrics.height - boxH - 6, ly));
-
-        const box: LabelBox = { x: lx, y: ly, w: boxW, h: boxH };
-        if (!mustShow && overlapsExistingLabel(box, placedLabels)) {
-          continue;
-        }
+        const box = resolveLabelBox(
+          item.x,
+          item.y,
+          boxW,
+          boxH,
+          metrics.width,
+          metrics.height,
+          placedLabels,
+          mustShow
+        );
+        if (!box) continue;
 
         placedLabels.push(box);
         if (!mustShow) labelsDrawn += 1;
 
-        ctx.fillStyle = mustShow ? 'rgba(9, 15, 28, 0.92)' : 'rgba(6, 11, 20, 0.78)';
-        ctx.strokeStyle = mustShow ? item.color : 'rgba(120, 190, 255, 0.22)';
-        ctx.lineWidth = mustShow ? 1 : 0.7;
+        ctx.fillStyle = mustShow ? 'rgba(9, 15, 28, 0.94)' : 'rgba(6, 11, 20, 0.84)';
+        ctx.strokeStyle = mustShow
+          ? item.color
+          : isHighPriority
+          ? 'rgba(148, 163, 184, 0.36)'
+          : 'rgba(120, 190, 255, 0.24)';
+        ctx.lineWidth = mustShow ? 1.1 : 0.75;
         ctx.beginPath();
-        traceRoundedRect(ctx, lx, ly, boxW, boxH, 3);
+        traceRoundedRect(ctx, box.x, box.y, box.w, box.h, 3);
         ctx.fill();
         ctx.stroke();
 
-        ctx.fillStyle = mustShow ? '#F8FAFC' : item.elDeg < 0 ? '#94A3B8' : '#CBD5E1';
-        ctx.fillText(labelText, lx + 4, ly + boxH / 2 + 0.5);
+        ctx.fillStyle = mustShow
+          ? '#F8FAFC'
+          : item.elDeg < 0
+          ? '#94A3B8'
+          : isHighPriority
+          ? '#E2E8F0'
+          : '#CBD5E1';
+        ctx.fillText(labelText, box.x + 5, box.y + box.h / 2 + 0.5);
       }
       ctx.restore();
     };
@@ -1222,9 +1358,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       observerRO?.disconnect();
       window.removeEventListener('resize', onWinResize);
     };
-  }, []);
+  }, [updateCanvasSize]);
 
-  const findNearestHit = (px: number, py: number): string | null => {
+  const findNearestHit = (px: number, py: number, radiusPx = HIT_RADIUS_PX): string | null => {
     const hits = renderedHitsRef.current;
     let bestId: string | null = null;
     let bestScore = Number.POSITIVE_INFINITY;
@@ -1232,7 +1368,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     for (let i = 0; i < hits.length; i += 1) {
       const hit = hits[i];
       const dist = Math.hypot(px - hit.x, py - hit.y);
-      if (dist <= HIT_RADIUS_PX) {
+      if (dist <= radiusPx) {
         // Prefer closer hit, slightly biasing higher priority targets when right on top of each other
         const score = dist - hit.priority * 0.025;
         if (score < bestScore) {
@@ -1244,40 +1380,46 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     return bestId;
   };
 
-  const getCanvasPoint = (e: MouseEvent<HTMLCanvasElement>): { px: number; py: number } | null => {
+  const getClientCanvasPoint = (
+    clientX: number,
+    clientY: number
+  ): { px: number; py: number } | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
     return {
-      px: e.clientX - rect.left,
-      py: e.clientY - rect.top,
+      px: clientX - rect.left,
+      py: clientY - rect.top,
     };
   };
 
+  const updateCursorReadout = (px: number, py: number) => {
+    const metrics = metricsRef.current;
+    if (!cursorReadoutRef.current || metrics.outerRadius <= 0) return;
+    const { azDeg, elDeg, inBounds } = canvasToAzEl(
+      px,
+      py,
+      metrics.cx,
+      metrics.cy,
+      metrics.outerRadius
+    );
+    if (inBounds) {
+      const azStr = azDeg.toFixed(1).padStart(5, '0');
+      const elStr = `${elDeg >= 0 ? ' ' : ''}${elDeg.toFixed(1)}°`;
+      cursorReadoutRef.current.textContent = `AZ ${azStr}° · EL ${elStr}`;
+    } else {
+      cursorReadoutRef.current.textContent = 'AZ ---.-° · EL --.-°';
+    }
+  };
+
   const handleMouseMove = (e: MouseEvent<HTMLCanvasElement>) => {
-    const pt = getCanvasPoint(e);
+    const pt = getClientCanvasPoint(e.clientX, e.clientY);
     if (!pt) return;
 
-    const metrics = metricsRef.current;
-    if (cursorReadoutRef.current && metrics.outerRadius > 0) {
-      const { azDeg, elDeg, inBounds } = canvasToAzEl(
-        pt.px,
-        pt.py,
-        metrics.cx,
-        metrics.cy,
-        metrics.outerRadius
-      );
-      if (inBounds) {
-        const azStr = azDeg.toFixed(1).padStart(5, '0');
-        const elStr = `${elDeg >= 0 ? ' ' : ''}${elDeg.toFixed(1)}°`;
-        cursorReadoutRef.current.textContent = `AZ ${azStr}° · EL ${elStr}`;
-      } else {
-        cursorReadoutRef.current.textContent = 'AZ ---.-° · EL --.-°';
-      }
-    }
+    updateCursorReadout(pt.px, pt.py);
 
     pointerInsideRef.current = true;
-    const hitId = findNearestHit(pt.px, pt.py);
+    const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
     const canvas = canvasRef.current;
     if (canvas) {
       canvas.style.cursor = hitId ? 'pointer' : 'crosshair';
@@ -1290,13 +1432,84 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   };
 
   const handleClick = (e: MouseEvent<HTMLCanvasElement>) => {
-    const pt = getCanvasPoint(e);
+    if (performance.now() - lastTouchEndMsRef.current < 450) {
+      return;
+    }
+    const pt = getClientCanvasPoint(e.clientX, e.clientY);
     if (!pt) return;
 
-    const hitId = findNearestHit(pt.px, pt.py);
+    const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
     if (!hitId) return;
 
-    useSkyStore.getState().selectEntity(hitId, true);
+    const store = useSkyStore.getState();
+    if (store.audioEnabled) {
+      void tacticalAudio.unlock();
+    }
+    store.selectEntity(hitId, true);
+  };
+
+  const handleTouchStart = (e: TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length !== 1) {
+      touchStartRef.current = null;
+      return;
+    }
+    const touch = e.touches[0];
+    touchStartRef.current = { x: touch.clientX, y: touch.clientY, moved: false };
+    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
+    if (pt) {
+      updateCursorReadout(pt.px, pt.py);
+    }
+  };
+
+  const handleTouchMove = (e: TouchEvent<HTMLCanvasElement>) => {
+    if (e.touches.length !== 1) {
+      touchStartRef.current = null;
+      return;
+    }
+    const touch = e.touches[0];
+    if (touchStartRef.current) {
+      const dist = Math.hypot(
+        touch.clientX - touchStartRef.current.x,
+        touch.clientY - touchStartRef.current.y
+      );
+      if (dist >= TOUCH_DRAG_THRESHOLD_PX) {
+        touchStartRef.current.moved = true;
+      }
+    }
+    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
+    if (pt) {
+      updateCursorReadout(pt.px, pt.py);
+    }
+  };
+
+  const handleTouchEnd = (e: TouchEvent<HTMLCanvasElement>) => {
+    const start = touchStartRef.current;
+    touchStartRef.current = null;
+    if (!start || e.changedTouches.length === 0) return;
+
+    const touch = e.changedTouches[0];
+    const dragDist = Math.hypot(touch.clientX - start.x, touch.clientY - start.y);
+    if (start.moved || dragDist >= TOUCH_DRAG_THRESHOLD_PX) {
+      return;
+    }
+
+    lastTouchEndMsRef.current = performance.now();
+    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
+    if (!pt) return;
+
+    updateCursorReadout(pt.px, pt.py);
+    const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
+    if (!hitId) return;
+
+    const store = useSkyStore.getState();
+    if (store.audioEnabled) {
+      void tacticalAudio.unlock();
+    }
+    store.selectEntity(hitId, true);
+  };
+
+  const handleTouchCancel = () => {
+    touchStartRef.current = null;
   };
 
   const handleMouseLeave = () => {
@@ -1357,8 +1570,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const bezelControlsStyle: CSSProperties = {
     position: 'absolute',
-    bottom: isCompact ? 8 : 12,
-    left: isCompact ? 8 : 12,
+    bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
+    left: isCompact ? 'max(8px, env(safe-area-inset-left))' : 'max(12px, env(safe-area-inset-left))',
     display: 'flex',
     alignItems: 'center',
     gap: 6,
@@ -1367,8 +1580,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const legendStyle: CSSProperties = {
     position: 'absolute',
-    bottom: isCompact ? 8 : 12,
-    right: isCompact ? 8 : 12,
+    bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
+    right: isCompact ? 'max(8px, env(safe-area-inset-right))' : 'max(12px, env(safe-area-inset-right))',
     pointerEvents: 'none',
     display: 'flex',
     alignItems: 'center',
@@ -1386,8 +1599,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const bezelButtonStyle = (active: boolean): CSSProperties => ({
     display: 'inline-flex',
     alignItems: 'center',
+    justifyContent: 'center',
     gap: 5,
-    padding: isCompact ? '4px 7px' : '5px 9px',
+    minHeight: 30,
+    padding: isCompact ? '4px 9px' : '5px 10px',
     borderRadius: 6,
     border: active
       ? '1px solid rgba(34, 211, 238, 0.5)'
@@ -1399,6 +1614,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     fontWeight: 600,
     letterSpacing: '0.06em',
     cursor: 'pointer',
+    touchAction: 'manipulation',
     backdropFilter: 'blur(8px)',
     outline: 'none',
   });
@@ -1420,7 +1636,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         onMouseMove={handleMouseMove}
         onClick={handleClick}
         onMouseLeave={handleMouseLeave}
-        style={{ display: 'block', width: '100%', height: '100%' }}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
+        onTouchCancel={handleTouchCancel}
+        style={{ display: 'block', width: '100%', height: '100%', touchAction: 'none' }}
       />
 
       {/* Top-Left Scope Header */}
@@ -1527,12 +1747,24 @@ function pulseWaveStartMsExpired(startMs: number | null, nowMs: number): boolean
 function drawPolarTrail(
   ctx: CanvasRenderingContext2D,
   points: Array<{ x: number; y: number }>,
-  color: string
+  color: string,
+  maxSegmentLengthPx: number
 ): void {
   if (points.length < 2) return;
   for (let i = 1; i < points.length; i += 1) {
     const p0 = points[i - 1];
     const p1 = points[i];
+    if (
+      !Number.isFinite(p0.x) ||
+      !Number.isFinite(p0.y) ||
+      !Number.isFinite(p1.x) ||
+      !Number.isFinite(p1.y)
+    ) {
+      continue;
+    }
+    if (Math.hypot(p1.x - p0.x, p1.y - p0.y) > maxSegmentLengthPx) {
+      continue;
+    }
     const segAlpha = (i / points.length) * 0.5;
     ctx.save();
     ctx.globalAlpha *= segAlpha;

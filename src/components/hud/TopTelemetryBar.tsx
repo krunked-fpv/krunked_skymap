@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import { MapPin, Radio, Volume2, VolumeX } from 'lucide-react';
+import { Download, MapPin, Radio, Volume2, VolumeX } from 'lucide-react';
 import {
   CATEGORY_COLORS,
   CATEGORY_LABELS,
@@ -8,9 +8,13 @@ import {
   type UnitSystem,
 } from '../../types/sky-contracts';
 import { useSkyStore } from '../../store/useSkyStore';
+import { formatClockTime } from '../inspector/unitFormatters';
+import { STATUS_LABEL } from './ControlDock';
 
 export interface TopTelemetryBarProps {
   onToggleAudio?: (enabled: boolean) => void;
+  onInstallPwa?: () => void;
+  onDismissPwa?: () => void;
 }
 
 const BADGE_ORDER: Array<{ category: SkyCategory; tag: string }> = [
@@ -38,7 +42,11 @@ function formatCompactObserverCoords(lat: number, lon: number): string {
   return `${Math.abs(lat).toFixed(2)}°${ns} ${Math.abs(lon).toFixed(2)}°${ew}`;
 }
 
-export function TopTelemetryBar({ onToggleAudio }: TopTelemetryBarProps) {
+export function TopTelemetryBar({
+  onToggleAudio,
+  onInstallPwa,
+  onDismissPwa,
+}: TopTelemetryBarProps) {
   const observer = useSkyStore((s) => s.observer);
   const counts = useSkyStore((s) => s.counts);
   const layers = useSkyStore((s) => s.layers);
@@ -55,6 +63,10 @@ export function TopTelemetryBar({ onToggleAudio }: TopTelemetryBarProps) {
   const setAudioVolume = useSkyStore((s) => s.setAudioVolume);
   const setOdidModalOpen = useSkyStore((s) => s.setOdidModalOpen);
   const odidConfig = useSkyStore((s) => s.odidConfig);
+  const flightsFeed = useSkyStore((s) => s.feeds.flights);
+  const pwaInstallAvailable = useSkyStore((s) => s.pwaInstallAvailable);
+  const pwaInstallDismissed = useSkyStore((s) => s.pwaInstallDismissed);
+  const isStandalonePwa = useSkyStore((s) => s.isStandalonePwa);
 
   const handleAudioClick = () => {
     const next = !audioEnabled;
@@ -62,11 +74,31 @@ export function TopTelemetryBar({ onToggleAudio }: TopTelemetryBarProps) {
     onToggleAudio?.(next);
   };
 
+  const handleDismissPwa = () => {
+    onDismissPwa?.();
+    useSkyStore.getState().setPwaInstallState({ dismissed: true });
+  };
+
   const odidDotClass = odidConfig.connected
     ? 'odid-trigger-dot is-live'
     : odidConfig.simulatorEnabled
       ? 'odid-trigger-dot is-sim'
       : 'odid-trigger-dot';
+
+  const liveAircraftCount = counts.flight + counts.military;
+  const flightStatusLabel = STATUS_LABEL[flightsFeed.status] ?? 'UNKNOWN';
+  const flightUpdatedClock = formatClockTime(flightsFeed.lastUpdatedMs, '--:--:--');
+  const feedTooltip = [
+    `ADS-B Feed: ${flightStatusLabel}`,
+    `Provider: ${flightsFeed.provider || 'adsb-cascade'}`,
+    `Verified Live: ${liveAircraftCount} AC`,
+    `Updated: ${flightUpdatedClock}`,
+    flightsFeed.errorMsg ? `Diagnostics: ${flightsFeed.errorMsg}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  const showPwaInstall = pwaInstallAvailable && !pwaInstallDismissed && !isStandalonePwa;
 
   return (
     <header className="top-telemetry-bar" aria-label="Telemetry status and cockpit controls">
@@ -129,6 +161,23 @@ export function TopTelemetryBar({ onToggleAudio }: TopTelemetryBarProps) {
           <span>{Math.round(fps)} FPS</span>
           <span aria-hidden="true">·</span>
           <span>{workerReady ? 'SGP4 OK' : 'SGP4 INIT'}</span>
+        </div>
+
+        <div
+          className={`topbar-feed-pill feed-pill--${flightsFeed.status} tabular`}
+          data-testid="hud-feed-diagnostics"
+          title={feedTooltip}
+          role="status"
+        >
+          <span className="topbar-feed-pill__status">{flightStatusLabel}</span>
+          <span className="topbar-feed-pill__sep" aria-hidden="true">
+            ·
+          </span>
+          <span className="topbar-feed-pill__count">{liveAircraftCount} AC</span>
+          <span className="topbar-feed-pill__sep" aria-hidden="true">
+            ·
+          </span>
+          <span className="topbar-feed-pill__time tabular">UPD {flightUpdatedClock}</span>
         </div>
       </div>
 
@@ -200,6 +249,36 @@ export function TopTelemetryBar({ onToggleAudio }: TopTelemetryBarProps) {
           <Radio size={12} aria-hidden="true" />
           <span>ODID STREAM</span>
         </button>
+
+        {showPwaInstall && (
+          <div
+            className="pwa-install-pill"
+            data-testid="pwa-install-banner"
+            role="region"
+            aria-label="Install Sky-Map application"
+          >
+            <button
+              type="button"
+              className="pwa-install-btn"
+              data-testid="pwa-install-btn"
+              onClick={() => onInstallPwa?.()}
+              title="Install Krunked Sky-Map as a standalone app"
+            >
+              <Download size={13} aria-hidden="true" />
+              <span>Install App</span>
+            </button>
+            <button
+              type="button"
+              className="pwa-dismiss-btn"
+              data-testid="pwa-install-dismiss"
+              aria-label="Dismiss install app prompt"
+              title="Dismiss install prompt"
+              onClick={handleDismissPwa}
+            >
+              ×
+            </button>
+          </div>
+        )}
       </div>
     </header>
   );
