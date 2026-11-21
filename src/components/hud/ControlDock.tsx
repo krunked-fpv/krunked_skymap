@@ -69,10 +69,13 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 const STATUS_LABEL: Record<FeedHealthStatus, string> = {
   idle: 'IDLE',
-  loading: 'LOADING',
+  loading: 'SYNCING',
   live: 'LIVE',
+  delayed: 'DELAYED',
+  'rate-limited': 'RATE-LIMITED',
+  offline: 'OFFLINE',
   cached: 'CACHED',
-  fallback: 'FALLBACK',
+  fallback: 'SEEDED',
   error: 'ERROR',
 };
 

@@ -8,7 +8,7 @@
   - `SondeHub v2` (`https://api.v2.sondehub.org/sondes` & `/amateur`): Direct CORS `*`.
   - `Open-Meteo Geocoding` (`https://geocoding-api.open-meteo.com/v1/search`): Direct CORS `*` with Nominatim fallback.
   - `FAA ArcGIS FeatureServers` (`FAA_UAS_FacilityMap_Data` queried via `where=LATITUDE BETWEEN ... AND LONGITUDE BETWEEN ...`, plus `Special_Use_Airspace` and `Boundary_Airspace` queried via spatial envelope): Direct CORS `*`, US airspace coverage check included, with `./data/fallback-airspace.geojson` fallback.
-  - `ADS-B Cascade`: Local `vite dev` / `vite preview` proxies `/api-proxy/adsb-lol` and `/api-proxy/adsb-fi` -> Direct cascade (`airplanes.live` -> `adsb.lol` -> `opensky-network.org`) -> Schema-validated CORS JSON relay (`api.codetabs.com`) -> Pre-seeded `./data/fallback-flights.json` relative translator badged `FALLBACK`.
+  - `ADS-B Cascade (Zero Phantom / Verified Live Only)`: Local `vite dev` / `vite preview` proxies `/api-proxy/adsb-fi`, `/api-proxy/adsb-lol`, and `/api-proxy/airplanes-live` -> Direct browser cascade (`adsb.lol` -> `airplanes.live` -> `opensky-network.org`) -> Schema-validated CORS JSON relay (`api.codetabs.com`). Zero synthetic/fallback aircraft are ever fabricated or translated around the observer (`public/data/fallback-flights.json` purged; `SIM-ODID` defaults to `false`). Honest `FeedHealthStatus` (`live`, `delayed`, `rate-limited`, `offline`, `error`) surfaces exact `lastUpdatedMs` and verified aircraft count in the HUD.
 
 ## 2. Directory & Exclusive File Ownership Matrix
 
@@ -47,7 +47,7 @@
 - `satellite`: `#C084FC` (Orbital Violet; `#E879F9` sunlit / `#7E22CE` eclipsed)
 - `balloon`: `#34D399` (Stratospheric Emerald)
 - `drone`: `#A3E635` (Compliant UAS) / `#FB7185` (TFR & Ceiling Breach Coral)
-- Viewport: `100dvh x 100dvw`, zero page scrollbars, tabular numerals throughout, responsive `<= 860px` bottom-sheet mobile layout.
+- **Viewport & Installable PWA:** `100dvh x 100dvw`, zero page scrollbars, `overscroll-behavior: none`, `env(safe-area-inset-*)` mobile safe-area compliance, tabular numerals throughout, responsive `<= 860px` bottom-sheet mobile layout, high-DPI collision-culled Map & Sky-Dome rendering, relative-scoped `./manifest.json` + `./sw.js` (network-first shell, live telemetry API cache bypass), valid `192x192`/`512x512` PNG icons, and dismissible `beforeinstallprompt` HUD trigger.
 
 ## 6. Goal-Grade Verification Gates
 1. `node scripts/refresh-ephemeris.mjs` generates valid static TLEs + flight/airspace snapshots.

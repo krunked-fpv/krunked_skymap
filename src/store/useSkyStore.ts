@@ -67,6 +67,11 @@ export interface SkyStoreState {
   audioVolume: number;
   sweepEnabled: boolean;
   domeLabelsEnabled: boolean;
+  mapLabelsEnabled: boolean;
+  recenterNonce: number;
+  pwaInstallAvailable: boolean;
+  pwaInstallDismissed: boolean;
+  isStandalonePwa: boolean;
   selectedId: string | null;
   hoveredId: string | null;
   followSelected: boolean;
@@ -95,6 +100,9 @@ export interface SkyStoreState {
   setAudioVolume: (volume: number) => void;
   setSweepEnabled: (enabled: boolean) => void;
   setDomeLabelsEnabled: (enabled: boolean) => void;
+  setMapLabelsEnabled: (enabled: boolean) => void;
+  bumpRecenterNonce: () => void;
+  setPwaInstallState: (patch: { available?: boolean; dismissed?: boolean; standalone?: boolean }) => void;
   selectEntity: (id: string | null, openInspector?: boolean) => void;
   setHoveredId: (id: string | null) => void;
   setFollowSelected: (follow: boolean) => void;
@@ -158,7 +166,7 @@ const createInitialFeeds = (): Record<FeedKey, FeedTelemetryState> => ({
     lastUpdatedMs: null,
     nextRefreshSec: 1,
     intervalSec: 1,
-    provider: 'sim-opendroneid',
+    provider: 'off',
     count: 0,
   },
 });
@@ -192,13 +200,18 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   audioVolume: 0.35,
   sweepEnabled: true,
   domeLabelsEnabled: true,
+  mapLabelsEnabled: true,
+  recenterNonce: 0,
+  pwaInstallAvailable: false,
+  pwaInstallDismissed: false,
+  isStandalonePwa: false,
   selectedId: null,
   hoveredId: null,
   followSelected: false,
   inspectorOpen: false,
   odidModalOpen: false,
   odidConfig: {
-    simulatorEnabled: true,
+    simulatorEnabled: false,
     endpointUrl: '',
     transport: 'off',
     connected: false,
@@ -224,7 +237,8 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   sweepPulseCounter: 0,
   selectedEntitySnapshot: null,
 
-  setObserver: (observer) => set({ observer }),
+  setObserver: (observer) =>
+    set((state) => ({ observer, recenterNonce: state.recenterNonce + 1 })),
   setRadiusKm: (radiusKm) =>
     set({ radiusKm: Math.max(10, Math.min(250, Math.round(radiusKm))) }),
   toggleLayer: (category) =>
@@ -248,6 +262,18 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     set({ audioVolume: Math.max(0, Math.min(1, audioVolume)) }),
   setSweepEnabled: (sweepEnabled) => set({ sweepEnabled }),
   setDomeLabelsEnabled: (domeLabelsEnabled) => set({ domeLabelsEnabled }),
+  setMapLabelsEnabled: (mapLabelsEnabled) => set({ mapLabelsEnabled }),
+  bumpRecenterNonce: () =>
+    set((state) => ({ recenterNonce: state.recenterNonce + 1 })),
+  setPwaInstallState: (patch) =>
+    set((state) => ({
+      pwaInstallAvailable:
+        patch.available !== undefined ? patch.available : state.pwaInstallAvailable,
+      pwaInstallDismissed:
+        patch.dismissed !== undefined ? patch.dismissed : state.pwaInstallDismissed,
+      isStandalonePwa:
+        patch.standalone !== undefined ? patch.standalone : state.isStandalonePwa,
+    })),
   selectEntity: (id, openInspector = true) =>
     set((state) => ({
       selectedId: id,
@@ -293,6 +319,7 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   hydrateFromUrlState: (patch) =>
     set((state) => ({
       observer: patch.observer ?? state.observer,
+      recenterNonce: patch.observer ? state.recenterNonce + 1 : state.recenterNonce,
       radiusKm:
         patch.radiusKm !== undefined
           ? Math.max(10, Math.min(250, Math.round(patch.radiusKm)))

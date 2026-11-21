@@ -2,7 +2,16 @@ export type SkyCategory = 'flight' | 'military' | 'satellite' | 'balloon' | 'dro
 
 export type FeedKey = 'flights' | 'satellites' | 'balloons' | 'airspace' | 'drones';
 
-export type FeedHealthStatus = 'idle' | 'loading' | 'live' | 'cached' | 'fallback' | 'error';
+export type FeedHealthStatus =
+  | 'idle'
+  | 'loading'
+  | 'live'
+  | 'delayed'
+  | 'rate-limited'
+  | 'offline'
+  | 'cached'
+  | 'fallback'
+  | 'error';
 
 export type UnitSystem = 'aviation' | 'metric';
 
@@ -135,6 +144,7 @@ export interface BaseSkyEntity {
   altBaroM?: number;
   speedMs: number;
   headingDeg: number;
+  headingValid?: boolean;
   vertRateMs: number;
   timestampMs: number;
   topocentric: TopocentricCoords;
@@ -200,10 +210,12 @@ export type SkyEntity = FlightEntity | SatelliteEntity | BalloonEntity | DroneEn
 export interface FeedTelemetryState {
   status: FeedHealthStatus;
   lastUpdatedMs: number | null;
+  lastCheckedMs?: number | null;
   nextRefreshSec: number;
   intervalSec: number;
   provider: string;
   errorMsg?: string;
+  httpStatus?: number;
   count: number;
 }
 
