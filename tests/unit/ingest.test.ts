@@ -19,7 +19,9 @@ import {
 import {
   classifyMilitary,
   clearFlightsServiceCache,
+  extractRelayedJsonPayload,
   fetchFlightsCascade,
+  isLocalDevOrLanRuntime,
   normalizeAdsbxAircraft,
   normalizeOpenSkyState,
 } from '../../src/services/flightsService';
@@ -29,7 +31,11 @@ import {
   parseTleText,
   refreshTlesIfStale,
 } from '../../src/services/satellitesService';
-import { fetchBalloons, normalizeSondeRecord } from '../../src/services/balloonsService';
+import {
+  balloonsCircuitBreaker,
+  fetchBalloons,
+  normalizeSondeRecord,
+} from '../../src/services/balloonsService';
 import {
   evaluateDroneAirspaceCompliance,
   fetchAirspace,
@@ -241,6 +247,8 @@ describe('httpClient resilience primitives', () => {
       }, 'adsb.lol')
     ).rejects.toThrow('upstream 503');
     expect(breaker.getState('adsb.lol')).toBe('open');
+    expect(breaker.getLastError('adsb.lol')).toBeInstanceOf(Error);
+    expect((breaker.getLastError('adsb.lol') as Error).message).toBe('upstream 503');
 
     await expect(
       breaker.execute(async () => 'ok', 'adsb.lol')
@@ -251,6 +259,15 @@ describe('httpClient resilience primitives', () => {
     const result = await breaker.execute(async () => 'recovered', 'adsb.lol');
     expect(result).toBe('recovered');
     expect(breaker.getState('adsb.lol')).toBe('closed');
+    expect(breaker.getLastError('adsb.lol')).toBeUndefined();
+
+    // Backward-compatible recordFailure without error preserves existing lastError
+    const err429 = new HttpError(429, 'https://example.test/api', 'HTTP 429');
+    breaker.recordFailure('legacy', err429);
+    breaker.recordFailure('legacy');
+    expect(breaker.getLastError('legacy')).toBe(err429);
+    breaker.recordSuccess('legacy');
+    expect(breaker.getLastError('legacy')).toBeUndefined();
   });
 
   it('fetches text, throws HttpError on non-2xx, and aborts on timeout', async () => {
@@ -634,17 +651,17 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(cachedRes.entities).toHaveLength(1);
     expect(calledUrls.length).toBe(callsBeforeCache);
 
-    // Test codetabs relay with valid ac[] schema
+    // Test Stage 2 CORS simple-GET relay (r.jina.ai -> adsb.lol) with Jina Markdown Content wrapper
     vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
     vi.stubGlobal(
       'fetch',
       vi.fn(async (input: RequestInfo | URL) => {
         const url = String(input);
-        if (url.includes('api.codetabs.com')) {
+        if (url.startsWith('https://r.jina.ai/https://api.adsb.lol/')) {
           return new Response(
-            JSON.stringify({
+            `Title: \n\nURL Source: ${url}\n\nMarkdown Content:\n${JSON.stringify({
               ac: [{ hex: 'a77777', flight: 'JAL12', lat: 35.58, lon: 139.8, alt_baro: 12000, gs: 320, track: 45 }],
-            }),
+            })}`,
             { status: 200 }
           );
         }
@@ -653,12 +670,12 @@ describe('flightsService classification, normalization & cascade', () => {
     );
     const relayRes = await fetchFlightsCascade(TOKYO_OBSERVER, 130, undefined, { force: true });
     expect(relayRes.status).toBe('live');
-    expect(relayRes.provider).toBe('codetabs-relay:adsb.lol');
+    expect(relayRes.provider).toBe('cors-relay:adsb.lol');
 
-    // Test codetabs schema rejection -> ZERO phantom flights, honest error status, never fetches fallback-flights.json
+    // Test relay schema rejection -> ZERO phantom flights, honest error status, never fetches fallback-flights.json
     const rejectedFetch = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.includes('api.codetabs.com')) {
+      if (url.startsWith('https://r.jina.ai/')) {
         return new Response(JSON.stringify({ Error: 'Proxy limit reached' }), { status: 200 });
       }
       return new Response('Service Unavailable', { status: 503 });
@@ -822,12 +839,12 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(String(fetchMock.mock.calls[0][0])).toContain('/65');
   });
 
-  it('treats valid empty { ac: [] } or OpenSky { states: [] } as authoritative live without calling downstream providers', async () => {
+  it('treats valid empty { ac: [] } / { aircraft: [] } or OpenSky { states: [] } as authoritative live without calling downstream providers', async () => {
     vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
     const adsbEmptySpy = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      if (url.startsWith('https://api.adsb.lol/')) {
-        return new Response(JSON.stringify({ ac: [] }), { status: 200 });
+      if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+        return new Response(JSON.stringify({ aircraft: [] }), { status: 200 });
       }
       throw new Error(`Unexpected downstream call to ${url}`);
     });
@@ -835,7 +852,7 @@ describe('flightsService classification, normalization & cascade', () => {
 
     const emptyLive = await fetchFlightsCascade(DCA_OBSERVER, 120);
     expect(emptyLive.status).toBe('live');
-    expect(emptyLive.provider).toBe('adsb.lol');
+    expect(emptyLive.provider).toBe('cors-relay:adsb.fi');
     expect(emptyLive.entities).toEqual([]);
     expect(adsbEmptySpy).toHaveBeenCalledTimes(1);
 
@@ -885,15 +902,12 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(osUrls.some((u) => u.includes('lomax=180.0000') && !u.includes('lomin=-180.0000'))).toBe(true);
     expect(osUrls.some((u) => u.includes('lomin=-180.0000') && !u.includes('lomax=180.0000'))).toBe(true);
 
-    // OpenSky empty states: [] returns live immediately without calling codetabs relay
+    // OpenSky empty states: [] returns live immediately without calling downstream fallback
     clearFlightsServiceCache();
     const osEmptySpy = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.startsWith('https://opensky-network.org/')) {
         return new Response(JSON.stringify({ states: [] }), { status: 200 });
-      }
-      if (url.includes('api.codetabs.com')) {
-        throw new Error('Should not invoke codetabs after empty OpenSky live response');
       }
       return new Response('Down', { status: 503 });
     });
@@ -904,8 +918,8 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(osEmpty.entities).toEqual([]);
   });
 
-  it('enforces proxy & direct cascade order, OpenSky stale/ground filtering, polar guard, and data.Error rejection', async () => {
-    // Localhost proxy order: adsb.fi -> adsb.lol -> airplanes.live
+  it('enforces proxy, zero-preflight relay, & direct cascade order, OpenSky stale/ground filtering, polar guard, and data.Error rejection', async () => {
+    // Stage 1 localhost proxy order: adsb.fi (v3) -> adsb.lol -> airplanes.live
     vi.stubGlobal('window', { location: { hostname: 'localhost' } });
     const proxyUrls: string[] = [];
     vi.stubGlobal(
@@ -931,20 +945,21 @@ describe('flightsService classification, normalization & cascade', () => {
     const proxyOrderRes = await fetchFlightsCascade(DCA_OBSERVER, 120);
     expect(proxyOrderRes.status).toBe('live');
     expect(proxyOrderRes.provider).toBe('vite-proxy:airplanes.live');
-    expect(proxyUrls[0]).toContain('/api-proxy/adsb-fi/');
+    expect(proxyUrls[0]).toContain('/api-proxy/adsb-fi/api/v3/');
     expect(proxyUrls[1]).toContain('/api-proxy/adsb-lol/');
     expect(proxyUrls[2]).toContain('/api-proxy/airplanes-live/');
 
-    // Direct cascade order: adsb.lol -> airplanes.live -> opensky-network (filters ground/stale) -> codetabs
+    // Stage 2 -> Stage 3 public domain cascade order:
+    // cors-relay:adsb.fi -> cors-relay:adsb.lol -> adsb.lol -> opensky-network (filters ground/stale; never calls api.airplanes.live)
     clearFlightsServiceCache();
     vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
-    const directUrls: string[] = [];
+    const directCalls: Array<{ url: string; headers?: HeadersInit }> = [];
     const nowSec = Math.floor(Date.now() / 1000);
     vi.stubGlobal(
       'fetch',
-      vi.fn(async (input: RequestInfo | URL) => {
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
-        directUrls.push(url);
+        directCalls.push({ url, headers: init?.headers });
         if (url.startsWith('https://opensky-network.org/')) {
           return new Response(
             JSON.stringify({
@@ -965,9 +980,13 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(osFiltered.status).toBe('live');
     expect(osFiltered.provider).toBe('opensky-network');
     expect(osFiltered.entities.map((e) => e.callsign)).toEqual(['AIR1']);
-    expect(directUrls[0]).toContain('https://api.adsb.lol/');
-    expect(directUrls[1]).toContain('https://api.airplanes.live/');
-    expect(directUrls[2]).toContain('https://opensky-network.org/');
+    expect(directCalls[0].url).toContain('https://r.jina.ai/https://opendata.adsb.fi/api/v3/');
+    expect(directCalls[0].headers).toBeUndefined();
+    expect(directCalls[1].url).toContain('https://r.jina.ai/https://api.adsb.lol/v2/');
+    expect(directCalls[1].headers).toBeUndefined();
+    expect(directCalls[2].url).toContain('https://api.adsb.lol/v2/');
+    expect(directCalls[3].url).toContain('https://opensky-network.org/');
+    expect(directCalls.some((c) => c.url.includes('api.airplanes.live'))).toBe(false);
 
     // Polar observer skips OpenSky without issuing a 360° global request
     clearFlightsServiceCache();
@@ -984,6 +1003,214 @@ describe('flightsService classification, normalization & cascade', () => {
     expect(polarRes.status).toBe('error');
     expect(polarRes.entities).toEqual([]);
     expect(polarUrls.some((u) => u.includes('opensky-network.org'))).toBe(false);
+  });
+
+  it('extractRelayedJsonPayload parses Jina Markdown Content, direct JSON, Jina {data:{content}}, and rejects HTML, {Error}, and truncated JSON', () => {
+    const jinaMarkdown = [
+      'Title: ',
+      '',
+      'URL Source: https://opendata.adsb.fi/api/v3/lat/38.85/lon/-77.04/dist/65',
+      '',
+      'Markdown Content:',
+      '{"aircraft":[{"hex":"a12345","flight":"UAL1"}]}',
+    ].join('\n');
+    expect(extractRelayedJsonPayload(jinaMarkdown, 'cors-relay:adsb.fi')).toEqual({
+      aircraft: [{ hex: 'a12345', flight: 'UAL1' }],
+    });
+
+    const jinaMarkdownCrlf = `URL Source: https://api.adsb.lol/\r\n\r\nMarkdown Content:\r\n{"ac":[{"hex":"a54321"}]}`;
+    expect(extractRelayedJsonPayload(jinaMarkdownCrlf, 'cors-relay:adsb.lol')).toEqual({
+      ac: [{ hex: 'a54321' }],
+    });
+
+    expect(extractRelayedJsonPayload('  {"ac":[{"hex":"a99999"}]}  ', 'direct')).toEqual({
+      ac: [{ hex: 'a99999' }],
+    });
+
+    const jinaEnvelope = JSON.stringify({
+      code: 200,
+      status: 20000,
+      data: {
+        title: '',
+        content: '{"aircraft":[{"hex":"a77777"}]}',
+      },
+    });
+    expect(extractRelayedJsonPayload(jinaEnvelope, 'cors-relay:adsb.fi')).toEqual({
+      aircraft: [{ hex: 'a77777' }],
+    });
+
+    // Rejections: HTML, wrapped HTML, { Error }, truncated JSON, arrays, empty/unmarked text
+    expect(() =>
+      extractRelayedJsonPayload('<!doctype html><html><body>502 Bad Gateway</body></html>', 'relay')
+    ).toThrow();
+    expect(() =>
+      extractRelayedJsonPayload('<html><body>Blocked</body></html>', 'relay')
+    ).toThrow();
+    expect(() =>
+      extractRelayedJsonPayload('URL Source: x\n\nMarkdown Content:\n<!doctype html><html>403</html>', 'relay')
+    ).toThrow();
+    expect(() =>
+      extractRelayedJsonPayload(JSON.stringify({ data: { content: '<html>err</html>' } }), 'relay')
+    ).toThrow();
+    expect(() =>
+      extractRelayedJsonPayload('{"Error":"Rate limit exceeded"}', 'relay')
+    ).toThrow('Rate limit exceeded');
+    expect(() =>
+      extractRelayedJsonPayload('Markdown Content:\n{"Error":"Upstream limit"}', 'relay')
+    ).toThrow('Upstream limit');
+    expect(() =>
+      extractRelayedJsonPayload('{"ac":[{"hex":"a12', 'relay')
+    ).toThrow();
+    expect(() =>
+      extractRelayedJsonPayload('Markdown Content:\n{"ac":[{"hex":"a12', 'relay')
+    ).toThrow();
+    expect(() => extractRelayedJsonPayload('[1, 2, 3]', 'relay')).toThrow('Invalid payload from relay');
+    expect(() => extractRelayedJsonPayload('   ', 'relay')).toThrow('Invalid payload from relay');
+  });
+
+  it('detects local dev / LAN runtimes vs public domains and fast-bypasses static 404/HTML proxy responses cleanly', async () => {
+    const devHosts = [
+      'localhost',
+      '127.0.0.1',
+      '::1',
+      '[::1]',
+      '192.168.1.42',
+      '10.0.0.5',
+      '172.20.0.2',
+      '100.64.0.1',
+      'macbook.local',
+      'cockpit-dev',
+    ];
+    for (const hostname of devHosts) {
+      vi.stubGlobal('window', { location: { hostname } });
+      expect(isLocalDevOrLanRuntime(), `${hostname} should be local/LAN`).toBe(true);
+    }
+
+    const publicHosts = ['krunked-fpv.github.io', 'krunked.github.io', '172.32.0.1', '100.128.0.1'];
+    for (const hostname of publicHosts) {
+      vi.stubGlobal('window', { location: { hostname } });
+      expect(isLocalDevOrLanRuntime(), `${hostname} should be public`).toBe(false);
+    }
+
+    // Static server at 127.0.0.1 returning 404 on /api-proxy/adsb-fi/ fast-bypasses Stage 1 without calling adsb-lol/airplanes-live proxies
+    clearFlightsServiceCache();
+    vi.stubGlobal('window', { location: { hostname: '127.0.0.1' } });
+    const bypassCalls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        bypassCalls.push(url);
+        if (url.startsWith('/api-proxy/adsb-fi/')) {
+          return new Response('Not Found', { status: 404, statusText: 'Not Found' });
+        }
+        if (url.startsWith('/api-proxy/adsb-lol/') || url.startsWith('/api-proxy/airplanes-live/')) {
+          throw new Error(`Should have fast-bypassed ${url}`);
+        }
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            JSON.stringify({
+              aircraft: [{ hex: 'a88888', flight: 'LAN1', lat: 38.86, lon: -77.05, alt_baro: 10000, gs: 260, track: 90 }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const bypassLive = await fetchFlightsCascade(DCA_OBSERVER, 120);
+    expect(bypassLive.status).toBe('live');
+    expect(bypassLive.provider).toBe('cors-relay:adsb.fi');
+    expect(bypassLive.httpStatus).toBeUndefined();
+    expect(bypassCalls).toHaveLength(2);
+    expect(bypassCalls[0]).toContain('/api-proxy/adsb-fi/');
+    expect(bypassCalls[1]).toContain('https://r.jina.ai/https://opendata.adsb.fi/');
+
+    // Subsequent call while viteProxyUnavailable is latched skips Stage 1 completely
+    const callsAfterLatch: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        callsAfterLatch.push(url);
+        throw new TypeError('Failed to fetch');
+      })
+    );
+    const latchedErr = await fetchFlightsCascade(DCA_OBSERVER, 120, undefined, { force: true });
+    expect(latchedErr.status).toBe('error');
+    expect(latchedErr.httpStatus).toBeUndefined();
+    expect(callsAfterLatch.some((u) => u.startsWith('/api-proxy/'))).toBe(false);
+
+    // Static 404 on fresh probe never leaks 404 into httpStatus when downstream fails with TypeError, and HTML SPA fallback also bypasses cleanly
+    clearFlightsServiceCache();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('/api-proxy/adsb-fi/')) {
+          return new Response('<!doctype html><html><body>SPA</body></html>', { status: 200 });
+        }
+        if (url.startsWith('/api-proxy/adsb-lol/') || url.startsWith('/api-proxy/airplanes-live/')) {
+          throw new Error(`Should not call ${url} after HTML fast-bypass`);
+        }
+        throw new TypeError('Failed to fetch');
+      })
+    );
+    const htmlBypassFail = await fetchFlightsCascade(DCA_OBSERVER, 120);
+    expect(htmlBypassFail.status).toBe('error');
+    expect(htmlBypassFail.httpStatus).toBeUndefined();
+    expect(htmlBypassFail.errorMsg).not.toContain('vite-proxy:adsb.fi');
+  });
+
+  it('recovers immediately with resetBreakers: true and preserves rate-limited + (HTTP 429) details on open 429 breakers', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    const rlUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        rlUrls.push(String(input));
+        return new Response('Too Many Requests', { status: 429, statusText: 'Too Many Requests' });
+      })
+    );
+
+    // 3 failed passes trip cors-relay:adsb.fi, adsb.lol, and opensky (cors-relay:adsb.lol skipped due to shared 429)
+    for (let i = 0; i < 3; i++) {
+      const res = await fetchFlightsCascade(DCA_OBSERVER, 120, undefined, { force: true });
+      expect(res.status).toBe('rate-limited');
+      expect(res.httpStatus).toBe(429);
+    }
+    expect(rlUrls.some((u) => u.includes('https://r.jina.ai/https://api.adsb.lol/'))).toBe(false);
+
+    // 4th pass with healthy mock MUST still see open circuit breakers (0 fetch calls), preserving rate-limited + (HTTP 429)
+    const liveMockAfterTrip = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+        return new Response(
+          JSON.stringify({
+            aircraft: [{ hex: 'a44444', flight: 'REC1', lat: 38.86, lon: -77.05, alt_baro: 9500, gs: 250, track: 110 }],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('Down', { status: 503 });
+    });
+    vi.stubGlobal('fetch', liveMockAfterTrip);
+
+    const openRes = await fetchFlightsCascade(DCA_OBSERVER, 120, undefined, { force: true });
+    expect(liveMockAfterTrip).not.toHaveBeenCalled();
+    expect(openRes.status).toBe('rate-limited');
+    expect(openRes.httpStatus).toBe(429);
+    expect(openRes.errorMsg).toContain('(HTTP 429)');
+
+    // 5th pass with resetBreakers: true resets breakers immediately and recovers live traffic
+    const recoveredRes = await fetchFlightsCascade(DCA_OBSERVER, 120, undefined, {
+      force: true,
+      resetBreakers: true,
+    });
+    expect(recoveredRes.status).toBe('live');
+    expect(recoveredRes.provider).toBe('cors-relay:adsb.fi');
+    expect(recoveredRes.entities.map((e) => e.callsign)).toEqual(['REC1']);
   });
 });
 
@@ -1213,6 +1440,43 @@ describe('balloonsService SondeHub parsing & nearestSondeHint', () => {
       { prev: b2 }
     )!;
     expect(bJump.trail).toHaveLength(1);
+  });
+
+  it('resets balloonsCircuitBreaker when fetchBalloons is called with force: true', async () => {
+    balloonsCircuitBreaker.reset();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('Unavailable', { status: 503 }))
+    );
+
+    for (let i = 0; i < 3; i++) {
+      const errRes = await fetchBalloons(DCA_OBSERVER, 120);
+      expect(errRes.status).toBe('error');
+    }
+    expect(balloonsCircuitBreaker.getState('sondehub-sondes')).toBe('open');
+    expect(balloonsCircuitBreaker.getState('sondehub-amateur')).toBe('open');
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/sondes')) {
+          return new Response(
+            JSON.stringify([{ serial: 'R4100888', lat: 38.9, lon: -77.01, alt: 12000, vel_v: 5.0, vel_h: 15 }]),
+            { status: 200 }
+          );
+        }
+        return new Response(JSON.stringify({}), { status: 200 });
+      })
+    );
+
+    const blockedRes = await fetchBalloons(DCA_OBSERVER, 120);
+    expect(blockedRes.status).toBe('error');
+
+    const recoveredRes = await fetchBalloons(DCA_OBSERVER, 120, undefined, { force: true });
+    expect(recoveredRes.status).toBe('live');
+    expect(recoveredRes.entities.map((e) => e.serial)).toEqual(['R4100888']);
+    balloonsCircuitBreaker.reset();
   });
 });
 

@@ -238,6 +238,7 @@ interface BreakerEntry {
   failures: number;
   openedAtMs: number;
   halfOpenInFlight: number;
+  lastError?: unknown;
 }
 
 /**
@@ -297,10 +298,14 @@ export class CircuitBreaker {
     entry.failures = 0;
     entry.openedAtMs = 0;
     entry.halfOpenInFlight = 0;
+    entry.lastError = undefined;
   }
 
-  recordFailure(key = 'default'): void {
+  recordFailure(key = 'default', error?: unknown): void {
     const entry = this.getEntry(key);
+    if (error !== undefined) {
+      entry.lastError = error;
+    }
     if (entry.state === 'half-open') {
       entry.state = 'open';
       entry.openedAtMs = this.nowFn();
@@ -315,6 +320,10 @@ export class CircuitBreaker {
       entry.openedAtMs = this.nowFn();
       entry.halfOpenInFlight = 0;
     }
+  }
+
+  getLastError(key = 'default'): unknown {
+    return this.entries.get(key)?.lastError;
   }
 
   async execute<T>(fn: () => Promise<T>, key = 'default'): Promise<T> {
@@ -338,7 +347,7 @@ export class CircuitBreaker {
       this.recordSuccess(key);
       return result;
     } catch (error) {
-      this.recordFailure(key);
+      this.recordFailure(key, error);
       throw error;
     }
   }

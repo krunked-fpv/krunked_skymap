@@ -16,6 +16,7 @@ import {
   HttpError,
   TokenBucketRateLimiter,
   fetchJsonWithTimeout,
+  fetchTextWithTimeout,
 } from './httpClient';
 
 const FT_TO_M = 0.3048;
@@ -23,6 +24,7 @@ const KNOTS_TO_MS = 0.514444;
 const FPM_TO_MS = 0.00508;
 const MAX_TRAIL_POINTS = 24;
 const DEFAULT_ADSB_TIMEOUT_MS = 3500;
+const RELAY_ADSB_TIMEOUT_MS = 6500;
 
 export interface RawAdsbxAircraft {
   hex?: unknown;
@@ -55,6 +57,7 @@ export interface RawAdsbxAircraft {
 
 export interface FlightsFetchOptions {
   force?: boolean;
+  resetBreakers?: boolean;
   rateLimitKey?: string;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -91,10 +94,13 @@ const lastCachedFlightsByKey = new Map<
   }
 >();
 
+let viteProxyUnavailable = false;
+
 export function clearFlightsServiceCache(): void {
   lastCachedFlightsByKey.clear();
   adsbRateLimiter.reset();
   flightsCircuitBreaker.reset();
+  viteProxyUnavailable = false;
 }
 
 const MILITARY_HEX_RANGES: ReadonlyArray<readonly [number, number]> = [
@@ -598,10 +604,122 @@ export function normalizeOpenSkyState(
   };
 }
 
-function isLocalhostRuntime(): boolean {
-  if (typeof window === 'undefined' || !window.location) return false;
-  const host = window.location.hostname;
-  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+const PRIVATE_OR_CGNAT_IP_REGEX =
+  /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.|100\.(?:6[4-9]|[7-9]\d|1[0-1]\d|12[0-7])\.)/;
+
+class StaticProxyUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StaticProxyUnavailableError';
+  }
+}
+
+function throwIfUpstreamErrorField(
+  data: Record<string, unknown>,
+  providerLabel: string
+): void {
+  const hasErrorField =
+    (typeof data.Error === 'string' && data.Error.trim().length > 0) ||
+    (data.Error !== undefined &&
+      data.Error !== null &&
+      typeof data.Error !== 'string' &&
+      Boolean(data.Error));
+  if (hasErrorField) {
+    throw new Error(
+      typeof data.Error === 'string'
+        ? data.Error.trim()
+        : `Upstream error from ${providerLabel}`
+    );
+  }
+}
+
+export function isLocalDevOrLanRuntime(): boolean {
+  const metaEnv = typeof import.meta !== 'undefined' ? import.meta.env : undefined;
+  const isTestRuntime = Boolean(metaEnv?.VITEST || metaEnv?.MODE === 'test');
+  if (!isTestRuntime && metaEnv?.DEV === true) {
+    return true;
+  }
+
+  if (typeof window === 'undefined' || !window.location?.hostname) {
+    return false;
+  }
+
+  const rawHost = window.location.hostname.trim().toLowerCase();
+  const host = rawHost.replace(/^\[|\]$/g, '');
+  if (!host) {
+    return false;
+  }
+
+  if (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host.endsWith('.local') ||
+    !host.includes('.')
+  ) {
+    return true;
+  }
+
+  return PRIVATE_OR_CGNAT_IP_REGEX.test(host);
+}
+
+/**
+ * Extract a JSON object from direct responses, Jina `{ data: { content } }` JSON envelopes,
+ * or Jina `Markdown Content:` text payloads while rejecting HTML and upstream `{ Error }` payloads.
+ */
+export function extractRelayedJsonPayload(
+  rawText: string,
+  providerLabel: string
+): Record<string, unknown> {
+  const trimmed = typeof rawText === 'string' ? rawText.trim() : '';
+  if (!trimmed || trimmed.startsWith('<')) {
+    throw new Error(`Invalid payload from ${providerLabel}`);
+  }
+
+  let parsed: unknown;
+  if (trimmed.startsWith('{')) {
+    const topLevel = JSON.parse(trimmed) as unknown;
+    if (topLevel && typeof topLevel === 'object' && !Array.isArray(topLevel)) {
+      const topObj = topLevel as Record<string, unknown>;
+      const nestedData = topObj.data;
+      if (
+        nestedData &&
+        typeof nestedData === 'object' &&
+        !Array.isArray(nestedData) &&
+        typeof (nestedData as Record<string, unknown>).content === 'string'
+      ) {
+        const innerContent = (
+          (nestedData as Record<string, unknown>).content as string
+        ).trim();
+        if (!innerContent || innerContent.startsWith('<')) {
+          throw new Error(`Invalid payload from ${providerLabel}`);
+        }
+        parsed = JSON.parse(innerContent);
+      } else {
+        parsed = topLevel;
+      }
+    } else {
+      parsed = topLevel;
+    }
+  } else {
+    const match = /(?:^|\r?\n)Markdown Content:\s*/.exec(trimmed);
+    if (!match) {
+      throw new Error(`Invalid payload from ${providerLabel}`);
+    }
+    const content = trimmed.slice(match.index + match[0].length).trim();
+    if (!content || content.startsWith('<')) {
+      throw new Error(`Invalid payload from ${providerLabel}`);
+    }
+    parsed = JSON.parse(content);
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`Invalid payload from ${providerLabel}`);
+  }
+
+  const record = parsed as Record<string, unknown>;
+  throwIfUpstreamErrorField(record, providerLabel);
+  return record;
 }
 
 function toPrevMap(prevEntities?: Map<string, FlightEntity> | FlightEntity[]): Map<string, FlightEntity> {
@@ -711,9 +829,9 @@ function buildOpenSkyBoxes(
 
 /**
  * Multi-tier zero-key live ADS-B cascade (zero phantom/synthetic aircraft):
- * 1) Local Vite proxies (localhost/127.0.0.1 only: adsb.fi -> adsb.lol -> airplanes.live)
- * 2) Direct browser cascade (adsb.lol -> airplanes.live -> opensky-network.org)
- * 3) Schema-validated CORS relay (api.codetabs.com -> adsb.lol)
+ * 1) Local Vite / LAN proxies (adsb.fi v3 -> adsb.lol -> airplanes.live; fast-bypass on static 404/405/HTML)
+ * 2) Zero-preflight CORS simple-GET relays (cors-relay:adsb.fi -> cors-relay:adsb.lol)
+ * 3) Direct browser fallback (adsb.lol -> opensky-network.org)
  */
 export async function fetchFlightsCascade(
   observer: ObserverLocation,
@@ -721,8 +839,14 @@ export async function fetchFlightsCascade(
   prevEntities?: Map<string, FlightEntity> | FlightEntity[],
   options: FlightsFetchOptions = {}
 ): Promise<FlightsFetchResult> {
+  if (options.resetBreakers === true) {
+    flightsCircuitBreaker.reset();
+    viteProxyUnavailable = false;
+  }
+
   const prevMap = toPrevMap(prevEntities);
   const timeoutMs = options.timeoutMs ?? DEFAULT_ADSB_TIMEOUT_MS;
+  const relayTimeoutMs = options.timeoutMs ?? RELAY_ADSB_TIMEOUT_MS;
   const latStr = observer.lat.toFixed(4);
   const lonStr = observer.lon.toFixed(4);
   const radiusNm = Math.max(1, Math.min(250, Math.ceil(radiusKm / 1.852)));
@@ -779,38 +903,89 @@ export async function fetchFlightsCascade(
     errors.push(`${providerLabel}: ${err instanceof Error ? err.message : String(err)}`);
   };
 
+  const recordCircuitOpen = (breakerKey: string, providerLabel: string): void => {
+    const lastErr = flightsCircuitBreaker.getLastError(breakerKey);
+    if (lastErr instanceof HttpError) {
+      lastHttpStatus = lastErr.status;
+      if (lastErr.status === 429) {
+        saw429 = true;
+      }
+      errors.push(`${providerLabel}: circuit open (HTTP ${lastErr.status})`);
+    } else if (lastErr instanceof Error) {
+      errors.push(`${providerLabel}: circuit open (${lastErr.message})`);
+    } else {
+      errors.push(`${providerLabel}: circuit open`);
+    }
+  };
+
+  interface AdsbxAttemptResult {
+    result: FlightsFetchResult | null;
+    proxyUnavailable?: boolean;
+    error?: unknown;
+  }
+
   const tryAdsbxEndpoint = async (
     breakerKey: string,
     providerLabel: string,
     url: string,
-    strictAcOnly = false
-  ): Promise<FlightsFetchResult | null> => {
+    opts: {
+      strictAcOnly?: boolean;
+      isRelay?: boolean;
+      isViteProxy?: boolean;
+      endpointTimeoutMs?: number;
+    } = {}
+  ): Promise<AdsbxAttemptResult> => {
     if (!flightsCircuitBreaker.canExecute(breakerKey)) {
-      errors.push(`${providerLabel}: circuit open`);
-      return null;
+      recordCircuitOpen(breakerKey, providerLabel);
+      return { result: null };
     }
+
+    const strictAcOnly = opts.strictAcOnly ?? false;
+    const effectiveTimeoutMs = opts.endpointTimeoutMs ?? timeoutMs;
+
     try {
       const rawList = await flightsCircuitBreaker.execute(async () => {
-        const data = await fetchJsonWithTimeout<Record<string, unknown>>(url, {
-          timeoutMs,
-          signal: options.signal,
-        });
-        if (!data || typeof data !== 'object') {
+        let data: Record<string, unknown>;
+
+        if (opts.isRelay) {
+          const rawText = await fetchTextWithTimeout(url, {
+            timeoutMs: effectiveTimeoutMs,
+            signal: options.signal,
+          });
+          data = extractRelayedJsonPayload(rawText, providerLabel);
+        } else if (opts.isViteProxy) {
+          const rawText = await fetchTextWithTimeout(url, {
+            timeoutMs: effectiveTimeoutMs,
+            signal: options.signal,
+          });
+          const trimmed = rawText.trim();
+          const lowerPrefix = trimmed.slice(0, 32).toLowerCase();
+          if (
+            lowerPrefix.startsWith('<!doctype') ||
+            lowerPrefix.startsWith('<html') ||
+            trimmed.startsWith('<')
+          ) {
+            throw new StaticProxyUnavailableError(
+              `Static HTML response from ${providerLabel}`
+            );
+          }
+          const parsed = JSON.parse(trimmed) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error(`Invalid payload from ${providerLabel}`);
+          }
+          data = parsed as Record<string, unknown>;
+        } else {
+          data = await fetchJsonWithTimeout<Record<string, unknown>>(url, {
+            timeoutMs: effectiveTimeoutMs,
+            signal: options.signal,
+          });
+        }
+
+        if (!data || typeof data !== 'object' || Array.isArray(data)) {
           throw new Error(`Invalid payload from ${providerLabel}`);
         }
-        const hasErrorField =
-          (typeof data.Error === 'string' && data.Error.trim().length > 0) ||
-          (data.Error !== undefined &&
-            data.Error !== null &&
-            typeof data.Error !== 'string' &&
-            Boolean(data.Error));
-        if (hasErrorField) {
-          throw new Error(
-            typeof data.Error === 'string'
-              ? data.Error.trim()
-              : `Upstream error from ${providerLabel}`
-          );
-        }
+        throwIfUpstreamErrorField(data, providerLabel);
+
         const candidate = Array.isArray(data.ac)
           ? data.ac
           : !strictAcOnly && Array.isArray(data.aircraft)
@@ -831,57 +1006,92 @@ export async function fetchFlightsCascade(
         timestampMs: nowMs,
       });
       return {
-        entities,
-        status: 'live',
-        provider: providerLabel,
-        timestampMs: nowMs,
+        result: {
+          entities,
+          status: 'live',
+          provider: providerLabel,
+          timestampMs: nowMs,
+        },
       };
     } catch (err) {
+      if (
+        opts.isViteProxy &&
+        (err instanceof StaticProxyUnavailableError ||
+          (err instanceof HttpError && (err.status === 404 || err.status === 405)))
+      ) {
+        viteProxyUnavailable = true;
+        flightsCircuitBreaker.reset(breakerKey);
+        return { result: null, proxyUnavailable: true, error: err };
+      }
       recordFailure(providerLabel, err);
-      return null;
+      return { result: null, error: err };
     }
   };
 
-  // Stage 1: Local Vite proxies when running on localhost / 127.0.0.1
-  if (isLocalhostRuntime()) {
+  // Stage 1: Local Vite / LAN proxies (fast-bypass out of Stage 1 on static 404/405/HTML)
+  if (!viteProxyUnavailable && isLocalDevOrLanRuntime()) {
     const proxyFi = await tryAdsbxEndpoint(
       'proxy-adsb-fi',
       'vite-proxy:adsb.fi',
-      `/api-proxy/adsb-fi/api/v2/lat/${latStr}/lon/${lonStr}/dist/${radiusNm}`
+      `/api-proxy/adsb-fi/api/v3/lat/${latStr}/lon/${lonStr}/dist/${radiusNm}`,
+      { strictAcOnly: false, isViteProxy: true }
     );
-    if (proxyFi) return proxyFi;
+    if (proxyFi.result) return proxyFi.result;
 
-    const proxyLol = await tryAdsbxEndpoint(
-      'proxy-adsb-lol',
-      'vite-proxy:adsb.lol',
-      `/api-proxy/adsb-lol/v2/point/${latStr}/${lonStr}/${radiusNm}`
-    );
-    if (proxyLol) return proxyLol;
+    if (!proxyFi.proxyUnavailable && !viteProxyUnavailable) {
+      const proxyLol = await tryAdsbxEndpoint(
+        'proxy-adsb-lol',
+        'vite-proxy:adsb.lol',
+        `/api-proxy/adsb-lol/v2/point/${latStr}/${lonStr}/${radiusNm}`,
+        { isViteProxy: true }
+      );
+      if (proxyLol.result) return proxyLol.result;
 
-    const proxyAirplanesLive = await tryAdsbxEndpoint(
-      'proxy-airplanes-live',
-      'vite-proxy:airplanes.live',
-      `/api-proxy/airplanes-live/v2/point/${latStr}/${lonStr}/${radiusNm}`
-    );
-    if (proxyAirplanesLive) return proxyAirplanesLive;
+      if (!proxyLol.proxyUnavailable && !viteProxyUnavailable) {
+        const proxyAirplanesLive = await tryAdsbxEndpoint(
+          'proxy-airplanes-live',
+          'vite-proxy:airplanes.live',
+          `/api-proxy/airplanes-live/v2/point/${latStr}/${lonStr}/${radiusNm}`,
+          { isViteProxy: true }
+        );
+        if (proxyAirplanesLive.result) return proxyAirplanesLive.result;
+      }
+    }
   }
 
-  // Stage 2: Direct browser cascade (adsb.lol -> airplanes.live -> opensky-network)
+  // Stage 2: Zero-preflight CORS simple-GET relays (works on GitHub Pages & static servers)
+  const cacheBucket = Math.floor(Date.now() / 10_000);
+  const relayFi = await tryAdsbxEndpoint(
+    'cors-relay-adsb-fi',
+    'cors-relay:adsb.fi',
+    `https://r.jina.ai/https://opendata.adsb.fi/api/v3/lat/${latStr}/lon/${lonStr}/dist/${radiusNm}?_=${cacheBucket}`,
+    { strictAcOnly: false, isRelay: true, endpointTimeoutMs: relayTimeoutMs }
+  );
+  if (relayFi.result) return relayFi.result;
+
+  const relayFiLastErr =
+    relayFi.error ?? flightsCircuitBreaker.getLastError('cors-relay-adsb-fi');
+  const relayFiRateLimited =
+    relayFiLastErr instanceof HttpError && relayFiLastErr.status === 429;
+  if (!relayFiRateLimited) {
+    const relayLol = await tryAdsbxEndpoint(
+      'cors-relay-adsb-lol',
+      'cors-relay:adsb.lol',
+      `https://r.jina.ai/https://api.adsb.lol/v2/point/${latStr}/${lonStr}/${radiusNm}?_=${cacheBucket}`,
+      { strictAcOnly: true, isRelay: true, endpointTimeoutMs: relayTimeoutMs }
+    );
+    if (relayLol.result) return relayLol.result;
+  }
+
+  // Stage 3: Direct fallback (adsb.lol -> opensky-network)
   const directAdsbLol = await tryAdsbxEndpoint(
     'adsb.lol',
     'adsb.lol',
     `https://api.adsb.lol/v2/point/${latStr}/${lonStr}/${radiusNm}`
   );
-  if (directAdsbLol) return directAdsbLol;
+  if (directAdsbLol.result) return directAdsbLol.result;
 
-  const directAirplanesLive = await tryAdsbxEndpoint(
-    'airplanes.live',
-    'airplanes.live',
-    `https://api.airplanes.live/v2/point/${latStr}/${lonStr}/${radiusNm}`
-  );
-  if (directAirplanesLive) return directAirplanesLive;
-
-  // Stage 2c: OpenSky bounding box(es) with antimeridian splitting & polar guard
+  // Stage 3b: OpenSky bounding box(es) with antimeridian splitting & polar guard
   const openSkyPlan = buildOpenSkyBoxes(observer, radiusKm);
   if (openSkyPlan && flightsCircuitBreaker.canExecute('opensky')) {
     try {
@@ -945,21 +1155,8 @@ export async function fetchFlightsCascade(
       recordFailure('opensky-network', err);
     }
   } else if (openSkyPlan) {
-    errors.push('opensky-network: circuit open');
+    recordCircuitOpen('opensky', 'opensky-network');
   }
-
-  // Stage 3: Zero-key CORS JSON relay targeting adsb.lol (strictly Array.isArray(data?.ac))
-  const targetAdsbLolUrl = `https://api.adsb.lol/v2/point/${latStr}/${lonStr}/${radiusNm}`;
-  const codetabsRelayUrl = `https://api.codetabs.com/v1/proxy/?quest=${encodeURIComponent(
-    targetAdsbLolUrl
-  )}`;
-  const relayed = await tryAdsbxEndpoint(
-    'codetabs-adsb-lol',
-    'codetabs-relay:adsb.lol',
-    codetabsRelayUrl,
-    true
-  );
-  if (relayed) return relayed;
 
   // All live providers failed — return strictly verified recent entities or honest empty status (ZERO synthetic aircraft)
   const nowMs = Date.now();

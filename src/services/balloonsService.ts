@@ -58,6 +58,7 @@ export interface BalloonsFetchResult {
 }
 
 export interface BalloonsFetchOptions {
+  force?: boolean;
   signal?: AbortSignal;
   timeoutMs?: number;
 }
@@ -264,6 +265,9 @@ export async function fetchBalloons(
   prevEntities?: Map<string, BalloonEntity> | BalloonEntity[],
   options: BalloonsFetchOptions = {}
 ): Promise<BalloonsFetchResult> {
+  if (options.force === true) {
+    balloonsCircuitBreaker.reset();
+  }
   const prevMap = toPrevBalloonMap(prevEntities);
   const timeoutMs = options.timeoutMs ?? SONDE_TIMEOUT_MS;
   const radiusM = Math.max(10_000, Math.round(radiusKm * 1000));
