@@ -11,6 +11,10 @@ const COOLDOWN_MS: Record<AudioCueKind, number> = {
 
 const MAX_CONCURRENT_VOICES = 8;
 
+function isPausedAudioState(state: AudioContextState | string): boolean {
+  return state === 'suspended' || state === 'interrupted';
+}
+
 interface AudioWindow extends Window {
   webkitAudioContext?: typeof AudioContext;
 }
@@ -45,7 +49,7 @@ export class TacticalAudioEngine {
 
     this.unlocked = true;
 
-    if (ctx.state === 'suspended') {
+    if (isPausedAudioState(ctx.state)) {
       this.unlockPending = true;
       try {
         await ctx.resume();
@@ -308,14 +312,15 @@ export class TacticalAudioEngine {
   private syncMasterGain(): void {
     if (!this.ctx || !this.masterGain) return;
     const { audioEnabled, audioVolume } = useSkyStore.getState();
-    const clampedVol = Math.max(0, Math.min(1, audioVolume));
+    const safeVol = Number.isFinite(audioVolume) ? audioVolume : 0;
+    const clampedVol = Math.max(0, Math.min(1, safeVol));
     const targetGain = audioEnabled ? clampedVol * 0.55 : 0;
     this.masterGain.gain.setTargetAtTime(targetGain, this.ctx.currentTime, 0.015);
   }
 
   private prepareCue(kind: AudioCueKind): AudioContext | null {
     const { audioEnabled, audioVolume } = useSkyStore.getState();
-    if (!audioEnabled || audioVolume <= 0) return null;
+    if (!audioEnabled || !Number.isFinite(audioVolume) || audioVolume <= 0) return null;
     if (this.activeVoices >= MAX_CONCURRENT_VOICES) return null;
 
     const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
@@ -328,11 +333,12 @@ export class TacticalAudioEngine {
       return null;
     }
 
-    if (ctx.state === 'suspended' && !this.unlocked && !this.unlockPending) {
+    const paused = isPausedAudioState(ctx.state);
+    if (paused && !this.unlocked && !this.unlockPending) {
       return null;
     }
 
-    if (ctx.state === 'suspended' && this.unlocked && !this.unlockPending) {
+    if (paused && this.unlocked && !this.unlockPending) {
       this.unlockPending = true;
       ctx.resume()
         .catch(() => {})
