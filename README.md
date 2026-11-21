@@ -26,12 +26,13 @@ Krunked Sky-Map is a zero-API-key, dark-cockpit aerospace visualization dashboar
 
 ---
 
-## Zero-Key Public Data Integrations & Fallbacks
+## Zero-Key Public Data Integrations & Diagnostics
 
-Every data stream runs without user-supplied API keys, guarded by `AbortController` timeouts, token-bucket rate limiters, circuit breakers, and `LIVE` | `CACHED` | `FALLBACK` status badges:
+Every data stream runs without user-supplied API keys, guarded by `AbortController` timeouts, token-bucket rate limiters, circuit breakers, and honest `LIVE` | `DELAYED` | `RATE-LIMITED` | `OFFLINE` | `CACHED` | `FALLBACK` | `ERROR` status badges:
 
 1. **Civil & Military / Uncensored ADS-B Flights (`src/services/flightsService.ts`)**
-   - **Cascade:** Local Vite dev/preview proxy (`/api-proxy/adsb-lol`, `/api-proxy/adsb-fi`) -> direct browser cascade (`api.airplanes.live` -> `api.adsb.lol` -> `opensky-network.org`) -> schema-validated CORS JSON relay -> relative-translated static snapshot (`./data/fallback-flights.json`).
+   - **Cascade:** Local Vite dev/preview proxy (`/api-proxy/adsb-fi`, `/api-proxy/adsb-lol`, `/api-proxy/airplanes-live`) -> direct browser cascade (`api.adsb.lol` -> `api.airplanes.live` -> `opensky-network.org`) -> schema-validated CORS JSON relay.
+   - **Verified-Live Telemetry Only:** Zero fabricated or static fallback flights (`fallback-flights.json` removed). Landed (`onGround`), stale (`seen_pos > 60s`), out-of-range, and Null Island `(0, 0)` observations are purged, and valid empty `{ ac: [] }` / `{ states: [] }` responses resolve honestly as `LIVE` (`0` aircraft). When upstreams fail or throttle (`HTTP 429`), the HUD surfaces honest `DELAYED` (recent verified `< 45s` tracks only), `RATE-LIMITED`, `OFFLINE`, or `ERROR` diagnostics with exact `Last Updated` timestamps (`HH:MM:SS`) and provider metadata.
    - **Classification:** Separates civil traffic from military/LADD/PIA aircraft via `dbFlags`, military ICAO hex allocations, and military callsign prefixes, plus highlights emergency squawks (`7700`, `7600`, `7500`).
 2. **Active Satellites via Client-Side SGP4 (`src/services/satellitesService.ts`, `src/workers/astro.worker.ts`)**
    - **0ms Cold Boot:** Loads build-seeded TLE catalogs from `./data/tle/{stations,visual,starlink}.tle`.
@@ -83,23 +84,34 @@ Connect a `ws://`, `wss://`, `http://`, or `https://` endpoint via the **ODID ST
 
 ---
 
+## Installable PWA & Standalone WebAPK
+
+Krunked Sky-Map supports standalone installation on desktop and mobile devices (including GitHub Pages `/<repo-name>/` subpaths via relative scoping):
+
+- **Web App Manifest (`public/manifest.json`):** Configured with `start_url: "./"`, `scope: "./"`, `display: "standalone"`, and `#06090F` obsidian theme/background colors.
+- **Raster PNG Icons (`scripts/generate-pwa-icons.mjs`):** Zero-dependency Node script generating valid `192x192`, `512x512`, and `180x180` (`apple-touch-icon.png`) binary PNG radar icons inside the maskable safe zone (`public/icons/`).
+- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v2`) that pre-caches core shell assets for offline boot and deletes superseded caches on activation, while strictly bypassing cross-origin requests, live telemetry APIs, `/api-proxy/` routes, and Vite HMR dev paths so radar/flight data is never served stale.
+
+---
+
 ## Local Development & Verification
 
 ```bash
 npm install
-npm run seed       # Refresh static TLEs & fallback flight/airspace snapshots
-npm run dev        # Start Vite dev server with live /api-proxy ADS-B relays
-npm run typecheck  # Strict TypeScript check
-npm run test       # Unit geodesy, ingestion & adversarial chaos test suites
-npm run build      # Emit static GitHub Pages bundle under dist/
-npm run preview    # Preview built bundle locally
+npm run seed                           # Refresh static CelesTrak TLEs & FAA airspace snapshots
+node scripts/generate-pwa-icons.mjs    # Regenerate raster PNG PWA & Apple Touch icons
+npm run dev                            # Start Vite dev server with live /api-proxy ADS-B relays
+npm run typecheck                      # Strict TypeScript check
+npm run test                           # Unit geodesy, ingestion & adversarial chaos test suites
+npm run build                          # Emit static GitHub Pages bundle under dist/
+npm run preview                        # Preview built bundle locally
 ```
 
 ---
 
 ## GitHub Pages Deployment
 
-`.github/workflows/deploy-pages.yml` builds and deploys the static bundle automatically on pushes to `main`, manual `workflow_dispatch`, and a 6-hourly scheduled cron (`0 */6 * * *`) to keep pre-seeded CelesTrak ephemeris fresh:
+`.github/workflows/deploy-pages.yml` generates PWA PNG icons, refreshes static CelesTrak ephemeris and FAA airspace snapshots, verifies types/tests, and builds/deploys the static bundle automatically on pushes to `main`, manual `workflow_dispatch`, and a 6-hourly scheduled cron (`0 */6 * * *`):
 
 1. Push this repository to GitHub (`main` branch).
 2. In your GitHub repository, open **Settings -> Pages** and set **Source** to **GitHub Actions**.

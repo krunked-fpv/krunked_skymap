@@ -6,7 +6,10 @@
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#06090F" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <link rel="manifest" href="./manifest.json" />
+    <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
     <meta
       name="description"
       content="Krunked Sky-Map — Live 60fps Aerospace Situational Awareness Command Deck visualizing live ADS-B flights, military traffic, SGP4 orbital passes, weather radiosondes, FAA UAS airspace, and OpenDroneID telemetry."
@@ -37,5 +40,15 @@
   <body style="margin:0;background:#06090F;color:#E2E8F0;overflow:hidden;">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if (
+        'serviceWorker' in navigator &&
+        (window.location.protocol === 'https:' || window.location.protocol === 'http:')
+      ) {
+        window.addEventListener('load', function () {
+          navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(function () {});
+        });
+      }
+    </script>
   </body>
 </html>
