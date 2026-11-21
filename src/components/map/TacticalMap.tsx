@@ -933,10 +933,12 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
         ['linear'],
         ['zoom'],
         4,
-        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.68],
-        8,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.56],
+        7.5,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.78],
+        11,
         ['coalesce', ['get', 'iconScale'], 0.85],
-        12,
+        14,
         ['*', ['coalesce', ['get', 'iconScale'], 0.85], 1.15],
       ],
       'icon-rotate': ['get', 'headingDeg'],
@@ -1785,14 +1787,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
           onClick={() => setMapLabelsEnabled(!mapLabelsEnabled)}
           style={{
             position: 'absolute',
-            left: '50%',
-            bottom: 'max(10px, env(safe-area-inset-bottom))',
-            transform: 'translateX(-50%)',
+            top: 10,
+            right: 'max(10px, env(safe-area-inset-right))',
             zIndex: 15,
             display: 'inline-flex',
             alignItems: 'center',
             gap: 6,
             padding: '5px 10px',
+            minHeight: 30,
             borderRadius: 6,
             border: mapLabelsEnabled
               ? '1px solid rgba(34, 211, 238, 0.5)'

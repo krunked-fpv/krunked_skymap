@@ -1539,8 +1539,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const cornerTitleStyle: CSSProperties = {
     position: 'absolute',
-    top: isCompact ? 8 : 12,
-    left: isCompact ? 8 : 12,
+    top: layout === 'dome' && isCompact ? 46 : isCompact ? 8 : 12,
+    left: layout === 'dome' && !isCompact ? 340 : isCompact ? 8 : 12,
     pointerEvents: 'none',
     display: 'flex',
     flexDirection: 'column',
@@ -1571,11 +1571,17 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const bezelControlsStyle: CSSProperties = {
     position: 'absolute',
     bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
-    left: isCompact ? 'max(8px, env(safe-area-inset-left))' : 'max(12px, env(safe-area-inset-left))',
+    left:
+      layout === 'dome' && !isCompact
+        ? 340
+        : isCompact
+          ? 'max(8px, env(safe-area-inset-left))'
+          : 'max(12px, env(safe-area-inset-left))',
     display: 'flex',
     alignItems: 'center',
     gap: 6,
     pointerEvents: 'auto',
+    zIndex: 10,
   };
 
   const legendStyle: CSSProperties = {
