@@ -202,3 +202,75 @@ All 18 findings (`[DEFECT-01]`..`[DEFECT-18]`) identified in Round 1 were surgic
 - **High:** **0**
 - **Medium:** **0**
 - **Low:** **0**
+
+---
+
+## Sprint 02 — Live Telemetry, Render Overhaul & PWA Red-Team Audit
+
+**Auditor:** `@astro-redteam`  
+**Branch / Worktree:** `sprint/astro-redteam` (`c:\krunked_skymap\.worktrees\astro-redteam`)  
+**Scope:** Merged Sprint 02 source files (`flightsService.ts`, `App.tsx`, `TacticalMap.tsx`, `tacticalSprites.ts`, `PolarSkyDome.tsx`, `TopTelemetryBar.tsx`, `ControlDock.tsx`, `TargetInspector.tsx`, `cockpit.css`, `public/manifest.json`, `public/sw.js`, `public/icons/*.png`, `index.html`, `vite.config.ts`) audited for phantom telemetry elimination, TTL/range/track pruning, MapLibre & Sky-Dome canvas/memory hygiene, PWA binary/service-worker integrity, offline/mobile UX desyncs, and rate-limiter consistency.
+
+### Sprint 02 Open Defect Tally
+
+| Severity | Count | Findings |
+| :--- | :---: | :--- |
+| **Critical** | **0** | None |
+| **High** | **0** | None |
+| **Medium** | **0** | None |
+| **Low** | **2** | Stale prior-region `feeds.flights.lastUpdatedMs` retained across `> 50 km` observer jumps (`[DEFECT-S2-01]`); `{ force: true }` skipping `adsbRateLimiter.tryConsume` (`[DEFECT-S2-02]`) |
+| **Total** | **2** | **21 passing** + **2 intentional failing `[DEFECT-S2-*]` probes** in [chaos.test.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/tests/adversarial/chaos.test.ts) |
+
+### Sprint 02 Verification Summary (Verified Passing Controls)
+1. **Zero Phantom Aircraft & Honest Live Feed Diagnostics:**
+   - Verified `public/data/fallback-flights.json` is completely removed from disk (`fs.existsSync` returns `false`), `useSkyStore.getState().odidConfig.simulatorEnabled === false` by default, and `flightsService.ts` contains zero static seed/synthesis paths.
+   - Under `TypeError('Failed to fetch')`, HTTP `429`, HTTP `503`, truncated JSON, and `navigator.onLine = false`, `fetchFlightsCascade` returns `entities: []` (or strictly verified `<= 45s` airborne in-range `prevEntities` as `'delayed'` / `'rate-limited'`), never requests `fallback-flights.json`, and surfaces honest `'rate-limited'`, `'offline'`, `'delayed'`, or `'error'` states.
+   - Valid empty `{ ac: [] }` and OpenSky `{ states: [] }` responses return authoritative `'live'` `entities: []` immediately without exhausting downstream providers, and `buildOpenSkyBoxes` splits antimeridian bounding boxes cleanly while skipping polar regions (`|lat| > 88.5` / `dLon >= 180`).
+2. **TTL, Landed & Out-of-Range Pruning + Zero-Track Drift Guard:**
+   - `normalizeAdsbxAircraft`, `normalizeAdsbxPayloadList`, and `normalizeOpenSkyState` exclude `onGround: true`, `seen_pos > 60s`, stale `timestampMs > 60s`, future `timestampMs > nowMs + 60s`, Null Island `(0, 0)`, corrupt altitudes (`< -500 m` / `> 60_000 m`, preserving `-390 m` Dead Sea), and `groundDistKm > radiusKm`.
+   - Missing track (`track: null` without `> 50 m` displacement from `prev`) sets `headingValid: false`. `App.tsx` (`922-927`, `973`), `TacticalMap.tsx` (`502-507`, `604`), `PolarSkyDome.tsx` (`1214-1231`), and `unitFormatters.ts` (`29-30`) gate dead-reckoning, velocity vectors, heading ticks, and inspector readouts (`TRACK UNKNOWN`) cleanly, alongside `60_000 ms` flight TTL and `radiusKm * 1.02` out-of-range pruning.
+3. **PWA Manifest, Binary PNG & Service Worker Integrity:**
+   - [manifest.json](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/manifest.json) defines `start_url: "./"`, `scope: "./"`, `display: "standalone"`, `background_color: "#06090F"`, `theme_color: "#06090F"`, and `192x192` + `512x512` `image/png` icons with `"purpose": "any maskable"`.
+   - Raw binary inspection of [icon-192.png](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/icons/icon-192.png) (23,322 B), [icon-512.png](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/icons/icon-512.png) (89,136 B), and [apple-touch-icon.png](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/icons/apple-touch-icon.png) (20,787 B) confirms valid PNG magic signature (`89 50 4E 47 0D 0A 1A 0A`), valid `IHDR` / `IDAT` / `IEND` chunks, and exact big-endian `IHDR` dimensions (`192x192`, `512x512`, `180x180`).
+   - VM sandbox execution of [sw.js](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/sw.js) confirms `activate` prunes stale cache versions (`krunked-skymap-v1` deleted, `krunked-skymap-v2` retained), intercepts same-origin navigation/shell requests with `networkFirst`, and strictly bypasses cross-origin telemetry (`adsb.lol`, `opensky-network.org`, `sondehub.org`) and `/api-proxy/` routes.
+   - [index.html](file:///c:/krunked_skymap/.worktrees/astro-redteam/index.html) and [vite.config.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/vite.config.ts) configure `./manifest.json`, `./icons/apple-touch-icon.png`, `#06090F` `theme-color`, `./sw.js` (`scope: './'`), `base: './'`, and `/api-proxy/` dev/preview routes (`npm run build` verified clean with relative `./assets/` paths).
+4. **Render, Spatial Placement & Memory Hygiene:**
+   - Both [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L978-L982) and [TacticalMap.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/map/TacticalMap.tsx#L1082-L1086) reset transforms to identity (`setTransform(1, 0, 0, 1, 0, 0)`) prior to `clearRect(0, 0, canvas.width, canvas.height)`.
+   - `PolarSkyDome.tsx` (`1080-1090`) prunes `polarTrailsRef` and `lastTrailSampleRef` immediately (`!activeIds.has(key)`) with zero `+ 40` slack.
+   - `TacticalMap.tsx` enforces `maxPitch: 0`, `touchPitch: false`, `pitchWithRotate: false` (`1025-1028`), syncs `recenterNonce` both post-`load` and reactively (`1368`, `1643`, `1667`), deduplicates entity features via `seenIds` (`489-495`, `571-577`), registers 96x96 `pixelRatio: 3` Retina sprites (`tacticalSprites.ts:21,53`), and cleans up all map events, `webglcontextlost`, `ResizeObserver`, window `resize`, and `requestAnimationFrame` on unmount (`1588-1621`).
+
+---
+
+### Sprint 02 Defect Registry & Surgical Fix Directives
+
+#### `[DEFECT-S2-01]` Low — Cross-Region Observer Jump (`> 50 km`) Retains Prior Region's `feeds.flights.lastUpdatedMs` on Offline/Failure
+- **Location:** [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L486-L502), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L595-L604)
+- **Reproduction:**
+  1. Load the app on **DC / Potomac Corridor** while online so `feeds.flights.lastUpdatedMs` records `T_DC` (e.g., `14:00:00`).
+  2. Go offline (or simulate upstream `503`/`429`) and switch observer preset to **Tokyo Haneda / Kanto** (`jumpKm > 50`).
+  3. `App.tsx:596` immediately clears `rawFlights`, `rawBalloons`, and `rawDrones`, and calls `runFlightsRefresh(true)`.
+  4. `fetchFlightsCascade` finds no fresh flights for Tokyo's `rateKey` and returns `{ entities: [], status: 'offline', timestampMs: 0 }`.
+  5. `App.tsx:488-489` evaluates `res.timestampMs > 0 ? res.timestampMs : prevFlightsFeed.lastUpdatedMs`, preserving `T_DC` (`14:00:00`) as if Tokyo had last updated at `14:00:00`.
+- **Root Cause:** `if (jumpKm > 50)` wipes `liveKinematicsRegistry.rawFlights` without resetting `feeds.flights` (`lastUpdatedMs: null`, `provider: 'adsb-cascade'`, `count: 0`, `errorMsg: undefined`).
+- **Surgical Fix:** Inside `if (jumpKm > 50)` (`src/App.tsx:595-604`), reset flight feed diagnostics before triggering `runFlightsRefresh(true)`:
+  ```ts
+  useSkyStore.getState().setFeedState('flights', {
+    lastUpdatedMs: null,
+    provider: 'adsb-cascade',
+    count: 0,
+    errorMsg: undefined,
+  });
+  ```
+
+#### `[DEFECT-S2-02]` Low — `fetchFlightsCascade(..., { force: true })` Fails to Consume `adsbRateLimiter`, Allowing Immediate Non-Forced Re-Fetch Within 10s
+- **Location:** [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L733-L735)
+- **Reproduction:**
+  1. Call `await fetchFlightsCascade(DCA, 120, undefined, { force: true })` (matching `App.tsx`'s mount, observer-change, and manual-sweep calls).
+  2. Immediately (< 10s later) call `await fetchFlightsCascade(DCA, 120, prevEntities)` without `force: true`.
+  3. Because `!options.force` short-circuits `&&` before `adsbRateLimiter.tryConsume(rateKey)`, the bucket remains full and the second call hits upstream ADS-B endpoints again instead of returning the 10s rate-limit cache.
+- **Root Cause:** `if (!options.force && !adsbRateLimiter.tryConsume(rateKey))` skips `tryConsume` whenever `force: true`.
+- **Surgical Fix:** Evaluate `adsbRateLimiter.tryConsume(rateKey)` unconditionally (or record consumption in `TokenBucketRateLimiter` on `force: true`) before checking `!options.force`:
+  ```ts
+  const rateAllowed = adsbRateLimiter.tryConsume(rateKey);
+  if (!options.force && !rateAllowed) {
+  ```

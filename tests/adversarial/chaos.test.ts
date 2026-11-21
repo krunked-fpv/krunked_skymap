@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import fallbackFlightsRaw from '../../public/data/fallback-flights.json?raw';
 import fallbackAirspaceRaw from '../../public/data/fallback-airspace.geojson?raw';
 import stationsTleRaw from '../../public/data/tle/stations.tle?raw';
 import visualTleRaw from '../../public/data/tle/visual.tle?raw';
@@ -31,12 +30,10 @@ import {
   clearFlightsServiceCache,
   fetchFlightsCascade,
   normalizeAdsbxAircraft,
+  normalizeOpenSkyState,
 } from '../../src/services/flightsService';
 import { fetchBalloons, normalizeSondeRecord } from '../../src/services/balloonsService';
-import {
-  fetchAirspace,
-  isInsideContinentalUsOrTerritories,
-} from '../../src/services/airspaceService';
+import { fetchAirspace } from '../../src/services/airspaceService';
 import {
   clearTleCache,
   loadInitialTles,
@@ -53,6 +50,7 @@ import { useSkyStore } from '../../src/store/useSkyStore';
 import {
   formatAltitude as formatInspectorAltitude,
   formatDoppler as formatInspectorDoppler,
+  formatHeading as formatInspectorHeading,
   formatSpeed as formatInspectorSpeed,
 } from '../../src/components/inspector/unitFormatters';
 import {
@@ -67,6 +65,30 @@ import {
   type WorkerRequestMessage,
   type WorkerResponseMessage,
 } from '../../src/types/sky-contracts';
+
+interface NodeFsSubset {
+  existsSync(path: URL): boolean;
+  readFileSync(path: URL): Uint8Array;
+  readFileSync(path: URL, encoding: 'utf8'): string;
+}
+
+interface NodeVmSubset {
+  runInNewContext(code: string, context: Record<string, unknown>): unknown;
+}
+
+async function loadNodeFs(): Promise<NodeFsSubset> {
+  const mod = 'node:fs';
+  return (await import(/* @vite-ignore */ mod)) as NodeFsSubset;
+}
+
+async function loadNodeVm(): Promise<NodeVmSubset> {
+  const mod = 'node:vm';
+  return (await import(/* @vite-ignore */ mod)) as NodeVmSubset;
+}
+
+function repoFileUrl(relativePath: string): URL {
+  return new URL(`../../${relativePath}`, import.meta.url);
+}
 
 const EXTREME_OBSERVERS: Array<{ id: string; observer: ObserverLocation }> = [
   {
@@ -181,17 +203,11 @@ function makeSynthesizedTle(index: number): TleRecord {
   };
 }
 
-function makeFallbackAwareFetch(
+function makeSeededStaticAwareFetch(
   externalBehavior: (url: string) => Promise<Response> | never
 ): typeof fetch {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url.includes('fallback-flights.json')) {
-      return new Response(fallbackFlightsRaw, {
-        status: 200,
-        headers: { 'Content-Type': 'application/json' },
-      });
-    }
     if (url.includes('fallback-airspace.geojson')) {
       return new Response(fallbackAirspaceRaw, {
         status: 200,
@@ -254,7 +270,6 @@ describe('Challenge 1 — Extreme Geodesy & Antimeridian Torture', () => {
       }
     }
 
-    // Cross-antimeridian shortest path from (0, 179.95) to (0, -179.95)
     expect(haversineDistanceKm(0, 179.95, 0, -179.95)).toBeCloseTo(11.12, 1);
     expect(computeBearingDeg(0, 179.95, 0, -179.95)).toBeCloseTo(90, 1);
     expect(computeBearingDeg(0, -179.95, 0, 179.95)).toBeCloseTo(270, 1);
@@ -299,35 +314,22 @@ describe('Challenge 1 — Extreme Geodesy & Antimeridian Torture', () => {
     }
   });
 
-  it('builds geodesicCirclePolygon rings across non-polar observers without >180 deg jumps', () => {
-    const nonPolarCases: Array<{ id: string; lat: number; lon: number; radiusKm: number }> = [
+  it('builds geodesicCirclePolygon rings across non-polar and polar-enclosing observers without >180 deg jumps', () => {
+    const cases: Array<{ id: string; lat: number; lon: number; radiusKm: number }> = [
       { id: 'equator-120', lat: 0, lon: 0, radiusKm: 120 },
       { id: 'sydney-250', lat: -33.86, lon: 151.2, radiusKm: 250 },
       { id: 'svalbard-250', lat: 78.22, lon: 15.63, radiusKm: 250 },
       { id: 'antimeridian-e-120', lat: 0, lon: 179.95, radiusKm: 120 },
       { id: 'antimeridian-w-250', lat: 0, lon: -179.95, radiusKm: 250 },
+      { id: 'south-pole-120', lat: -89.99, lon: 0, radiusKm: 120 },
+      { id: 'svalbard-footprint-2200', lat: 78.22, lon: 15.63, radiusKm: 2200 },
     ];
 
-    for (const c of nonPolarCases) {
+    for (const c of cases) {
       const rings = geodesicCirclePolygon(c.lat, c.lon, c.radiusKm, 72);
       expect(rings.length, `${c.id} should return rings`).toBeGreaterThanOrEqual(1);
       for (let r = 0; r < rings.length; r++) {
         expect(rings[r].length).toBeGreaterThanOrEqual(4);
-        expect(rings[r][0]).toEqual(rings[r][rings[r].length - 1]);
-        assertAllFiniteCoords(rings[r], `${c.id}.ring[${r}]`);
-      }
-    }
-  });
-
-  it('[DEFECT-02] geodesicCirclePolygon jumps 360 deg across +-180 when closing polar-enclosing circles', () => {
-    const polarCases: Array<{ id: string; lat: number; lon: number; radiusKm: number }> = [
-      { id: 'south-pole-120', lat: -89.99, lon: 0, radiusKm: 120 },
-      { id: 'svalbard-footprint-2200', lat: 78.22, lon: 15.63, radiusKm: 2200 },
-    ];
-    for (const c of polarCases) {
-      const rings = geodesicCirclePolygon(c.lat, c.lon, c.radiusKm, 72);
-      expect(rings.length).toBeGreaterThanOrEqual(1);
-      for (let r = 0; r < rings.length; r++) {
         expect(rings[r][0]).toEqual(rings[r][rings[r].length - 1]);
         assertAllFiniteCoords(rings[r], `${c.id}.ring[${r}]`);
       }
@@ -459,7 +461,7 @@ describe('Challenge 2 — WGS-84 Curvature Horizon & Bennett Refraction Bounds',
 });
 
 describe('Challenge 3 — SGP4 Resilience & 2,000-Satellite Latency Budget', () => {
-  it('propagates valid ISS/LEO TLEs cleanly alongside corrupt/malformed TLEs without NaNs', () => {
+  it('propagates valid ISS/LEO TLEs cleanly alongside corrupt/malformed and decayed TLEs without NaNs or crashes', () => {
     const rawChaosText = [
       'ISS (ZARYA)',
       ISS_TLE.line1,
@@ -493,6 +495,7 @@ describe('Challenge 3 — SGP4 Resilience & 2,000-Satellite Latency Budget', () 
 
     const directRecords: TleRecord[] = [
       ...textParsed,
+      DECAYED_TLE,
       { name: 'EMPTY', noradId: 91000, group: 'visual', line1: '', line2: '' },
       null as unknown as TleRecord,
     ];
@@ -500,6 +503,13 @@ describe('Challenge 3 — SGP4 Resilience & 2,000-Satellite Latency Budget', () 
     const parsed = parseTleRecords(directRecords);
     expect(parsed.some((p) => p.meta.noradId === 25544)).toBe(true);
     expect(parsed.some((p) => p.meta.noradId === 33591)).toBe(true);
+
+    const decayed = parsed.find((s) => s.meta.noradId === 90007);
+    expect(decayed).toBeDefined();
+    expect(() => {
+      const ov = computeSatelliteOrbitOverlay(decayed!, ISS_EPOCH_MS, EXTREME_OBSERVERS[0].observer);
+      expect(Number.isFinite(ov.footprintRadiusKm)).toBe(true);
+    }).not.toThrow();
 
     const res = propagateSatellites(parsed, ISS_EPOCH_MS, {
       observer: EXTREME_OBSERVERS[1].observer,
@@ -513,17 +523,6 @@ describe('Challenge 3 — SGP4 Resilience & 2,000-Satellite Latency Budget', () 
       expect(Number.isFinite(res.kinematics[i]), `kinematics[${i}]`).toBe(true);
     }
     expect(res.meta.some((m) => m.noradId === 25544)).toBe(true);
-  });
-
-  it('[DEFECT-01] computeSatelliteOrbitOverlay crashes when SGP4 returns undefined position on decayed TLE', () => {
-    const parsed = parseTleRecords([ISS_TLE, DECAYED_TLE]);
-    const decayed = parsed.find((s) => s.meta.noradId === 90007);
-    expect(decayed).toBeDefined();
-
-    expect(() => {
-      const ov = computeSatelliteOrbitOverlay(decayed!, ISS_EPOCH_MS, EXTREME_OBSERVERS[0].observer);
-      expect(Number.isFinite(ov.footprintRadiusKm)).toBe(true);
-    }).not.toThrow();
   });
 
   it('propagates 2,000 synthesized valid LEO satellites in < 100ms with strict Stride-12 Float32Array packing', () => {
@@ -581,7 +580,7 @@ describe('Challenge 3 — SGP4 Resilience & 2,000-Satellite Latency Budget', () 
   });
 });
 
-describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
+describe('Challenge 4 — Zero Phantom Aircraft & Multi-API Blackout Chaos', () => {
   const DCA: ObserverLocation = {
     lat: 38.8512,
     lon: -77.0402,
@@ -607,41 +606,75 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
     vi.unstubAllGlobals();
   });
 
-  it('survives network TypeError, HTTP 429, HTTP 503, and truncated JSON across all 4 services with clean fallbacks', async () => {
+  it('proves fallback-flights.json does not exist on disk and SIM-ODID defaults to disabled', async () => {
+    const fs = await loadNodeFs();
+    expect(
+      fs.existsSync(repoFileUrl('public/data/fallback-flights.json')),
+      'Obsolete public/data/fallback-flights.json must not exist in Sprint 02'
+    ).toBe(false);
+    expect(useSkyStore.getState().odidConfig.simulatorEnabled).toBe(false);
+  });
+
+  it('returns 0 fabricated aircraft and honest status under TypeError, 429, 503, truncated JSON, and offline', async () => {
     const chaosScenarios: Array<{
       name: string;
       external: (url: string) => Promise<Response>;
+      expectedFlightStatus: 'error' | 'rate-limited' | 'offline';
+      offline?: boolean;
     }> = [
       {
         name: 'TypeError(Failed to fetch)',
         external: async () => {
           throw new TypeError('Failed to fetch');
         },
+        expectedFlightStatus: 'error',
       },
       {
         name: 'HTTP 429 Rate Limited',
         external: async () =>
           new Response('Rate limit exceeded', { status: 429, statusText: 'Too Many Requests' }),
+        expectedFlightStatus: 'rate-limited',
       },
       {
         name: 'HTTP 503 Service Unavailable',
         external: async () =>
           new Response('Upstream unavailable', { status: 503, statusText: 'Service Unavailable' }),
+        expectedFlightStatus: 'error',
       },
       {
         name: 'Truncated / Corrupt JSON',
         external: async () => new Response('{"ac":[{"hex":"a12', { status: 200 }),
+        expectedFlightStatus: 'error',
+      },
+      {
+        name: 'Navigator Offline',
+        external: async () => {
+          throw new TypeError('Failed to fetch');
+        },
+        expectedFlightStatus: 'offline',
+        offline: true,
       },
     ];
 
     for (const scenario of chaosScenarios) {
       clearFlightsServiceCache();
       clearTleCache();
-      vi.stubGlobal('fetch', makeFallbackAwareFetch(scenario.external));
+      vi.stubGlobal('navigator', { onLine: !scenario.offline });
+      const fetchSpy = makeSeededStaticAwareFetch(scenario.external);
+      vi.stubGlobal('fetch', fetchSpy);
 
       const flights = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
-      expect(flights.status, `${scenario.name} flights.status`).toBe('fallback');
-      expect(flights.entities.length, `${scenario.name} flights.entities`).toBeGreaterThan(0);
+      expect(flights.status, `${scenario.name} flights.status`).toBe(scenario.expectedFlightStatus);
+      expect(flights.entities, `${scenario.name} flights.entities must be empty`).toEqual([]);
+      expect(flights.timestampMs, `${scenario.name} timestampMs must be 0 when no live cache`).toBe(0);
+
+      const fetchedUrls = (fetchSpy as unknown as ReturnType<typeof vi.fn>).mock.calls.map((c) =>
+        String(c[0])
+      );
+      expect(
+        fetchedUrls.some((u) => u.includes('fallback-flights.json')),
+        `${scenario.name} must never fetch fallback-flights.json`
+      ).toBe(false);
 
       const balloons = await fetchBalloons(DCA, 120);
       expect(balloons.status, `${scenario.name} balloons.status`).toBe('error');
@@ -664,9 +697,46 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
       expect(cold.length).toBeGreaterThan(0);
     }
 
+    // Fresh <= 45s live cache preserves verified aircraft as delayed or rate-limited (never phantom)
+    clearFlightsServiceCache();
+    vi.stubGlobal('navigator', { onLine: true });
+    const nowMs = Date.now();
+    const freshLive = normalizeAdsbxAircraft(
+      {
+        hex: 'a10999',
+        flight: 'LIVE999',
+        lat: 38.86,
+        lon: -77.05,
+        alt_baro: 9000,
+        gs: 260,
+        track: 120,
+        seen_pos: 12,
+      },
+      DCA,
+      undefined,
+      nowMs
+    )!;
+    vi.stubGlobal(
+      'fetch',
+      makeSeededStaticAwareFetch(async () => new Response('Unavailable', { status: 503 }))
+    );
+    const delayedRes = await fetchFlightsCascade(DCA, 120, [freshLive], { force: true });
+    expect(delayedRes.status).toBe('delayed');
+    expect(delayedRes.entities.map((e) => e.id)).toEqual([freshLive.id]);
+
+    clearFlightsServiceCache();
+    vi.stubGlobal(
+      'fetch',
+      makeSeededStaticAwareFetch(async () => new Response('Rate limited', { status: 429 }))
+    );
+    const rlDelayedRes = await fetchFlightsCascade(DCA, 120, [freshLive], { force: true });
+    expect(rlDelayedRes.status).toBe('rate-limited');
+    expect(rlDelayedRes.entities.map((e) => e.id)).toEqual([freshLive.id]);
+
     // Total blackout where even ./data/* fallback assets fail with TypeError
     clearFlightsServiceCache();
     clearTleCache();
+    vi.stubGlobal('navigator', { onLine: true });
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => {
@@ -675,8 +745,8 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
     );
 
     const totalBlackoutFlights = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
-    expect(totalBlackoutFlights.status).toBe('fallback');
-    expect(totalBlackoutFlights.entities.length).toBeGreaterThan(0);
+    expect(totalBlackoutFlights.status).toBe('error');
+    expect(totalBlackoutFlights.entities).toEqual([]);
 
     const totalBlackoutAirspace = await fetchAirspace(DCA, 120);
     expect(totalBlackoutAirspace.status).toBe('error');
@@ -687,7 +757,7 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
     expect(totalBlackoutTles.records).toEqual([]);
   });
 
-  it('normalizes ADS-B edge cases: alt_baro="ground", Dead Sea -390m, lat=undefined, track=null, dbFlags 1/4/8, and Heathrow coverage', async () => {
+  it('prunes onGround, seen_pos > 60s, stale timestamp > 60s, Null Island, and out-of-range aircraft + guards zero-track drift', async () => {
     const deadSeaObs: ObserverLocation = {
       lat: 31.5,
       lon: 35.5,
@@ -695,25 +765,6 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
       label: 'Dead Sea',
       source: 'manual',
     };
-
-    const grounded = normalizeAdsbxAircraft(
-      {
-        hex: 'a10001',
-        flight: 'BAW101',
-        lat: 51.47,
-        lon: -0.4543,
-        alt_baro: 'ground',
-        gs: 12,
-        track: null,
-        dbFlags: 0,
-      },
-      HEATHROW
-    );
-    expect(grounded).not.toBeNull();
-    expect(grounded?.onGround).toBe(true);
-    expect(grounded?.altBaroM).toBe(0);
-    expect(grounded?.altM).toBe(0);
-    expect(grounded?.headingDeg).toBe(0);
 
     const deadSeaPlane = normalizeAdsbxAircraft(
       {
@@ -733,7 +784,15 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
     expect(deadSeaPlane?.altM).toBeCloseTo(-390, 0);
     expect(deadSeaPlane?.altBaroM).toBeCloseTo(-390, 0);
     expect(deadSeaPlane?.headingDeg).toBe(0);
+    expect(deadSeaPlane?.headingValid).toBe(false);
+    expect(formatInspectorHeading(deadSeaPlane!.headingDeg, deadSeaPlane!.headingValid)).toBe(
+      'TRACK UNKNOWN'
+    );
 
+    // Null Island & missing coordinates rejected
+    expect(
+      normalizeAdsbxAircraft({ hex: 'a10003', lat: 0, lon: 0, alt_baro: 5000 }, HEATHROW)
+    ).toBeNull();
     expect(
       normalizeAdsbxAircraft(
         { hex: 'a10003', lat: undefined, lon: -0.4543, alt_baro: 5000, track: null },
@@ -741,65 +800,133 @@ describe('Challenge 4 — Multi-API Blackout & Malformed Payload Chaos', () => {
       )
     ).toBeNull();
 
-    const milFlag = normalizeAdsbxAircraft(
-      { hex: 'a10004', flight: 'CIV123', lat: 51.5, lon: -0.4, alt_baro: 10000, dbFlags: 1 },
-      HEATHROW
+    // OpenSky track=null without prior fix emits headingValid=false
+    const osNoTrack = normalizeOpenSkyState(
+      ['a77771', 'NOTRK', 'US', Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000), -77.04, 38.85, 5000, false, 200, null],
+      DCA
     );
-    expect(milFlag?.isMilitary).toBe(true);
-    expect(milFlag?.category).toBe('military');
-    expect(milFlag?.isPia).toBe(false);
-    expect(milFlag?.isLadd).toBe(false);
+    expect(osNoTrack).not.toBeNull();
+    expect(osNoTrack?.headingValid).toBe(false);
+    expect(osNoTrack?.headingDeg).toBe(0);
 
-    const piaFlag = normalizeAdsbxAircraft(
-      { hex: 'a10005', flight: 'PIA777', lat: 51.5, lon: -0.4, alt_baro: 10000, dbFlags: 4 },
-      HEATHROW
-    );
-    expect(piaFlag?.isMilitary).toBe(false);
-    expect(piaFlag?.isPia).toBe(true);
-    expect(piaFlag?.isLadd).toBe(false);
-
-    const laddFlag = normalizeAdsbxAircraft(
-      { hex: 'a10006', flight: 'N12345', lat: 51.5, lon: -0.4, alt_baro: 10000, dbFlags: 8 },
-      HEATHROW
-    );
-    expect(laddFlag?.isMilitary).toBe(false);
-    expect(laddFlag?.isPia).toBe(false);
-    expect(laddFlag?.isLadd).toBe(true);
-
-    expect(isInsideContinentalUsOrTerritories(HEATHROW.lat, HEATHROW.lon)).toBe(false);
-    const fetchSpy = vi.fn();
-    vi.stubGlobal('fetch', fetchSpy);
-    const heathrowAirspace = await fetchAirspace(HEATHROW, 120);
-    expect(heathrowAirspace.airspace.usCoverage).toBe(false);
-    expect(fetchSpy).not.toHaveBeenCalled();
-  });
-
-  it('[DEFECT-09] flightsService rate-limiter must not mask fallback status as cached or bypass rate limit when prevEntities is empty', async () => {
+    // fetchFlightsCascade excludes onGround, seen_pos > 60s, seen > 60s, Null Island, and groundDistKm > radiusKm
+    const outOfRange = greatCircleDestination(DCA.lat, DCA.lon, 90, 130);
+    const inRange = greatCircleDestination(DCA.lat, DCA.lon, 90, 95);
     vi.stubGlobal(
       'fetch',
-      makeFallbackAwareFetch(async () => new Response('Unavailable', { status: 503 }))
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('adsb.lol')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                { hex: 'a20001', flight: 'GND', lat: 38.86, lon: -77.05, alt_baro: 'ground', gs: 12, track: 90, seen_pos: 1 },
+                { hex: 'a20002', flight: 'GNDFLAG', lat: 38.86, lon: -77.05, alt_baro: 100, ground: true, gs: 12, track: 90, seen_pos: 1 },
+                { hex: 'a20003', flight: 'STALEPOS', lat: 38.86, lon: -77.05, alt_baro: 8000, gs: 220, track: 90, seen_pos: 61 },
+                { hex: 'a20004', flight: 'STALETS', lat: 38.86, lon: -77.05, alt_baro: 8000, gs: 220, track: 90, seen: 65 },
+                { hex: 'a20005', flight: 'NULLISL', lat: 0, lon: 0, alt_baro: 8000, gs: 220, track: 90, seen_pos: 2 },
+                { hex: 'a20006', flight: 'OUTRANGE', lat: outOfRange.lat, lon: outOfRange.lon, alt_baro: 8000, gs: 220, track: 90, seen_pos: 2 },
+                { hex: 'a20007', flight: 'VALIDIN', lat: inRange.lat, lon: inRange.lon, alt_baro: 12000, gs: 280, track: null, seen_pos: 4 },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
     );
 
+    const cascade = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(cascade.status).toBe('live');
+    expect(cascade.entities.map((e) => e.callsign)).toEqual(['VALIDIN']);
+    expect(cascade.entities[0].headingValid).toBe(false);
+
+    // Also verify OpenSky stage inside fetchFlightsCascade excludes onGround, stale (>60s), future (>+60s), Null Island, and out-of-range
+    clearFlightsServiceCache();
+    const nowSec = Math.floor(Date.now() / 1000);
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('https://opensky-network.org/')) {
+          return new Response(
+            JSON.stringify({
+              states: [
+                ['a30001', 'OSGND', 'US', nowSec, nowSec, inRange.lon, inRange.lat, 50, true, 10, 90],
+                ['a30002', 'OSOLD', 'US', nowSec - 65, nowSec - 65, inRange.lon, inRange.lat, 5000, false, 220, 90],
+                ['a30003', 'OSFUT', 'US', nowSec + 120, nowSec + 120, inRange.lon, inRange.lat, 5000, false, 220, 90],
+                ['a30004', 'OSNULL', 'US', nowSec, nowSec, 0, 0, 5000, false, 220, 90],
+                ['a30005', 'OSOUT', 'US', nowSec, nowSec, outOfRange.lon, outOfRange.lat, 5000, false, 220, 90],
+                ['a30006', 'OSLIVE', 'US', nowSec - 5, nowSec - 5, inRange.lon, inRange.lat, 5000, false, 220, null],
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
+    );
+    const osCascade = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(osCascade.status).toBe('live');
+    expect(osCascade.provider).toBe('opensky-network');
+    expect(osCascade.entities.map((e) => e.callsign)).toEqual(['OSLIVE']);
+    expect(osCascade.entities[0].headingValid).toBe(false);
+
+    // App.tsx gates dead-reckoning on headingValid !== false and prunes flights at 60_000ms + radiusKm * 1.02
+    expect(appSourceRaw).toContain('raw.headingValid !== false');
+    expect(appSourceRaw).toMatch(/pushAtmospheric\(liveKinematicsRegistry\.rawFlights,\s*12,\s*60_000\)/);
+    expect(appSourceRaw).toContain('topocentric.groundDistKm > st.radiusKm * 1.02');
+    expect(tacticalMapSourceRaw).toContain('entity.headingValid === false');
+    expect(tacticalMapSourceRaw).toContain('entity.headingValid !== false');
+    expect(polarDomeSourceRaw).toContain('entity.headingValid === false');
+  });
+
+  it('preserves status & respects rate-limiter cooldown cleanly on consecutive non-forced calls', async () => {
+    const fetchMock = makeSeededStaticAwareFetch(
+      async () => new Response('Unavailable', { status: 503 })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
     const first = await fetchFlightsCascade(DCA, 120);
-    expect(first.status).toBe('fallback');
+    expect(first.status).toBe('error');
+    expect(first.entities).toEqual([]);
 
-    const fetchCallsBeforeSecond = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+    const callsAfterFirst = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls.length;
     const second = await fetchFlightsCascade(DCA, 120, first.entities);
-    expect(
-      second.status,
-      'Cooldown hit after fallback masked status as "cached" instead of "fallback"'
-    ).toBe('fallback');
+    expect(second.status).toBe('error');
+    expect(second.entities).toEqual([]);
+    expect((fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls.length).toBe(callsAfterFirst);
+  });
 
-    await fetchFlightsCascade(DCA, 120);
-    const fetchCallsAfterThird = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.length;
+  it('[DEFECT-S2-02] forced fetchFlightsCascade call fails to consume adsbRateLimiter bucket, letting immediate non-forced call bypass 10s cooldown', async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('adsb.lol')) {
+        return new Response(
+          JSON.stringify({
+            ac: [{ hex: 'a12345', flight: 'DAL1', lat: 38.86, lon: -77.05, alt_baro: 8000, gs: 240, track: 90 }],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('Unavailable', { status: 503 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const forced = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(forced.status).toBe('live');
+    const callsAfterForced = fetchMock.mock.calls.length;
+
+    const immediateUnforced = await fetchFlightsCascade(DCA, 120, forced.entities);
     expect(
-      fetchCallsAfterThird,
-      'Non-forced call within 10s cooldown bypassed rate limiter when prevEntities was empty'
-    ).toBe(fetchCallsBeforeSecond);
+      fetchMock.mock.calls.length,
+      'Non-forced call immediately after forced call bypassed 10s adsbRateLimiter cooldown'
+    ).toBe(callsAfterForced);
+    expect(immediateUnforced.status).toBe('cached');
   });
 });
 
-describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Adversarial Bug Probes', () => {
+describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Sprint 02 Render Probes', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -993,119 +1120,56 @@ describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Adversarial Bug Probes
     audio.dispose();
   });
 
-  it('[DEFECT-03] App.tsx checks "sat:" instead of "sat-", breaking OrbitOverlay & pass arcs for every satellite', () => {
-    const parsed = parseTleRecords([ISS_TLE]);
-    const pool = selectSatellitePool(parsed, true);
-    const { kinematics, meta } = propagateSatellites(pool, ISS_EPOCH_MS, {
-      observer: EXTREME_OBSERVERS[0].observer,
-      radiusKm: 25_000,
-      orbitalScope: 'hemisphere',
-      activeGroups: { stations: true, visual: true, starlink: true },
-      fullConstellation: true,
-    });
-    const unpacked = unpackSatelliteKinematics(kinematics, meta, ISS_EPOCH_MS);
-    expect(unpacked[0].id).toBe('sat-25544');
+  it('preserves Sprint 01 fixes: sat- prefix, 6h balloon TTL, permalink alt/label, ODID clear, cursor/audio/ControlDock & worker error settlement', async () => {
+    expect(appSourceRaw).toContain("startsWith('sat-')");
 
-    expect(
-      appSourceRaw.includes("startsWith('sat-')"),
-      'App.tsx line 340 checks selectedId.startsWith("sat:") instead of "sat-", preventing computeOrbit() from ever firing'
-    ).toBe(true);
-  });
-
-  it('[DEFECT-04] App.tsx prunes SondeHub radiosondes after 5 min (300s) despite 3h/6h SondeHub fetch window', () => {
     expect(balloonsSourceRaw).toContain('last=10800');
     const match = appSourceRaw.match(
       /pushAtmospheric\(liveKinematicsRegistry\.rawBalloons,\s*\d+,\s*([\d_]+)\)/
     );
     expect(match).not.toBeNull();
-    const pruneMs = Number(match![1].replaceAll('_', ''));
-    expect(
-      pruneMs,
-      `App.tsx prunes balloons at ${pruneMs}ms (< 10,800,000ms SondeHub window), dropping valid active sondes immediately`
-    ).toBeGreaterThanOrEqual(10_800_000);
-  });
+    expect(Number(match![1].replaceAll('_', ''))).toBeGreaterThanOrEqual(10_800_000);
 
-  it('[DEFECT-05] App.tsx buildUrlHashString drops alt & label params, and TargetInspector renders satellite altitude in NM', () => {
     const buildHashBlock = appSourceRaw.slice(
       appSourceRaw.indexOf('function buildUrlHashString'),
       appSourceRaw.indexOf('export default function App')
     );
-    expect(
-      buildHashBlock.includes("params.set('label'"),
-      'buildUrlHashString omits label parameter parsed by parseUrlHashPatch'
-    ).toBe(true);
-    expect(
-      buildHashBlock.includes("params.set('alt'"),
-      'buildUrlHashString omits alt parameter parsed by parseUrlHashPatch'
-    ).toBe(true);
-
-    expect(
-      formatInspectorAltitude(420_000, 'aviation'),
-      'Inspector formatAltitude formats orbital altitude in NM instead of km'
-    ).toMatch(/^420(\.0)? km$/);
-    expect(
-      formatInspectorSpeed(7660, 'aviation'),
-      'Inspector formatSpeed formats orbital velocity in kt instead of km/s'
-    ).toContain('km/s');
+    expect(buildHashBlock).toContain("params.set('label'");
+    expect(buildHashBlock).toContain("params.set('alt'");
+    expect(formatInspectorAltitude(420_000, 'aviation')).toMatch(/^420(\.0)? km$/);
+    expect(formatInspectorSpeed(7660, 'aviation')).toContain('km/s');
     expect(formatInspectorDoppler(8420)).toContain('kHz');
-  });
 
-  it('[DEFECT-06] App.tsx retains disconnected OpenDroneID webhook drones in liveWebhookDronesRef', () => {
     const cleanupSlice = appSourceRaw.slice(
       appSourceRaw.indexOf('// 5. OpenDroneID Live Client'),
       appSourceRaw.indexOf('// 6. Target Lock Audio Feedback')
     );
-    expect(
-      cleanupSlice.includes('liveWebhookDronesRef.current.clear()'),
-      'OpenDroneID disconnect cleanup does not clear liveWebhookDronesRef, causing disconnected drones to resurrect every 1s'
-    ).toBe(true);
-  });
+    expect(cleanupSlice).toContain('liveWebhookDronesRef.current.clear()');
 
-  it('[DEFECT-07] PolarSkyDome cursor style conflict & TacticalMap hover/cursor leak on missing/hidden targets', () => {
-    const hasInlineCursorConflict = /style=\{\{[^}]*cursor:\s*'crosshair'/.test(polarDomeSourceRaw);
-    expect(
-      hasInlineCursorConflict,
-      'PolarSkyDome mixes inline JSX cursor: crosshair with imperative canvas.style.cursor = pointer'
-    ).toBe(false);
-
+    expect(/style=\{\{[^}]*cursor:\s*'crosshair'/.test(polarDomeSourceRaw)).toBe(false);
     const hoverSyncSlice = tacticalMapSourceRaw.slice(
       tacticalMapSourceRaw.indexOf('// Refresh active hover tooltip'),
       tacticalMapSourceRaw.indexOf('const containerWidth')
     );
-    expect(
-      hoverSyncSlice.includes('setHoveredId(null)'),
-      'TacticalMap frameLoop clears hoverTip without resetting hoveredId or canvas cursor when target vanishes/hides'
-    ).toBe(true);
-  });
+    expect(hoverSyncSlice).toContain('setHoveredId(null)');
 
-  it('[DEFECT-08] Duplicate audio triggers, missing OrbitOverlay layer gating, and ControlDock post-select dropdown reopen', () => {
     const sweepCallers =
       (appSourceRaw.includes('playSweepPulse()') ? 1 : 0) +
       (polarDomeSourceRaw.includes('playSweepPulse()') ? 1 : 0);
-    expect(sweepCallers, 'Both App.tsx and PolarSkyDome.tsx call playSweepPulse() on manual sweep').toBe(
-      1
-    );
+    expect(sweepCallers).toBe(1);
 
     const mapOrbitScope = tacticalMapSourceRaw.slice(
       tacticalMapSourceRaw.indexOf('function buildOrbitOverlayFc'),
       tacticalMapSourceRaw.indexOf('// Smooth camera follow')
     );
-    expect(
-      mapOrbitScope.includes('satellite'),
-      'TacticalMap orbit overlay ignores layers.satellite visibility toggle'
-    ).toBe(true);
+    expect(mapOrbitScope).toContain('satellite');
 
     const selectBlock = controlDockSourceRaw.slice(
       controlDockSourceRaw.indexOf('const selectSearchResult'),
       controlDockSourceRaw.indexOf('const handleSearchKeyDown')
     );
-    expect(
-      /Ref\.current\s*=|selectedLabel/.test(selectBlock),
-      'ControlDock.selectSearchResult mutates query without suppressing debounced search, reopening dropdown 300ms after pick'
-    ).toBe(true);
-  });
+    expect(/Ref\.current\s*=|selectedLabel/.test(selectBlock)).toBe(true);
 
-  it('[DEFECT-10] AstroClient computeOrbit promise hangs indefinitely if worker posts { type: "error" }', async () => {
     const client = new AstroClient(
       {},
       {
@@ -1135,10 +1199,75 @@ describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Adversarial Bug Probes
       new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 100)),
     ]);
     client.dispose();
+    expect(outcome).toBe('settled');
+  });
+
+  it('verifies PolarSkyDome & TacticalMap Sprint 02 render, pitch-lock, recenterNonce, deduplication, and cleanup hygiene', () => {
+    // 1. Identity-transform clearRect(0, 0, canvas.width, canvas.height)
+    expect(polarDomeSourceRaw).toContain('ctx.setTransform(1, 0, 0, 1, 0, 0)');
+    expect(polarDomeSourceRaw).toContain('ctx.clearRect(0, 0, canvas.width, canvas.height)');
+    expect(tacticalMapSourceRaw).toContain('ctx.setTransform(1, 0, 0, 1, 0, 0)');
+    expect(tacticalMapSourceRaw).toContain('ctx.clearRect(0, 0, labelCanvas.width, labelCanvas.height)');
+
+    // 2. Immediate polar trail pruning with zero +40 slack retention
+    expect(polarDomeSourceRaw).not.toMatch(/polarTrailsRef\.current\.size\s*>\s*activeIds\.size\s*\+\s*40/);
+    const pruneSlice = polarDomeSourceRaw.slice(
+      polarDomeSourceRaw.indexOf('// Immediately prune stale trail cache entries'),
+      polarDomeSourceRaw.indexOf('// Draw lowest priority first')
+    );
+    expect(pruneSlice).toContain('if (!activeIds.has(key))');
+    expect(pruneSlice).toContain('polarTrailsRef.current.delete(key)');
+    expect(pruneSlice).toContain('lastTrailSampleRef.current.delete(key)');
+
+    // 3. MapLibre pitch lock + recenterNonce + deduplication
+    expect(tacticalMapSourceRaw).toContain('maxPitch: 0');
+    expect(tacticalMapSourceRaw).toContain('touchPitch: false');
+    expect(tacticalMapSourceRaw).toContain('pitchWithRotate: false');
+    expect(tacticalMapSourceRaw).toContain('recenterNonce');
+    expect(tacticalMapSourceRaw).toContain('if (seenIds.has(entity.id)) continue;');
+
+    const baseNonce = useSkyStore.getState().recenterNonce;
+    useSkyStore.getState().bumpRecenterNonce();
+    expect(useSkyStore.getState().recenterNonce).toBe(baseNonce + 1);
+    useSkyStore.getState().setObserver({
+      lat: 35.5494,
+      lon: 139.7798,
+      altM: 11,
+      label: 'Haneda',
+      source: 'preset',
+    });
+    expect(useSkyStore.getState().recenterNonce).toBe(baseNonce + 2);
+
+    // 4. Cleanup of listeners, ResizeObserver, and rAF on unmount
+    const mapCleanup = tacticalMapSourceRaw.slice(
+      tacticalMapSourceRaw.lastIndexOf('return () => {'),
+      tacticalMapSourceRaw.indexOf('// Sync observer, scan ring, and recenter')
+    );
+    expect(mapCleanup).toContain('cancelAnimationFrame(rafId)');
+    expect(mapCleanup).toContain('resizeObserver.disconnect()');
+    expect(mapCleanup).toContain("window.removeEventListener('resize', handleWindowResize)");
+    expect(mapCleanup).toContain("map.off('mousemove', LAYER_IDS.entitiesSymbol, handleMouseMove)");
+    expect(mapCleanup).toContain("removeEventListener('webglcontextlost', handleCanvasContextLost)");
+    expect(mapCleanup).toContain('map.remove()');
+
+    const domeCleanup = polarDomeSourceRaw.slice(
+      polarDomeSourceRaw.indexOf('rafId = requestAnimationFrame(renderFrame);'),
+      polarDomeSourceRaw.indexOf('const findNearestHit')
+    );
+    expect(domeCleanup).toContain('cancelAnimationFrame(rafId)');
+    expect(domeCleanup).toContain('observerRO?.disconnect()');
+    expect(domeCleanup).toContain("window.removeEventListener('resize', onWinResize)");
+  });
+
+  it('[DEFECT-S2-01] App.tsx >50km observer jump clears rawFlights without resetting feeds.flights.lastUpdatedMs, leaking prior region timestamp on offline/error', () => {
+    const jumpBlock = appSourceRaw.slice(
+      appSourceRaw.indexOf('if (jumpKm > 50)'),
+      appSourceRaw.indexOf('const timer = window.setTimeout')
+    );
     expect(
-      outcome,
-      'AstroClient.computeOrbit promise hung when worker returned { type: "error" }'
-    ).toBe('settled');
+      jumpBlock.includes('lastUpdatedMs: null'),
+      'App.tsx jumpKm > 50 clears rawFlights without resetting feeds.flights.lastUpdatedMs to null, leaving stale prior-region timestamp in HUD on failure/offline'
+    ).toBe(true);
   });
 
   it('supports runtime dead-reckoning & negative altitude preservation without NaN', () => {
@@ -1150,5 +1279,209 @@ describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Adversarial Bug Probes
 
     const negExtrap = extrapolateDeadReckoning(31.5, 35.5, 50, 90, 5, -390, 0);
     expect(negExtrap.altM).toBe(-390);
+  });
+});
+
+describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Integrity', () => {
+  it('validates public/manifest.json fields, relative paths, and icon definitions', async () => {
+    const fs = await loadNodeFs();
+    const manifestUrl = repoFileUrl('public/manifest.json');
+    expect(fs.existsSync(manifestUrl)).toBe(true);
+    const manifest = JSON.parse(fs.readFileSync(manifestUrl, 'utf8')) as {
+      start_url: string;
+      scope: string;
+      display: string;
+      background_color: string;
+      theme_color: string;
+      icons: Array<{ src: string; sizes: string; type: string; purpose?: string }>;
+    };
+
+    expect(manifest.start_url).toBe('./');
+    expect(manifest.scope).toBe('./');
+    expect(manifest.display).toBe('standalone');
+    expect(manifest.background_color.toUpperCase()).toBe('#06090F');
+    expect(manifest.theme_color.toUpperCase()).toBe('#06090F');
+
+    const icon192 = manifest.icons.find((i) => i.sizes === '192x192');
+    const icon512 = manifest.icons.find((i) => i.sizes === '512x512');
+    expect(icon192).toMatchObject({
+      src: './icons/icon-192.png',
+      sizes: '192x192',
+      type: 'image/png',
+      purpose: 'any maskable',
+    });
+    expect(icon512).toMatchObject({
+      src: './icons/icon-512.png',
+      sizes: '512x512',
+      type: 'image/png',
+      purpose: 'any maskable',
+    });
+  });
+
+  it('verifies exact binary PNG signatures and big-endian IHDR dimensions for all PWA raster icons', async () => {
+    const fs = await loadNodeFs();
+    const expectedSignature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    const decoder = new TextDecoder('ascii');
+    const hasAsciiChunk = (bytes: Uint8Array, tag: string): boolean => {
+      const t = [tag.charCodeAt(0), tag.charCodeAt(1), tag.charCodeAt(2), tag.charCodeAt(3)];
+      for (let i = 0; i <= bytes.length - 4; i += 1) {
+        if (bytes[i] === t[0] && bytes[i + 1] === t[1] && bytes[i + 2] === t[2] && bytes[i + 3] === t[3]) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const targets: Array<{ file: string; width: number; height: number }> = [
+      { file: 'public/icons/icon-192.png', width: 192, height: 192 },
+      { file: 'public/icons/icon-512.png', width: 512, height: 512 },
+      { file: 'public/icons/apple-touch-icon.png', width: 180, height: 180 },
+    ];
+
+    for (const target of targets) {
+      const bytes = fs.readFileSync(repoFileUrl(target.file));
+      expect(bytes.length, `${target.file} must be non-empty`).toBeGreaterThan(64);
+      expect(Array.from(bytes.subarray(0, 8)), `${target.file} PNG magic bytes`).toEqual(
+        expectedSignature
+      );
+
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      expect(view.getUint32(8, false), `${target.file} IHDR chunk length`).toBe(13);
+      expect(decoder.decode(bytes.subarray(12, 16)), `${target.file} IHDR chunk type`).toBe('IHDR');
+      expect(view.getUint32(16, false), `${target.file} width`).toBe(target.width);
+      expect(view.getUint32(20, false), `${target.file} height`).toBe(target.height);
+      expect(hasAsciiChunk(bytes, 'IDAT'), `${target.file} IDAT chunk`).toBe(true);
+      expect(hasAsciiChunk(bytes, 'IEND'), `${target.file} IEND chunk`).toBe(true);
+    }
+  });
+
+  it('verifies public/sw.js cache hygiene, activate pruning, and strict bypass of telemetry & /api-proxy/', async () => {
+    const fs = await loadNodeFs();
+    const vm = await loadNodeVm();
+    const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
+
+    expect(swSource).toContain("addEventListener('install'");
+    expect(swSource).toContain("addEventListener('activate'");
+    expect(swSource).toContain("addEventListener('fetch'");
+    expect(swSource).toContain('caches.delete');
+    expect(swSource).toContain("url.origin !== self.location.origin");
+    expect(swSource).toContain("url.pathname.includes('/api-proxy/')");
+    expect(swSource).toContain('networkFirst');
+
+    // Execute sw.js in an isolated VM sandbox to prove runtime bypass vs shell handling
+    const listeners = new Map<string, (ev: unknown) => void>();
+    const deletedCaches: string[] = [];
+    const openedCaches = new Map<string, Map<string, Response>>();
+    const mockFetch = vi.fn(async () => new Response('shell-ok', { status: 200 }));
+
+    const sandboxSelf = {
+      location: {
+        origin: 'https://example.github.io',
+        href: 'https://example.github.io/krunked_skymap/sw.js',
+      },
+      addEventListener(type: string, cb: (ev: unknown) => void) {
+        listeners.set(type, cb);
+      },
+      skipWaiting: vi.fn(async () => {}),
+      clients: { claim: vi.fn(async () => {}) },
+    };
+
+    const sandboxCaches = {
+      async open(name: string) {
+        let store = openedCaches.get(name);
+        if (!store) {
+          store = new Map<string, Response>();
+          openedCaches.set(name, store);
+        }
+        return {
+          async add(req: Request | string) {
+            const key = typeof req === 'string' ? req : req.url;
+            store!.set(key, new Response('precached', { status: 200 }));
+          },
+          async put(req: Request | string, res: Response) {
+            const key = typeof req === 'string' ? req : req.url;
+            store!.set(key, res);
+          },
+        };
+      },
+      async keys() {
+        return ['krunked-skymap-v1', 'krunked-skymap-v2'];
+      },
+      async delete(key: string) {
+        deletedCaches.push(key);
+        return true;
+      },
+      async match() {
+        return undefined;
+      },
+    };
+
+    vm.runInNewContext(swSource, {
+      self: sandboxSelf,
+      caches: sandboxCaches,
+      fetch: mockFetch,
+      URL,
+      Request,
+      Response,
+      Promise,
+    });
+
+    // Activate deletes old cache versions while keeping current CACHE_VERSION
+    const activateTasks: Array<Promise<unknown>> = [];
+    listeners.get('activate')?.({
+      waitUntil(p: Promise<unknown>) {
+        activateTasks.push(p);
+      },
+    });
+    await Promise.all(activateTasks);
+    expect(deletedCaches).toEqual(['krunked-skymap-v1']);
+
+    // Telemetry and /api-proxy/ URLs MUST bypass respondWith()
+    const fetchListener = listeners.get('fetch')!;
+    const bypassUrls = [
+      'https://api.adsb.lol/v2/point/38.85/-77.04/65',
+      'https://opensky-network.org/api/states/all?lamin=38&lomin=-78&lamax=39&lomax=-76',
+      'https://api.v2.sondehub.org/sondes?lat=38.85&lon=-77.04',
+      'https://example.github.io/krunked_skymap/api-proxy/adsb-fi/api/v2/lat/38.85/lon/-77.04/dist/65',
+    ];
+    for (const url of bypassUrls) {
+      const respondWith = vi.fn();
+      fetchListener({
+        request: { method: 'GET', cache: 'default', mode: 'cors', url },
+        respondWith,
+      });
+      expect(respondWith, `SW must bypass ${url}`).not.toHaveBeenCalled();
+    }
+
+    // Same-origin app shell URL MUST be intercepted via respondWith(networkFirst)
+    const shellRespondWith = vi.fn();
+    fetchListener({
+      request: {
+        method: 'GET',
+        cache: 'default',
+        mode: 'navigate',
+        destination: 'document',
+        url: 'https://example.github.io/krunked_skymap/index.html',
+      },
+      respondWith: shellRespondWith,
+    });
+    expect(shellRespondWith).toHaveBeenCalledTimes(1);
+    await shellRespondWith.mock.calls[0][0];
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('audits index.html and vite.config.ts for relative PWA metadata, SW registration, and proxy routes', async () => {
+    const fs = await loadNodeFs();
+    const indexHtml = fs.readFileSync(repoFileUrl('index.html'), 'utf8');
+    expect(indexHtml).toContain('href="./manifest.json"');
+    expect(indexHtml).toContain('href="./icons/apple-touch-icon.png"');
+    expect(indexHtml).toContain('name="theme-color" content="#06090F"');
+    expect(indexHtml).toContain("navigator.serviceWorker.register('./sw.js', { scope: './' })");
+
+    const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8');
+    expect(viteConfig).toContain("base: './'");
+    expect(viteConfig).toContain("'/api-proxy/adsb-fi'");
+    expect(viteConfig).toContain("'/api-proxy/adsb-lol'");
+    expect(viteConfig).toContain("'/api-proxy/airplanes-live'");
   });
 });
