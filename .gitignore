@@ -1,0 +1,23 @@
+# Dependencies & Build Outputs
+node_modules/
+dist/
+coverage/
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+
+# Logs & Temporary Files
+*.log
+npm-debug.log*
+*.bak
+*.tmp
+.scratch/
+
+# OS & Editor Artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo

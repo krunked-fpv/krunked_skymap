@@ -1,0 +1,33 @@
+{
+  "name": "krunked-skymap",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Krunked Sky-Map — Live 60fps Aerospace Situational Awareness Command Deck & Client-Side Astrodynamics Lab",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "seed": "node scripts/refresh-ephemeris.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.475.0",
+    "maplibre-gl": "^4.7.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "satellite.js": "^5.0.0",
+    "zustand": "^5.0.3"
+  },
+  "devDependencies": {
+    "@types/geojson": "^7946.0.16",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  }
+}
