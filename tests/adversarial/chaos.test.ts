@@ -28,7 +28,9 @@ import {
 import { AstroClient, unpackSatelliteKinematics } from '../../src/workers/astroClient';
 import {
   clearFlightsServiceCache,
+  extractRelayedJsonPayload,
   fetchFlightsCascade,
+  flightsCircuitBreaker,
   normalizeAdsbxAircraft,
   normalizeOpenSkyState,
 } from '../../src/services/flightsService';
@@ -1361,6 +1363,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
 
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v3'");
     expect(swSource).toContain("addEventListener('install'");
     expect(swSource).toContain("addEventListener('activate'");
     expect(swSource).toContain("addEventListener('fetch'");
@@ -1406,7 +1409,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
         };
       },
       async keys() {
-        return ['krunked-skymap-v1', 'krunked-skymap-v2'];
+        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3'];
       },
       async delete(key: string) {
         deletedCaches.push(key);
@@ -1427,7 +1430,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       Promise,
     });
 
-    // Activate deletes old cache versions while keeping current CACHE_VERSION
+    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v3)
     const activateTasks: Array<Promise<unknown>> = [];
     listeners.get('activate')?.({
       waitUntil(p: Promise<unknown>) {
@@ -1435,15 +1438,18 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       },
     });
     await Promise.all(activateTasks);
-    expect(deletedCaches).toEqual(['krunked-skymap-v1']);
+    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2']);
+    expect(deletedCaches).not.toContain('krunked-skymap-v3');
 
-    // Telemetry and /api-proxy/ URLs MUST bypass respondWith()
+    // Telemetry, CORS relays (r.jina.ai), and /api-proxy/ URLs MUST bypass respondWith()
     const fetchListener = listeners.get('fetch')!;
     const bypassUrls = [
+      'https://r.jina.ai/https://opendata.adsb.fi/api/v3/lat/38.8512/lon/-77.0402/dist/65?_=123',
+      'https://r.jina.ai/https://api.adsb.lol/v2/point/38.8512/-77.0402/65?_=123',
       'https://api.adsb.lol/v2/point/38.85/-77.04/65',
       'https://opensky-network.org/api/states/all?lamin=38&lomin=-78&lamax=39&lomax=-76',
       'https://api.v2.sondehub.org/sondes?lat=38.85&lon=-77.04',
-      'https://example.github.io/krunked_skymap/api-proxy/adsb-fi/api/v2/lat/38.85/lon/-77.04/dist/65',
+      'https://example.github.io/krunked_skymap/api-proxy/adsb-fi/api/v3/lat/38.85/lon/-77.04/dist/65',
     ];
     for (const url of bypassUrls) {
       const respondWith = vi.fn();
@@ -1479,10 +1485,383 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     expect(indexHtml).toContain('name="theme-color" content="#06090F"');
     expect(indexHtml).toContain("navigator.serviceWorker.register('./sw.js', { scope: './' })");
 
-    const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8');
+    const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8').replace(/\r\n/g, '\n');
     expect(viteConfig).toContain("base: './'");
     expect(viteConfig).toContain("'/api-proxy/adsb-fi'");
     expect(viteConfig).toContain("'/api-proxy/adsb-lol'");
     expect(viteConfig).toContain("'/api-proxy/airplanes-live'");
+    expect(viteConfig).toContain("proxyReq.removeHeader('origin')");
+    expect(viteConfig).toContain("proxyReq.removeHeader('referer')");
+    expect(viteConfig).toContain(
+      "proxyReq.setHeader(\n      'User-Agent',\n      'KrunkedSkyMap/2.0 (+https://github.com/krunked-fpv/krunked_skymap)'"
+    );
+    expect(viteConfig).toContain('server: {\n    proxy: adsbApiProxy,');
+    expect(viteConfig).toContain('preview: {\n    proxy: adsbApiProxy,');
+  });
+});
+
+describe('Challenge 7 — Sprint 02.1 Live ADS-B CORS Relays, Fast-Bypass & Circuit-Breaker Recovery', () => {
+  const DCA: ObserverLocation = {
+    lat: 38.8512,
+    lon: -77.0402,
+    altM: 12,
+    label: 'DCA',
+    source: 'preset',
+  };
+
+  beforeEach(() => {
+    clearFlightsServiceCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('enforces zero-preflight simple-GET header hygiene on all r.jina.ai CORS relay fetch() calls', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    const capturedCalls: Array<{ url: string; init?: RequestInit }> = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        capturedCalls.push({ url, init });
+        if (url.startsWith('https://r.jina.ai/https://api.adsb.lol/')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'a12345',
+                  flight: 'SIMPLE1',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 10000,
+                  gs: 260,
+                  track: 90,
+                  seen_pos: 2,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Upstream unavailable', { status: 503 });
+      })
+    );
+
+    const res = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(res.status).toBe('live');
+    expect(res.provider).toBe('cors-relay:adsb.lol');
+    expect(res.entities).toHaveLength(1);
+
+    const relayCalls = capturedCalls.filter((c) => c.url.startsWith('https://r.jina.ai/'));
+    expect(relayCalls).toHaveLength(2);
+    expect(relayCalls[0].url).toContain('https://r.jina.ai/https://opendata.adsb.fi/api/v3/');
+    expect(relayCalls[1].url).toContain('https://r.jina.ai/https://api.adsb.lol/v2/');
+
+    for (const call of relayCalls) {
+      expect(call.init?.method === undefined || call.init.method.toUpperCase() === 'GET').toBe(true);
+      expect(
+        call.init?.headers,
+        `r.jina.ai call ${call.url} must omit custom headers (e.g., Accept: application/json) to avoid CORS OPTIONS preflight`
+      ).toBeUndefined();
+    }
+  });
+
+  it('extracts Markdown Content payloads while rejecting upstream {Error}, HTML, and truncated JSON with 0 phantom aircraft', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+
+    const validMarkdown = [
+      'Title: ',
+      '',
+      'URL Source: https://opendata.adsb.fi/api/v3/lat/38.8512/lon/-77.0402/dist/65',
+      '',
+      'Markdown Content:',
+      JSON.stringify({
+        aircraft: [
+          {
+            hex: 'a88001',
+            flight: 'JINA1',
+            lat: 38.86,
+            lon: -77.05,
+            alt_baro: 11000,
+            gs: 280,
+            track: 135,
+            seen_pos: 3,
+          },
+        ],
+      }),
+    ].join('\n');
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(validMarkdown, { status: 200 });
+        }
+        return new Response('Unexpected downstream', { status: 503 });
+      })
+    );
+
+    const validRes = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(validRes.status).toBe('live');
+    expect(validRes.provider).toBe('cors-relay:adsb.fi');
+    expect(validRes.entities.map((e) => e.callsign)).toEqual(['JINA1']);
+
+    // Direct helper rejection proofs (including { Error, ac: [...] } poisoning attempt)
+    expect(() =>
+      extractRelayedJsonPayload(
+        JSON.stringify({ Error: 'Quota exceeded', ac: [{ hex: 'a99999', lat: 38.86, lon: -77.05 }] }),
+        'cors-relay:adsb.fi'
+      )
+    ).toThrow('Quota exceeded');
+    expect(() =>
+      extractRelayedJsonPayload(
+        'Title: Gate\n\nMarkdown Content:\n<!DOCTYPE html><html><body>502</body></html>',
+        'cors-relay:adsb.fi'
+      )
+    ).toThrow('Invalid payload from cors-relay:adsb.fi');
+
+    const poisonedBodies = [
+      {
+        name: 'Upstream { Error } alongside ac[]',
+        body: `Markdown Content:\n${JSON.stringify({
+          Error: 'Rate limit exceeded',
+          ac: [{ hex: 'a99999', flight: 'PHANTOM', lat: 38.86, lon: -77.05, alt_baro: 9000, gs: 250, track: 90 }],
+        })}`,
+      },
+      {
+        name: 'Jina { data: { content } } containing { Error }',
+        body: JSON.stringify({
+          code: 200,
+          data: {
+            content: JSON.stringify({
+              Error: 'Upstream rejected',
+              aircraft: [{ hex: 'a99998', flight: 'PHANTOM2', lat: 38.86, lon: -77.05, alt_baro: 9000 }],
+            }),
+          },
+        }),
+      },
+      {
+        name: 'HTML <!DOCTYPE html> gateway page',
+        body: '<!DOCTYPE html><html><head><title>502</title></head><body>Bad Gateway</body></html>',
+      },
+      {
+        name: 'Markdown Content wrapping HTML <!DOCTYPE html>',
+        body: 'Title: 502\n\nMarkdown Content:\n<!DOCTYPE html><html><body>Blocked</body></html>',
+      },
+      {
+        name: 'Truncated JSON inside Markdown Content',
+        body: 'Title: \n\nMarkdown Content:\n{"aircraft":[{"hex":"a12345","flight":"CUT',
+      },
+    ];
+
+    for (const poisoned of poisonedBodies) {
+      clearFlightsServiceCache();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+          const url = String(input);
+          if (url.startsWith('https://r.jina.ai/')) {
+            return new Response(poisoned.body, { status: 200 });
+          }
+          return new Response('Upstream unavailable', { status: 503 });
+        })
+      );
+
+      const res = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+      expect(res.status, `${poisoned.name} status`).toBe('error');
+      expect(res.entities, `${poisoned.name} must yield 0 phantom aircraft`).toEqual([]);
+    }
+  });
+
+  it('fast-bypasses localhost static-server 404 and 200 HTML proxy responses straight into cors-relay:adsb.fi without leaking 404', async () => {
+    vi.stubGlobal('window', { location: { hostname: '127.0.0.1' } });
+    const calls404: string[] = [];
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        calls404.push(url);
+        if (url.startsWith('/api-proxy/adsb-fi/')) {
+          return new Response('Not Found', { status: 404, statusText: 'Not Found' });
+        }
+        if (url.startsWith('/api-proxy/adsb-lol/') || url.startsWith('/api-proxy/airplanes-live/')) {
+          throw new Error(`Fast-bypass failed: unexpected Stage 1 call to ${url}`);
+        }
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            `Markdown Content:\n${JSON.stringify({
+              aircraft: [
+                {
+                  hex: 'a70001',
+                  flight: 'STAT404',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 8500,
+                  gs: 240,
+                  track: 180,
+                  seen_pos: 1,
+                },
+              ],
+            })}`,
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const bypass404 = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(bypass404.status).toBe('live');
+    expect(bypass404.provider).toBe('cors-relay:adsb.fi');
+    expect(bypass404.httpStatus).toBeUndefined();
+    expect(bypass404.errorMsg).toBeUndefined();
+    expect(bypass404.entities.map((e) => e.callsign)).toEqual(['STAT404']);
+    expect(calls404).toHaveLength(2);
+    expect(calls404[0]).toContain('/api-proxy/adsb-fi/');
+    expect(calls404[1]).toContain('https://r.jina.ai/https://opendata.adsb.fi/');
+
+    // Also verify 200 HTML SPA fallback at localhost fast-bypasses cleanly and never leaks 404 or proxy failure
+    clearFlightsServiceCache();
+    vi.stubGlobal('window', { location: { hostname: 'localhost' } });
+    const callsHtml: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        callsHtml.push(url);
+        if (url.startsWith('/api-proxy/adsb-fi/')) {
+          return new Response('<!DOCTYPE html><html><body>Vite SPA Shell</body></html>', { status: 200 });
+        }
+        if (url.startsWith('/api-proxy/adsb-lol/') || url.startsWith('/api-proxy/airplanes-live/')) {
+          throw new Error(`Fast-bypass failed on HTML proxy response: ${url}`);
+        }
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            JSON.stringify({
+              aircraft: [
+                {
+                  hex: 'a70002',
+                  flight: 'HTMLBYP',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 9500,
+                  gs: 250,
+                  track: 45,
+                  seen_pos: 2,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const bypassHtml = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+    expect(bypassHtml.status).toBe('live');
+    expect(bypassHtml.provider).toBe('cors-relay:adsb.fi');
+    expect(bypassHtml.httpStatus).toBeUndefined();
+    expect(bypassHtml.entities.map((e) => e.callsign)).toEqual(['HTMLBYP']);
+    expect(callsHtml).toHaveLength(2);
+  });
+
+  it('recovers immediately on resetBreakers: true manual sweep while background resetBreakers: false honors open circuit cooldowns and prevents tight polling loops', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('Rate limited', { status: 429, statusText: 'Too Many Requests' }))
+    );
+
+    for (let i = 0; i < 3; i++) {
+      const trip = await fetchFlightsCascade(DCA, 120, undefined, { force: true });
+      expect(trip.status).toBe('rate-limited');
+      expect(trip.httpStatus).toBe(429);
+    }
+
+    expect(flightsCircuitBreaker.getState('cors-relay-adsb-fi')).toBe('open');
+    expect(flightsCircuitBreaker.getState('adsb.lol')).toBe('open');
+    expect(flightsCircuitBreaker.getState('opensky')).toBe('open');
+
+    const healthyFetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+        return new Response(
+          `Markdown Content:\n${JSON.stringify({
+            aircraft: [
+              {
+                hex: 'a60001',
+                flight: 'RECOV1',
+                lat: 38.86,
+                lon: -77.05,
+                alt_baro: 14000,
+                gs: 310,
+                track: 270,
+                seen_pos: 1,
+              },
+            ],
+          })}`,
+          { status: 200 }
+        );
+      }
+      return new Response('Down', { status: 503 });
+    });
+    vi.stubGlobal('fetch', healthyFetch);
+
+    // Background 1Hz tick uses resetBreakers: false -> must respect open circuits (0 fetch calls)
+    const bgTick = await fetchFlightsCascade(DCA, 120, undefined, {
+      force: true,
+      resetBreakers: false,
+    });
+    expect(healthyFetch).not.toHaveBeenCalled();
+    expect(bgTick.status).toBe('rate-limited');
+    expect(bgTick.httpStatus).toBe(429);
+    expect(bgTick.errorMsg).toContain('(HTTP 429)');
+    expect(bgTick.entities).toEqual([]);
+
+    // Manual sweep / Retry Live Feed / online recovery uses resetBreakers: true -> immediate recovery
+    const manualSweep = await fetchFlightsCascade(DCA, 120, undefined, {
+      force: true,
+      resetBreakers: true,
+    });
+    expect(healthyFetch).toHaveBeenCalledTimes(1);
+    expect(manualSweep.status).toBe('live');
+    expect(manualSweep.provider).toBe('cors-relay:adsb.fi');
+    expect(manualSweep.entities.map((e) => e.callsign)).toEqual(['RECOV1']);
+
+    // App.tsx & ControlDock.tsx separation + anti-loop guards
+    const normalizedApp = appSourceRaw.replace(/\r\n/g, '\n');
+    expect(normalizedApp).toContain('if (flightsInFlightRef.current) return;');
+    expect(normalizedApp).toContain('nextFlightsDueMsRef.current = checkedAtMs + 10_000;');
+    expect(normalizedApp).toContain('void runFlightsRefresh(shouldForce, false);');
+
+    const manualSweepBlock = normalizedApp.slice(
+      normalizedApp.indexOf('// Manual Sweep trigger'),
+      normalizedApp.indexOf('// 1Hz Wall-Clock Scheduler')
+    );
+    expect(manualSweepBlock).toContain('void runFlightsRefresh(true, true);');
+
+    const onlineBlock = normalizedApp.slice(
+      normalizedApp.indexOf('const handleOnline = () => {'),
+      normalizedApp.indexOf('const handleVisibilityChange = () => {')
+    );
+    expect(onlineBlock).toContain('void runFlightsRefresh(true, true);');
+
+    const normalizedDock = controlDockSourceRaw.replace(/\r\n/g, '\n');
+    const retryGateSlice = normalizedDock.slice(
+      normalizedDock.indexOf('const canRetryLiveFeed ='),
+      normalizedDock.indexOf('return (', normalizedDock.indexOf('const canRetryLiveFeed ='))
+    );
+    expect(retryGateSlice).toContain("flightsFeed.status === 'error'");
+    expect(retryGateSlice).toContain("flightsFeed.status === 'rate-limited'");
+    expect(retryGateSlice).toContain("flightsFeed.status === 'delayed'");
+    expect(retryGateSlice).not.toContain("'loading'");
+    expect(normalizedDock).toContain('data-testid="dock-feed-retry"');
+    expect(normalizedDock).toContain('onClick={onManualSweep}');
   });
 });

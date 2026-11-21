@@ -291,3 +291,41 @@ Both Low defects (`[DEFECT-S2-01]`, `[DEFECT-S2-02]`) were remediated on `main`:
 - **High:** **0**
 - **Medium:** **0**
 - **Low:** **0**
+
+---
+
+## Sprint 02.1 — Live ADS-B CORS & Circuit-Breaker Patch Audit
+
+**Auditor:** `@redteam-patch`  
+**Branch / Worktree:** `sprint/redteam-patch` (`c:\krunked_skymap\.worktrees\redteam-patch`)  
+**Scope:** Sprint 02.1 commits (`0e01a2d`, `a116c5f`, `dc61b62`, `9cc78d1`, `aa019a4`) touching [flightsService.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/flightsService.ts), [httpClient.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/httpClient.ts), [balloonsService.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/balloonsService.ts), [vite.config.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/vite.config.ts), [sw.js](file:///c:/krunked_skymap/.worktrees/redteam-patch/public/sw.js), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/components/hud/ControlDock.tsx), [cockpit.css](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/styles/cockpit.css), and [App.tsx](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/App.tsx).
+
+### Sprint 02.1 Open Defect Tally
+
+| Severity | Count | Findings |
+| :--- | :---: | :--- |
+| **Critical** | **0** | None |
+| **High** | **0** | None |
+| **Medium** | **0** | None |
+| **Low** | **0** | None |
+| **Total** | **0** | **27 / 27 passing** in [chaos.test.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/tests/adversarial/chaos.test.ts) (`74 / 74` full suite; `tsc --noEmit` exit `0`) |
+
+### Sprint 02.1 Verification Summary (Verified Passing Controls)
+1. **Zero-Preflight CORS Relay Hygiene (`r.jina.ai`):**
+   - Stage 2 relay calls in [flightsService.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/flightsService.ts#L950-L955) invoke [fetchTextWithTimeout](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/httpClient.ts#L114-L120) without `headers` or non-GET `method`, keeping `init?.headers === undefined` (no `Accept: application/json` or custom headers) so browsers execute simple GET requests with zero `OPTIONS` preflight failures.
+   - Shared `429` suppression skips `cors-relay:adsb.lol` whenever `cors-relay:adsb.fi` failed with HTTP `429` (live or open-circuit `getLastError`).
+2. **Cache-Poisoning & Phantom-Aircraft Rejection:**
+   - [extractRelayedJsonPayload](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/flightsService.ts#L670-L723) extracts direct JSON, Jina `{ data: { content } }`, and `Markdown Content:` envelopes while rejecting `<!DOCTYPE html>` / `<html>`, upstream `{ Error: "..." }` (even when accompanied by an `ac[]` array), truncated JSON, arrays, and empty responses — returning `status: 'error'` and `0` phantom aircraft.
+3. **Vite Proxy Header Scrubbing & Localhost Static-Server Fast-Bypass:**
+   - [vite.config.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/vite.config.ts#L4-L44) strips `origin` and `referer` on `proxyReq` and sets an explicit `User-Agent` across `/api-proxy/adsb-lol`, `/api-proxy/adsb-fi`, and `/api-proxy/airplanes-live` for both `server.proxy` and `preview.proxy`.
+   - [isLocalDevOrLanRuntime](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/flightsService.ts#L636-L664) restricts Stage 1 proxy probes to dev/localhost/LAN/CGNAT hosts, and HTTP `404`/`405` or `200 HTML` responses latch `viteProxyUnavailable = true`, reset the proxy breaker, suppress spurious `404` status/error strings, and fast-bypass straight into `cors-relay:adsb.fi`.
+4. **Service Worker `krunked-skymap-v3` Isolation:**
+   - VM sandbox execution of [sw.js](file:///c:/krunked_skymap/.worktrees/redteam-patch/public/sw.js#L1-L132) confirms `activate` prunes `krunked-skymap-v1` and `krunked-skymap-v2` while preserving `krunked-skymap-v3`, and `shouldBypassCache` bypasses `r.jina.ai`, `api.adsb.lol`, `opensky-network.org`, `api.v2.sondehub.org`, and `/api-proxy/` routes.
+5. **Circuit-Breaker Reset Separation & Anti-Loop UI Hygiene:**
+   - [App.tsx](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/App.tsx#L461-L704) cleanly isolates user/recovery triggers (`runFlightsRefresh(true, true)` on observer jump, manual sweep, and `online` recovery; plus `fetchBalloons(..., { force: true })` in [balloonsService.ts](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/balloonsService.ts#L268-L270)) from the 1Hz background scheduler (`runFlightsRefresh(shouldForce, false)` honoring open circuit cooldowns and surfacing `(HTTP 429)`/`lastError` diagnostics via [CircuitBreaker.getLastError](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/services/httpClient.ts#L325-L327)).
+   - `flightsInFlightRef` locking, `nextFlightsDueMsRef = checkedAtMs + 10_000`, `nextRefreshSec = 10`, and [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/components/hud/ControlDock.tsx#L617-L778) `canRetryLiveFeed` gating (hiding `Retry Live Feed` during `loading`) prevent tight polling loops on repeated clicks of `Retry Live Feed` or `Sweep Now`, while [cockpit.css](file:///c:/krunked_skymap/.worktrees/redteam-patch/src/styles/cockpit.css#L1236-L1334) wraps structured error diagnostics cleanly inside the dock.
+
+### Toolchain Verification (Post-Edit)
+- `npx tsc --noEmit` -> **PASS (exit 0)**
+- `npx vitest run --pool=vmThreads tests/adversarial/chaos.test.ts` -> **27 / 27 PASS** (`Challenge 1`–`Challenge 7`)
+- `npx vitest run --pool=vmThreads` -> **74 / 74 PASS** (`tests/unit/ingest.test.ts`: 28, `tests/unit/math.test.ts`: 19, `tests/adversarial/chaos.test.ts`: 27)
