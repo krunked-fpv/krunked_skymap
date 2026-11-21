@@ -13,6 +13,7 @@ import {
   Crosshair,
   Info,
   Radar,
+  RefreshCw,
   Search,
   SlidersHorizontal,
   Wind,
@@ -613,6 +614,16 @@ export function ControlDock({
               const degradedNotice = getDegradedFeedNotice(flightsFeed.status);
               const isCritical =
                 flightsFeed.status === 'offline' || flightsFeed.status === 'error';
+              const errorItems = flightsFeed.errorMsg
+                ? flightsFeed.errorMsg
+                    .split(' | ')
+                    .map((item) => item.trim())
+                    .filter((item) => item.length > 0)
+                : [];
+              const canRetryLiveFeed =
+                flightsFeed.status === 'error' ||
+                flightsFeed.status === 'rate-limited' ||
+                flightsFeed.status === 'delayed';
 
               return (
                 <div className="dock-feed-diag" data-testid="dock-feed-diagnostics">
@@ -651,15 +662,40 @@ export function ControlDock({
                         style={{ flexShrink: 0, marginTop: 1 }}
                         aria-hidden="true"
                       />
-                      <div>
+                      <div className="dock-feed-diag__notice-body">
                         <span>{degradedNotice}</span>
-                        {flightsFeed.errorMsg && (
-                          <span className="dock-feed-diag__error-detail">
-                            {flightsFeed.errorMsg}
-                          </span>
+                        {errorItems.length > 0 && (
+                          <div className="dock-feed-diag__error-detail">
+                            <ul
+                              className="dock-feed-diag__error-list"
+                              aria-label="Provider diagnostics"
+                            >
+                              {errorItems.map((errLine, idx) => (
+                                <li
+                                  key={`${idx}-${errLine}`}
+                                  className="dock-feed-diag__error-item"
+                                >
+                                  {errLine}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
                         )}
                       </div>
                     </div>
+                  )}
+
+                  {canRetryLiveFeed && (
+                    <button
+                      type="button"
+                      className="dock-feed-diag__retry-btn"
+                      data-testid="dock-feed-retry"
+                      onClick={onManualSweep}
+                      title="Reset feed circuit breakers and retry live ADS-B sweep"
+                    >
+                      <RefreshCw size={12} aria-hidden="true" />
+                      <span>Retry Live Feed</span>
+                    </button>
                   )}
                 </div>
               );
