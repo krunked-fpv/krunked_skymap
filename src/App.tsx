@@ -30,6 +30,13 @@ import { TacticalMap } from './components/map/TacticalMap';
 import { PolarSkyDome } from './components/skydome/PolarSkyDome';
 
 const ALL_CATEGORIES: SkyCategory[] = ['flight', 'military', 'satellite', 'balloon', 'drone'];
+const PWA_DISMISS_STORAGE_KEY = 'krunked_pwa_dismissed';
+
+interface BeforeInstallPromptEvent extends Event {
+  readonly platforms?: string[];
+  readonly userChoice: Promise<{ outcome: 'accepted' | 'dismissed'; platform: string }>;
+  prompt(): Promise<void>;
+}
 
 function parseUrlHashPatch(): UrlHydrationPatch | null {
   if (typeof window === 'undefined' || !window.location.hash) return null;
@@ -148,12 +155,16 @@ export default function App() {
 
   const astroClientRef = useRef<AstroClient | null>(null);
   const odidClientRef = useRef<OpenDroneIdClient | null>(null);
+  const deferredInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
   const liveWebhookDronesRef = useRef<Map<string, DroneEntity>>(new Map());
   const simStartMsRef = useRef<number>(Date.now());
   const hydratedRef = useRef(false);
   const flightsInFlightRef = useRef(false);
   const balloonsInFlightRef = useRef(false);
   const airspaceInFlightRef = useRef(false);
+  const lastFlightsAttemptMsRef = useRef<number>(0);
+  const nextFlightsDueMsRef = useRef<number>(Date.now() + 10_000);
+  const missingSelectedSinceRef = useRef<number | null>(null);
   const zenithNotifiedRef = useRef<Set<string>>(new Set());
   const alertNotifiedRef = useRef<Set<string>>(new Set());
   const prevSelectedIdRef = useRef<string | null>(null);
@@ -196,7 +207,7 @@ export default function App() {
                 () => {
                   // Stay on default aerospace hub silently
                 },
-                { enableHighAccuracy: false, timeout: 4000, maximumAge: 60000 }
+                { enableHighAccuracy: true, timeout: 6000, maximumAge: 15_000 }
               );
             }
           })
@@ -217,6 +228,66 @@ export default function App() {
     };
     window.addEventListener('hashchange', handleHashChange);
     return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  // 1b. PWA Install Prompt (`beforeinstallprompt`) & Standalone Mode Detection
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const mql = window.matchMedia?.('(display-mode: standalone)') ?? null;
+    const getStandalone = () =>
+      Boolean(
+        mql?.matches ||
+          (navigator as Navigator & { standalone?: boolean }).standalone === true
+      );
+
+    let dismissed = false;
+    try {
+      dismissed = window.sessionStorage?.getItem(PWA_DISMISS_STORAGE_KEY) === '1';
+    } catch {
+      dismissed = false;
+    }
+
+    useSkyStore.getState().setPwaInstallState({
+      standalone: getStandalone(),
+      dismissed,
+    });
+
+    const handleDisplayModeChange = () => {
+      const standalone = getStandalone();
+      useSkyStore.getState().setPwaInstallState({
+        standalone,
+        available: standalone ? false : undefined,
+      });
+    };
+
+    const handleBeforeInstallPrompt = (event: Event) => {
+      const bipEvent = event as BeforeInstallPromptEvent;
+      if (typeof bipEvent.preventDefault === 'function') {
+        bipEvent.preventDefault();
+      }
+      deferredInstallPromptRef.current = bipEvent;
+      if (!getStandalone()) {
+        useSkyStore.getState().setPwaInstallState({ available: true });
+      }
+    };
+
+    const handleAppInstalled = () => {
+      deferredInstallPromptRef.current = null;
+      useSkyStore.getState().setPwaInstallState({
+        available: false,
+        standalone: true,
+      });
+    };
+
+    mql?.addEventListener?.('change', handleDisplayModeChange);
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    return () => {
+      mql?.removeEventListener?.('change', handleDisplayModeChange);
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+    };
   }, []);
 
   // 2. Debounced URL Hash Permalink Synchronization
@@ -323,8 +394,9 @@ export default function App() {
       }
     });
 
-    // 10Hz Worker propagation tick
+    // 10Hz Worker propagation tick (paused when tab hidden)
     const tickTimer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       const st = useSkyStore.getState();
       if (st.layers.satellite && st.workerReady) {
         client.tick(Date.now());
@@ -387,8 +459,13 @@ export default function App() {
 
   // 4. Data Feed Runners (Flights, Balloons, FAA Airspace)
   const runFlightsRefresh = useCallback(async (force = false) => {
+    if (typeof document !== 'undefined' && document.hidden && !force) return;
     if (flightsInFlightRef.current) return;
     flightsInFlightRef.current = true;
+    const attemptNowMs = Date.now();
+    lastFlightsAttemptMsRef.current = attemptNowMs;
+    nextFlightsDueMsRef.current = attemptNowMs + 10_000;
+
     const st = useSkyStore.getState();
     st.setFeedState('flights', { status: 'loading' });
 
@@ -401,20 +478,35 @@ export default function App() {
       );
       const nextMap = new Map<string, (typeof res.entities)[number]>();
       for (const f of res.entities) {
-        nextMap.set(f.id, f);
+        if (!f.onGround) {
+          nextMap.set(f.id, f);
+        }
       }
       liveKinematicsRegistry.rawFlights = nextMap;
-      useSkyStore.getState().setFeedState('flights', {
+      const latestStore = useSkyStore.getState();
+      const prevFlightsFeed = latestStore.feeds.flights;
+      const resolvedLastUpdated =
+        res.timestampMs > 0 ? res.timestampMs : prevFlightsFeed.lastUpdatedMs;
+      const checkedAtMs = Date.now();
+      nextFlightsDueMsRef.current = checkedAtMs + 10_000;
+
+      latestStore.setFeedState('flights', {
         status: res.status,
         provider: res.provider,
-        lastUpdatedMs: res.timestampMs,
+        lastUpdatedMs: resolvedLastUpdated,
+        lastCheckedMs: checkedAtMs,
+        httpStatus: res.httpStatus,
         nextRefreshSec: 10,
-        count: res.entities.length,
+        count: nextMap.size,
         errorMsg: res.errorMsg,
       });
     } catch (err) {
+      const checkedAtMs = Date.now();
+      nextFlightsDueMsRef.current = checkedAtMs + 10_000;
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
       useSkyStore.getState().setFeedState('flights', {
-        status: 'error',
+        status: isOffline ? 'offline' : 'error',
+        lastCheckedMs: checkedAtMs,
         nextRefreshSec: 10,
         errorMsg: err instanceof Error ? err.message : String(err),
       });
@@ -531,14 +623,20 @@ export default function App() {
     }
   }, [sweepPulseCounter, runFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
 
-  // 1Hz Countdown Scheduler for all polling feeds
+  // 1Hz Wall-Clock Scheduler & Online/Offline/Visibility Recovery
   useEffect(() => {
     const interval = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.hidden) return;
       const store = useSkyStore.getState();
       store.tickCountdowns();
+      const nowMs = Date.now();
       const feeds = useSkyStore.getState().feeds;
-      if (feeds.flights.nextRefreshSec <= 0 && (store.layers.flight || store.layers.military)) {
-        void runFlightsRefresh(false);
+      if (
+        (nowMs >= nextFlightsDueMsRef.current || feeds.flights.nextRefreshSec <= 0) &&
+        (store.layers.flight || store.layers.military)
+      ) {
+        const shouldForce = nowMs - lastFlightsAttemptMsRef.current >= 9_800;
+        void runFlightsRefresh(shouldForce);
       }
       if (feeds.balloons.nextRefreshSec <= 0 && store.layers.balloon) {
         void runBalloonsRefresh();
@@ -547,7 +645,66 @@ export default function App() {
         void runAirspaceRefresh();
       }
     }, 1000);
-    return () => window.clearInterval(interval);
+
+    const handleOffline = () => {
+      const nowMs = Date.now();
+      let hasFresh = false;
+      for (const [id, flight] of liveKinematicsRegistry.rawFlights.entries()) {
+        if (nowMs - flight.timestampMs > 45_000) {
+          liveKinematicsRegistry.rawFlights.delete(id);
+        } else {
+          hasFresh = true;
+        }
+      }
+      if (!hasFresh) {
+        liveKinematicsRegistry.rawFlights.clear();
+        liveKinematicsRegistry.version += 1;
+        useSkyStore.getState().setFeedState('flights', {
+          status: 'offline',
+          lastCheckedMs: nowMs,
+          count: 0,
+          errorMsg: 'Network connection offline',
+        });
+      }
+    };
+
+    const handleOnline = () => {
+      const st = useSkyStore.getState();
+      if (st.layers.flight || st.layers.military) {
+        void runFlightsRefresh(true);
+      }
+      if (st.layers.balloon) {
+        void runBalloonsRefresh();
+      }
+      if (st.layers.drone) {
+        void runAirspaceRefresh();
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.hidden) return;
+      const st = useSkyStore.getState();
+      if (astroClientRef.current && st.workerReady && st.layers.satellite) {
+        astroClientRef.current.tick(Date.now());
+      }
+      if (
+        Date.now() >= nextFlightsDueMsRef.current &&
+        (st.layers.flight || st.layers.military)
+      ) {
+        void runFlightsRefresh(true);
+      }
+    };
+
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
   }, [runFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
 
   // 5. OpenDroneID Live Client & 1Hz Tactical Drone Simulator
@@ -637,22 +794,33 @@ export default function App() {
         }
       }
 
+      const droneActive = st.odidConfig.connected || st.odidConfig.simulatorEnabled;
+      const nextStatus = st.odidConfig.connected
+        ? 'live'
+        : st.odidConfig.simulatorEnabled
+          ? 'fallback'
+          : 'idle';
+      const nextProvider = st.odidConfig.connected
+        ? 'opendroneid-stream'
+        : st.odidConfig.simulatorEnabled
+          ? 'sim-opendroneid'
+          : 'off';
+
       liveKinematicsRegistry.rawDrones = combined;
-      st.setFeedState('drones', {
-        status: st.odidConfig.connected
-          ? 'live'
-          : st.odidConfig.simulatorEnabled
-            ? 'fallback'
-            : 'idle',
-        provider: st.odidConfig.connected
-          ? 'opendroneid-stream'
-          : st.odidConfig.simulatorEnabled
-            ? 'sim-opendroneid'
-            : 'off',
-        lastUpdatedMs: Date.now(),
-        nextRefreshSec: 1,
-        count: combined.size,
-      });
+      if (
+        droneActive ||
+        st.feeds.drones.status !== nextStatus ||
+        st.feeds.drones.provider !== nextProvider ||
+        st.feeds.drones.count !== combined.size
+      ) {
+        st.setFeedState('drones', {
+          status: nextStatus,
+          provider: nextProvider,
+          lastUpdatedMs: droneActive ? Date.now() : null,
+          nextRefreshSec: 1,
+          count: combined.size,
+        });
+      }
     };
 
     tickDrones();
@@ -738,16 +906,25 @@ export default function App() {
         pruneStaleMs: number
       ) => {
         for (const [id, raw] of sourceMap.entries()) {
-          const ageMs = nowMs - raw.timestampMs;
-          if (ageMs > pruneStaleMs) {
+          if ((raw.category === 'flight' || raw.category === 'military') && raw.onGround) {
             sourceMap.delete(id);
             continue;
           }
+
+          const ageMs = nowMs - raw.timestampMs;
+          if (ageMs > pruneStaleMs || ageMs < -60_000) {
+            sourceMap.delete(id);
+            continue;
+          }
+
           const dtSec = Math.max(0, Math.min(maxDtSec, ageMs / 1000));
-          const isMoving =
-            raw.category === 'flight' || raw.category === 'military'
-              ? !raw.onGround && raw.speedMs > 1
-              : raw.speedMs > 0.2;
+          const isFlight = raw.category === 'flight' || raw.category === 'military';
+          const isMoving = isFlight
+            ? !raw.onGround &&
+              raw.headingValid !== false &&
+              raw.speedMs > 1 &&
+              ageMs <= 15_000
+            : raw.headingValid !== false && raw.speedMs > 0.2;
 
           const extrap = isMoving
             ? extrapolateDeadReckoning(
@@ -767,6 +944,14 @@ export default function App() {
             true
           );
 
+          if (
+            (raw.category === 'flight' || raw.category === 'military' || raw.category === 'balloon') &&
+            topocentric.groundDistKm > st.radiusKm * 1.02
+          ) {
+            sourceMap.delete(id);
+            continue;
+          }
+
           const updated: T = {
             ...raw,
             lat: extrap.lat,
@@ -785,7 +970,7 @@ export default function App() {
         }
       };
 
-      pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 120_000);
+      pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 60_000);
       pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 21_600_000);
       pushAtmospheric(liveKinematicsRegistry.rawDrones, 3, 60_000);
 
@@ -858,11 +1043,31 @@ export default function App() {
           st.setCounts(counts);
         }
 
+        if (st.feeds.flights.count !== liveKinematicsRegistry.rawFlights.size) {
+          st.setFeedState('flights', { count: liveKinematicsRegistry.rawFlights.size });
+        }
+
         if (st.selectedId) {
           const currentSelected = nextEntities.get(st.selectedId) ?? null;
-          st.setSelectedEntitySnapshot(currentSelected ? { ...currentSelected } : null);
-        } else if (st.selectedEntitySnapshot !== null) {
-          st.setSelectedEntitySnapshot(null);
+          if (currentSelected) {
+            missingSelectedSinceRef.current = null;
+            st.setSelectedEntitySnapshot({ ...currentSelected });
+          } else {
+            st.setSelectedEntitySnapshot(null);
+            if (st.workerReady && st.feeds.flights.lastCheckedMs !== null) {
+              if (missingSelectedSinceRef.current === null) {
+                missingSelectedSinceRef.current = perfNow;
+              } else if (perfNow - missingSelectedSinceRef.current > 2500) {
+                missingSelectedSinceRef.current = null;
+                st.selectEntity(null, false);
+              }
+            }
+          }
+        } else {
+          missingSelectedSinceRef.current = null;
+          if (st.selectedEntitySnapshot !== null) {
+            st.setSelectedEntitySnapshot(null);
+          }
         }
       }
     };
@@ -901,7 +1106,7 @@ export default function App() {
         setGpsBusy(false);
         setGpsError(err.message || 'Unable to acquire GPS fix.');
       },
-      { enableHighAccuracy: true, timeout: 8000, maximumAge: 60_000 }
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 0 }
     );
   }, []);
 
@@ -932,9 +1137,43 @@ export default function App() {
     }
   }, []);
 
+  const handleInstallPwa = useCallback(async () => {
+    const promptEvent = deferredInstallPromptRef.current;
+    if (!promptEvent) {
+      useSkyStore.getState().setPwaInstallState({ available: false });
+      return;
+    }
+    try {
+      await promptEvent.prompt();
+      const choice = await promptEvent.userChoice;
+      deferredInstallPromptRef.current = null;
+      if (choice.outcome === 'accepted') {
+        useSkyStore.getState().setPwaInstallState({ available: false, standalone: true });
+      } else {
+        useSkyStore.getState().setPwaInstallState({ available: false });
+      }
+    } catch {
+      deferredInstallPromptRef.current = null;
+      useSkyStore.getState().setPwaInstallState({ available: false });
+    }
+  }, []);
+
+  const handleDismissPwa = useCallback(() => {
+    try {
+      window.sessionStorage?.setItem(PWA_DISMISS_STORAGE_KEY, '1');
+    } catch {
+      // Ignore restricted sessionStorage
+    }
+    useSkyStore.getState().setPwaInstallState({ dismissed: true });
+  }, []);
+
   return (
     <div className="cockpit-shell">
-      <TopTelemetryBar onToggleAudio={handleToggleAudio} />
+      <TopTelemetryBar
+        onToggleAudio={handleToggleAudio}
+        onInstallPwa={() => void handleInstallPwa()}
+        onDismissPwa={handleDismissPwa}
+      />
 
       <main
         className={`skymap-stage skymap-stage--${layout}`}
