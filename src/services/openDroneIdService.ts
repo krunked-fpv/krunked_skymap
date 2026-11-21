@@ -193,15 +193,25 @@ function appendDroneTrail(
   altM: number,
   ts: number
 ): TrailPoint[] {
+  const normLon = normalizeLonDeg(lon);
+  const newPoint: TrailPoint = { lon: normLon, lat, altM, ts };
   const base = prev?.trail ? [...prev.trail] : [];
   const last = base[base.length - 1];
+  if (!last) {
+    return [newPoint];
+  }
   if (
-    !last ||
+    ts - last.ts > 60_000 ||
+    haversineDistanceKm(last.lat, last.lon, lat, normLon) > 30
+  ) {
+    return [newPoint];
+  }
+  if (
     Math.abs(last.lat - lat) > 5e-6 ||
-    Math.abs(last.lon - lon) > 5e-6 ||
+    Math.abs(last.lon - normLon) > 5e-6 ||
     Math.abs(ts - last.ts) > 900
   ) {
-    base.push({ lon, lat, altM, ts });
+    base.push(newPoint);
   }
   return base.length > MAX_TRAIL_POINTS ? base.slice(base.length - MAX_TRAIL_POINTS) : base;
 }

@@ -5,12 +5,15 @@ import type {
   TrailPoint,
 } from '../types/sky-contracts';
 import {
+  computeBearingDeg,
   computeTopocentricLookAngles,
+  haversineDistanceKm,
   normalizeAzimuthDeg,
   normalizeLonDeg,
 } from './geoHelpers';
 import {
   CircuitBreaker,
+  HttpError,
   TokenBucketRateLimiter,
   fetchJsonWithTimeout,
 } from './httpClient';
@@ -48,8 +51,6 @@ export interface RawAdsbxAircraft {
   seen_pos?: unknown;
   seen?: unknown;
   ground?: unknown;
-  dLat?: unknown;
-  dLon?: unknown;
 }
 
 export interface FlightsFetchOptions {
@@ -65,6 +66,7 @@ export interface FlightsFetchResult {
   provider: string;
   timestampMs: number;
   errorMsg?: string;
+  httpStatus?: number;
 }
 
 export const adsbRateLimiter = new TokenBucketRateLimiter({
@@ -81,10 +83,11 @@ const lastCachedFlightsByKey = new Map<
   string,
   {
     entities: FlightEntity[];
-    status: 'live' | 'fallback';
+    status: 'live' | 'delayed' | 'rate-limited' | 'offline' | 'error';
     provider: string;
     timestampMs: number;
     errorMsg?: string;
+    httpStatus?: number;
   }
 >();
 
@@ -294,15 +297,25 @@ function appendTrailPoint(
   altM: number,
   ts: number
 ): TrailPoint[] {
+  const normLon = normalizeLonDeg(lon);
+  const newPoint: TrailPoint = { lon: normLon, lat, altM, ts };
   const base = prev?.trail ? [...prev.trail] : [];
   const last = base[base.length - 1];
+  if (!last) {
+    return [newPoint];
+  }
   if (
-    !last ||
+    ts - last.ts > 90_000 ||
+    haversineDistanceKm(last.lat, last.lon, lat, normLon) > 25
+  ) {
+    return [newPoint];
+  }
+  if (
     Math.abs(last.lat - lat) > 1e-5 ||
-    Math.abs(last.lon - lon) > 1e-5 ||
+    Math.abs(last.lon - normLon) > 1e-5 ||
     Math.abs(ts - last.ts) > 1500
   ) {
-    base.push({ lon, lat, altM, ts });
+    base.push(newPoint);
   }
   if (base.length > MAX_TRAIL_POINTS) {
     return base.slice(base.length - MAX_TRAIL_POINTS);
@@ -334,6 +347,61 @@ function asCleanString(val: unknown): string | undefined {
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
+function isValidGeoPoint(lat: number | undefined, lon: number | undefined): boolean {
+  if (
+    lat === undefined ||
+    lon === undefined ||
+    lat < -90 ||
+    lat > 90 ||
+    lon < -180 ||
+    lon > 180
+  ) {
+    return false;
+  }
+  return !(Math.abs(lat) < 1e-4 && Math.abs(lon) < 1e-4);
+}
+
+function resolveValidatedAltitudeM(
+  onGround: boolean,
+  altBaroM: number | undefined,
+  altGeomM: number | undefined
+): number | null {
+  if (
+    (altBaroM !== undefined && (altBaroM < -500 || altBaroM > 60_000)) ||
+    (altGeomM !== undefined && (altGeomM < -500 || altGeomM > 60_000))
+  ) {
+    return null;
+  }
+  const altM = onGround
+    ? altGeomM !== undefined
+      ? Math.max(0, altGeomM)
+      : 0
+    : altGeomM !== undefined
+      ? altGeomM
+      : altBaroM !== undefined
+        ? Math.max(0, altBaroM)
+        : 0;
+  return altM < -500 || altM > 60_000 ? null : altM;
+}
+
+function resolveHeading(
+  rawTrack: number | undefined,
+  prev: FlightEntity | undefined,
+  lat: number,
+  normLon: number
+): { headingDeg: number; headingValid: boolean } {
+  if (rawTrack !== undefined) {
+    return { headingDeg: normalizeAzimuthDeg(rawTrack), headingValid: true };
+  }
+  if (prev && haversineDistanceKm(prev.lat, prev.lon, lat, normLon) > 0.05) {
+    return {
+      headingDeg: normalizeAzimuthDeg(computeBearingDeg(prev.lat, prev.lon, lat, normLon)),
+      headingValid: true,
+    };
+  }
+  return { headingDeg: 0, headingValid: false };
+}
+
 /**
  * Normalize an ADS-B Exchange v2 aircraft object (airplanes.live / adsb.lol / adsb.fi)
  * into a FlightEntity. Returns null when required hex or coordinates are missing/invalid.
@@ -353,37 +421,36 @@ export function normalizeAdsbxAircraft(
 
   const lat = asFiniteNumber(raw.lat);
   const lon = asFiniteNumber(raw.lon);
-  if (lat === undefined || lon === undefined || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+  if (!isValidGeoPoint(lat, lon)) {
     return null;
   }
+  const safeLat = lat as number;
+  const normLon = normalizeLonDeg(lon as number);
 
   const onGround = raw.alt_baro === 'ground' || raw.ground === true;
-  const baroFt = typeof raw.alt_baro === 'number' && Number.isFinite(raw.alt_baro) ? raw.alt_baro : undefined;
+  const baroFt = asFiniteNumber(raw.alt_baro);
   const geomFt = asFiniteNumber(raw.alt_geom);
 
   const altBaroM = onGround ? 0 : baroFt !== undefined ? baroFt * FT_TO_M : undefined;
   const altGeomM = geomFt !== undefined ? geomFt * FT_TO_M : undefined;
-  const altM = onGround
-    ? altGeomM !== undefined
-      ? Math.max(0, altGeomM)
-      : 0
-    : altGeomM !== undefined
-      ? altGeomM
-      : altBaroM !== undefined
-        ? Math.max(0, altBaroM)
-        : 0;
+  const altM = resolveValidatedAltitudeM(onGround, altBaroM, altGeomM);
+  if (altM === null) {
+    return null;
+  }
 
-  const speedKts =
-    asFiniteNumber(raw.gs) ?? asFiniteNumber(raw.tas) ?? asFiniteNumber(raw.ias) ?? 0;
-  const speedMs = speedKts > 0 ? speedKts * KNOTS_TO_MS : 0;
+  const rawSpeedKts =
+    asFiniteNumber(raw.gs) ?? asFiniteNumber(raw.tas) ?? asFiniteNumber(raw.ias);
+  const speedMs = rawSpeedKts !== undefined ? rawSpeedKts * KNOTS_TO_MS : 0;
+  if (speedMs < 0 || speedMs > 1200) {
+    return null;
+  }
 
-  const rawHeading =
+  const rawTrack =
     asFiniteNumber(raw.track) ??
     asFiniteNumber(raw.true_heading) ??
     asFiniteNumber(raw.mag_heading) ??
-    asFiniteNumber(raw.calc_track) ??
-    0;
-  const headingDeg = normalizeAzimuthDeg(rawHeading);
+    asFiniteNumber(raw.calc_track);
+  const { headingDeg, headingValid } = resolveHeading(rawTrack, prev, safeLat, normLon);
 
   const rateFpm = asFiniteNumber(raw.baro_rate) ?? asFiniteNumber(raw.geom_rate) ?? 0;
   const vertRateMs = rateFpm * FPM_TO_MS;
@@ -408,8 +475,8 @@ export function normalizeAdsbxAircraft(
   const seenSec = Math.max(0, asFiniteNumber(raw.seen_pos) ?? asFiniteNumber(raw.seen) ?? 0);
   const timestampMs = nowMs - seenSec * 1000;
 
-  const topocentric = computeTopocentricLookAngles(observer, { lat, lon, altM });
-  const trail = appendTrailPoint(prev, lon, lat, altM, timestampMs);
+  const topocentric = computeTopocentricLookAngles(observer, { lat: safeLat, lon: normLon, altM });
+  const trail = appendTrailPoint(prev, normLon, safeLat, altM, timestampMs);
   const emergencyFlag = extractEmergencyFlag(squawkRaw, raw.emergency);
   const country = asCleanString(raw.ownOp) ?? deriveCountryFromIcaoHex(rawHex);
 
@@ -425,12 +492,13 @@ export function normalizeAdsbxAircraft(
     callsign,
     subtitle: subtitleParts.join(' · ') || (isMilitary ? 'Military Aircraft' : 'ADS-B Target'),
     country,
-    lat,
-    lon: normalizeLonDeg(lon),
+    lat: safeLat,
+    lon: normLon,
     altM,
     altBaroM,
     speedMs,
     headingDeg,
+    headingValid,
     vertRateMs,
     timestampMs,
     topocentric,
@@ -455,7 +523,8 @@ export function normalizeAdsbxAircraft(
 export function normalizeOpenSkyState(
   tuple: unknown[],
   observer: ObserverLocation,
-  prev?: FlightEntity
+  prev?: FlightEntity,
+  nowMs = Date.now()
 ): FlightEntity | null {
   if (!Array.isArray(tuple) || tuple.length < 11) return null;
 
@@ -466,28 +535,28 @@ export function normalizeOpenSkyState(
 
   const lon = asFiniteNumber(tuple[5]);
   const lat = asFiniteNumber(tuple[6]);
-  if (lat === undefined || lon === undefined || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+  if (!isValidGeoPoint(lat, lon)) {
     return null;
   }
+  const safeLat = lat as number;
+  const normLon = normalizeLonDeg(lon as number);
 
   const onGround = Boolean(tuple[8]);
   const baroAltM = asFiniteNumber(tuple[7]);
   const geoAltM = tuple.length > 13 ? asFiniteNumber(tuple[13]) : undefined;
-  const altM = onGround
-    ? geoAltM !== undefined
-      ? Math.max(0, geoAltM)
-      : 0
-    : geoAltM !== undefined
-      ? geoAltM
-      : baroAltM !== undefined
-        ? Math.max(0, baroAltM)
-        : 0;
+  const altM = resolveValidatedAltitudeM(onGround, baroAltM, geoAltM);
+  if (altM === null) {
+    return null;
+  }
 
   const rawSpeed = asFiniteNumber(tuple[9]);
-  const speedMs = rawSpeed !== undefined && rawSpeed >= 0 ? rawSpeed : 0;
+  if (rawSpeed !== undefined && (rawSpeed < 0 || rawSpeed > 1200)) {
+    return null;
+  }
+  const speedMs = rawSpeed ?? 0;
 
   const rawTrack = asFiniteNumber(tuple[10]);
-  const headingDeg = rawTrack !== undefined ? normalizeAzimuthDeg(rawTrack) : 0;
+  const { headingDeg, headingValid } = resolveHeading(rawTrack, prev, safeLat, normLon);
 
   const vertRateMs = tuple.length > 11 ? (asFiniteNumber(tuple[11]) ?? 0) : 0;
   const callsign = asCleanString(tuple[1]) ?? rawHex.toUpperCase();
@@ -495,12 +564,12 @@ export function normalizeOpenSkyState(
   const squawk = tuple.length > 14 ? asCleanString(tuple[14]) : undefined;
 
   const timePosSec = asFiniteNumber(tuple[3]) ?? asFiniteNumber(tuple[4]);
-  const timestampMs = timePosSec !== undefined ? timePosSec * 1000 : Date.now();
+  const timestampMs = timePosSec !== undefined ? timePosSec * 1000 : nowMs;
 
   const isMilitary = classifyMilitary(rawHex, callsign, 0);
   const airframeClass = classifyAirframeClass(undefined, undefined, isMilitary, speedMs);
-  const topocentric = computeTopocentricLookAngles(observer, { lat, lon, altM });
-  const trail = appendTrailPoint(prev, lon, lat, altM, timestampMs);
+  const topocentric = computeTopocentricLookAngles(observer, { lat: safeLat, lon: normLon, altM });
+  const trail = appendTrailPoint(prev, normLon, safeLat, altM, timestampMs);
   const emergencyFlag = extractEmergencyFlag(squawk);
 
   return {
@@ -509,12 +578,13 @@ export function normalizeOpenSkyState(
     callsign,
     subtitle: [country, squawk ? `SQK ${squawk}` : undefined].filter(Boolean).join(' · ') || 'OpenSky Target',
     country,
-    lat,
-    lon: normalizeLonDeg(lon),
+    lat: safeLat,
+    lon: normLon,
     altM,
     altBaroM: onGround ? 0 : baroAltM,
     speedMs,
     headingDeg,
+    headingValid,
     vertRateMs,
     timestampMs,
     topocentric,
@@ -544,6 +614,19 @@ function toPrevMap(prevEntities?: Map<string, FlightEntity> | FlightEntity[]): M
   return map;
 }
 
+function isVerifiedFreshLiveFlight(
+  entity: FlightEntity,
+  observer: ObserverLocation,
+  radiusKm: number,
+  nowMs: number
+): boolean {
+  if (entity.isSimulated || entity.onGround) return false;
+  if (!Number.isFinite(entity.timestampMs) || entity.timestampMs > nowMs + 60_000) return false;
+  if (nowMs - entity.timestampMs > 45_000) return false;
+  if (entity.topocentric.groundDistKm > radiusKm) return false;
+  return haversineDistanceKm(observer.lat, observer.lon, entity.lat, entity.lon) <= radiusKm;
+}
+
 function normalizeAdsbxPayloadList(
   rawList: unknown[],
   observer: ObserverLocation,
@@ -553,18 +636,29 @@ function normalizeAdsbxPayloadList(
 ): FlightEntity[] {
   const entities: FlightEntity[] = [];
   const seenIds = new Set<string>();
-  const maxDistKm = radiusKm * 1.05;
 
   for (const item of rawList) {
+    if (!item || typeof item !== 'object') continue;
+    const rawItem = item as RawAdsbxAircraft;
+    const seenPos = asFiniteNumber(rawItem.seen_pos);
+    if (seenPos !== undefined && seenPos > 60) {
+      continue;
+    }
+
+    const hexKey = typeof rawItem.hex === 'string' ? rawItem.hex.trim().toLowerCase() : '';
     const normalized = normalizeAdsbxAircraft(
-      item as RawAdsbxAircraft,
+      rawItem,
       observer,
-      prevMap.get(`flight:${String((item as RawAdsbxAircraft)?.hex ?? '').trim().toLowerCase()}`),
+      prevMap.get(`flight:${hexKey}`),
       nowMs
     );
     if (!normalized) continue;
+    if (normalized.onGround) continue;
+    if (nowMs - normalized.timestampMs > 60_000 || normalized.timestampMs > nowMs + 60_000) {
+      continue;
+    }
     if (seenIds.has(normalized.id)) continue;
-    if (normalized.topocentric.groundDistKm <= maxDistKm) {
+    if (normalized.topocentric.groundDistKm <= radiusKm) {
       seenIds.add(normalized.id);
       entities.push(normalized);
     }
@@ -572,119 +666,54 @@ function normalizeAdsbxPayloadList(
   return entities;
 }
 
-interface FallbackSeedEnvelope {
-  origin?: { lat?: number; lon?: number };
-  anchor?: { lat?: number; lon?: number };
-  ac?: RawAdsbxAircraft[];
-  aircraft?: RawAdsbxAircraft[];
-}
-
-const BUILTIN_FALLBACK_SEED: RawAdsbxAircraft[] = [
-  { hex: 'a12f44', flight: 'UAL418', r: 'N37418', t: 'B738', dLat: 0.14, dLon: -0.18, alt_baro: 18500, alt_geom: 18750, gs: 385, track: 68, baro_rate: 1200, squawk: '1241', category: 'A3' },
-  { hex: 'ae5120', flight: 'RCH842', r: '08-8194', t: 'C17', dLat: -0.19, dLon: 0.22, alt_baro: 24000, alt_geom: 24200, gs: 440, track: 295, baro_rate: -450, squawk: '4412', dbFlags: 1, category: 'A5' },
-  { hex: 'a8b201', flight: 'DAL902', r: 'N821DN', t: 'A359', dLat: 0.31, dLon: 0.28, alt_baro: 36000, alt_geom: 36400, gs: 485, track: 135, baro_rate: 0, squawk: '2104', category: 'A5' },
-  { hex: 'a44110', flight: 'N410PD', r: 'N410PD', t: 'EC35', dLat: -0.06, dLon: -0.08, alt_baro: 1450, alt_geom: 1500, gs: 112, track: 190, baro_rate: 0, squawk: '1200', category: 'A7' },
-  { hex: 'a0991c', flight: 'N172SP', r: 'N172SP', t: 'C172', dLat: 0.08, dLon: 0.09, alt_baro: 3500, alt_geom: 3600, gs: 108, track: 35, baro_rate: 250, squawk: '1200', category: 'A1' },
-];
-
-async function buildStaticFallbackResult(
+function buildOpenSkyBoxes(
   observer: ObserverLocation,
-  radiusKm: number,
-  prevMap: Map<string, FlightEntity>,
-  errorMsg?: string,
-  signal?: AbortSignal
-): Promise<FlightsFetchResult> {
-  const nowMs = Date.now();
-  let rawItems: RawAdsbxAircraft[] = BUILTIN_FALLBACK_SEED;
-  let originLat = 38.8512;
-  let originLon = -77.0402;
+  radiusKm: number
+): { lamin: string; lamax: string; boxes: Array<{ lomin: number; lomax: number }> } | null {
+  const dLat = radiusKm / 111.32;
+  const absLat = Math.abs(observer.lat);
+  const cosLat = Math.cos((observer.lat * Math.PI) / 180);
+  const dLon = cosLat > 1e-6 ? radiusKm / (111.32 * cosLat) : 180;
 
-  try {
-    const data = await fetchJsonWithTimeout<FallbackSeedEnvelope>('./data/fallback-flights.json', {
-      timeoutMs: 3000,
-      signal,
-    });
-    if (data && typeof data === 'object') {
-      if (typeof data.origin?.lat === 'number' && Number.isFinite(data.origin.lat)) {
-        originLat = data.origin.lat;
-      } else if (typeof data.anchor?.lat === 'number' && Number.isFinite(data.anchor.lat)) {
-        originLat = data.anchor.lat;
-      }
-      if (typeof data.origin?.lon === 'number' && Number.isFinite(data.origin.lon)) {
-        originLon = data.origin.lon;
-      } else if (typeof data.anchor?.lon === 'number' && Number.isFinite(data.anchor.lon)) {
-        originLon = data.anchor.lon;
-      }
-
-      const candidate = Array.isArray(data.ac)
-        ? data.ac
-        : Array.isArray(data.aircraft)
-          ? data.aircraft
-          : null;
-      if (candidate && candidate.length > 0) {
-        rawItems = candidate;
-      }
-    }
-  } catch {
-    // Keep built-in emergency fallback array when static JSON cannot be loaded.
+  if (absLat + dLat >= 90 || absLat > 88.5 || dLon >= 180) {
+    return null;
   }
 
-  const entities: FlightEntity[] = [];
-  const maxAllowedRadiusKm = Math.max(8, radiusKm * 0.92);
+  const lamin = Math.max(-90, observer.lat - dLat).toFixed(4);
+  const lamax = Math.min(90, observer.lat + dLat).toFixed(4);
+  const obsLon = normalizeLonDeg(observer.lon);
+  const rawMinLon = obsLon - dLon;
+  const rawMaxLon = obsLon + dLon;
 
-  for (const item of rawItems) {
-    if (!item || typeof item !== 'object') continue;
-    let dLat = asFiniteNumber(item.dLat);
-    let dLon = asFiniteNumber(item.dLon);
-
-    if (dLat === undefined || dLon === undefined) {
-      const itemLat = asFiniteNumber(item.lat);
-      const itemLon = asFiniteNumber(item.lon);
-      if (itemLat !== undefined && itemLon !== undefined) {
-        dLat = itemLat - originLat;
-        dLon = itemLon - originLon;
-      }
+  const boxes: Array<{ lomin: number; lomax: number }> = [];
+  if (rawMinLon < -180) {
+    const wrappedMin = normalizeLonDeg(rawMinLon);
+    if (wrappedMin < 180) {
+      boxes.push({ lomin: wrappedMin, lomax: 180 });
     }
-    if (dLat === undefined || dLon === undefined) continue;
-
-    // Scale oversized snapshot offsets smoothly if observer scan radius is tight.
-    const cosLat = Math.max(0.15, Math.cos((observer.lat * Math.PI) / 180));
-    const approxKm = Math.hypot(dLat * 111.32, dLon * 111.32 * cosLat);
-    if (approxKm > maxAllowedRadiusKm && approxKm > 0) {
-      const scale = maxAllowedRadiusKm / approxKm;
-      dLat *= scale;
-      dLon *= scale;
+    if (rawMaxLon > -180) {
+      boxes.push({ lomin: -180, lomax: rawMaxLon });
     }
-
-    const lat = Math.max(-89.9, Math.min(89.9, observer.lat + dLat));
-    const lon = normalizeLonDeg(observer.lon + dLon);
-
-    const normalized = normalizeAdsbxAircraft(
-      { ...item, lat, lon, seen_pos: 0, seen: 0 },
-      observer,
-      prevMap.get(`flight:${String(item.hex ?? '').trim().toLowerCase()}`),
-      nowMs
-    );
-    if (normalized) {
-      entities.push(normalized);
+  } else if (rawMaxLon > 180) {
+    if (rawMinLon < 180) {
+      boxes.push({ lomin: rawMinLon, lomax: 180 });
     }
+    const wrappedMax = normalizeLonDeg(rawMaxLon);
+    if (wrappedMax > -180) {
+      boxes.push({ lomin: -180, lomax: wrappedMax });
+    }
+  } else {
+    boxes.push({ lomin: rawMinLon, lomax: rawMaxLon });
   }
 
-  return {
-    entities,
-    status: 'fallback',
-    provider: 'seeded-snapshot',
-    timestampMs: nowMs,
-    errorMsg,
-  };
+  return boxes.length > 0 ? { lamin, lamax, boxes } : null;
 }
 
 /**
- * Multi-tier zero-key ADS-B cascade:
- * 1) Local Vite proxies (localhost/127.0.0.1 only)
- * 2) Direct browser cascade (airplanes.live -> adsb.lol -> opensky-network.org)
+ * Multi-tier zero-key live ADS-B cascade (zero phantom/synthetic aircraft):
+ * 1) Local Vite proxies (localhost/127.0.0.1 only: adsb.fi -> adsb.lol -> airplanes.live)
+ * 2) Direct browser cascade (adsb.lol -> airplanes.live -> opensky-network.org)
  * 3) Schema-validated CORS relay (api.codetabs.com -> adsb.lol)
- * 4) Relative-translated static snapshot (./data/fallback-flights.json)
  */
 export async function fetchFlightsCascade(
   observer: ObserverLocation,
@@ -696,7 +725,7 @@ export async function fetchFlightsCascade(
   const timeoutMs = options.timeoutMs ?? DEFAULT_ADSB_TIMEOUT_MS;
   const latStr = observer.lat.toFixed(4);
   const lonStr = observer.lon.toFixed(4);
-  const radiusNm = Math.max(1, Math.min(250, Math.round(radiusKm / 1.852)));
+  const radiusNm = Math.max(1, Math.min(250, Math.ceil(radiusKm / 1.852)));
   const rateKey =
     options.rateLimitKey ??
     `adsb:${observer.lat.toFixed(2)},${observer.lon.toFixed(2)}:r${Math.round(radiusKm)}`;
@@ -706,31 +735,48 @@ export async function fetchFlightsCascade(
     if (cached) {
       return {
         entities: cached.entities,
-        status: cached.status === 'fallback' ? 'fallback' : 'cached',
+        status: cached.status === 'live' ? 'cached' : cached.status,
         provider: cached.provider,
         timestampMs: cached.timestampMs,
         errorMsg: cached.errorMsg,
+        httpStatus: cached.httpStatus,
       };
     }
-    if (prevMap.size > 0) {
+
+    const nowMs = Date.now();
+    const freshPrev = Array.from(prevMap.values()).filter((e) =>
+      isVerifiedFreshLiveFlight(e, observer, radiusKm, nowMs)
+    );
+    if (freshPrev.length > 0) {
+      const maxTs = freshPrev.reduce((max, e) => Math.max(max, e.timestampMs), 0);
       return {
-        entities: Array.from(prevMap.values()),
+        entities: freshPrev,
         status: 'cached',
         provider: 'rate-limit-cache',
-        timestampMs: Date.now(),
+        timestampMs: maxTs,
       };
     }
     return {
       entities: [],
       status: 'cached',
       provider: 'rate-limit-cooldown',
-      timestampMs: Date.now(),
+      timestampMs: 0,
     };
   }
 
   const errors: string[] = [];
-  let sawEmptyLiveResponse = false;
-  let emptyLiveProvider = '';
+  let saw429 = false;
+  let lastHttpStatus: number | undefined;
+
+  const recordFailure = (providerLabel: string, err: unknown): void => {
+    if (err instanceof HttpError) {
+      lastHttpStatus = err.status;
+      if (err.status === 429) {
+        saw429 = true;
+      }
+    }
+    errors.push(`${providerLabel}: ${err instanceof Error ? err.message : String(err)}`);
+  };
 
   const tryAdsbxEndpoint = async (
     breakerKey: string,
@@ -739,35 +785,44 @@ export async function fetchFlightsCascade(
     strictAcOnly = false
   ): Promise<FlightsFetchResult | null> => {
     if (!flightsCircuitBreaker.canExecute(breakerKey)) {
+      errors.push(`${providerLabel}: circuit open`);
       return null;
     }
     try {
-      const data = await flightsCircuitBreaker.execute(
-        () =>
-          fetchJsonWithTimeout<Record<string, unknown>>(url, {
-            timeoutMs,
-            signal: options.signal,
-          }),
-        breakerKey
-      );
-      if (!data || typeof data !== 'object') {
-        throw new Error(`Invalid payload from ${providerLabel}`);
-      }
-      const rawList = Array.isArray(data.ac)
-        ? data.ac
-        : !strictAcOnly && Array.isArray(data.aircraft)
-          ? data.aircraft
-          : null;
-      if (!rawList) {
-        throw new Error(`Missing ac[] schema from ${providerLabel}`);
-      }
+      const rawList = await flightsCircuitBreaker.execute(async () => {
+        const data = await fetchJsonWithTimeout<Record<string, unknown>>(url, {
+          timeoutMs,
+          signal: options.signal,
+        });
+        if (!data || typeof data !== 'object') {
+          throw new Error(`Invalid payload from ${providerLabel}`);
+        }
+        const hasErrorField =
+          (typeof data.Error === 'string' && data.Error.trim().length > 0) ||
+          (data.Error !== undefined &&
+            data.Error !== null &&
+            typeof data.Error !== 'string' &&
+            Boolean(data.Error));
+        if (hasErrorField) {
+          throw new Error(
+            typeof data.Error === 'string'
+              ? data.Error.trim()
+              : `Upstream error from ${providerLabel}`
+          );
+        }
+        const candidate = Array.isArray(data.ac)
+          ? data.ac
+          : !strictAcOnly && Array.isArray(data.aircraft)
+            ? data.aircraft
+            : null;
+        if (!candidate) {
+          throw new Error(`Missing ac[] schema from ${providerLabel}`);
+        }
+        return candidate;
+      }, breakerKey);
+
       const nowMs = Date.now();
       const entities = normalizeAdsbxPayloadList(rawList, observer, prevMap, radiusKm, nowMs);
-      if (entities.length === 0) {
-        sawEmptyLiveResponse = true;
-        emptyLiveProvider = providerLabel;
-        return null;
-      }
       lastCachedFlightsByKey.set(rateKey, {
         entities,
         status: 'live',
@@ -781,13 +836,20 @@ export async function fetchFlightsCascade(
         timestampMs: nowMs,
       };
     } catch (err) {
-      errors.push(`${providerLabel}: ${err instanceof Error ? err.message : String(err)}`);
+      recordFailure(providerLabel, err);
       return null;
     }
   };
 
   // Stage 1: Local Vite proxies when running on localhost / 127.0.0.1
   if (isLocalhostRuntime()) {
+    const proxyFi = await tryAdsbxEndpoint(
+      'proxy-adsb-fi',
+      'vite-proxy:adsb.fi',
+      `/api-proxy/adsb-fi/api/v2/lat/${latStr}/lon/${lonStr}/dist/${radiusNm}`
+    );
+    if (proxyFi) return proxyFi;
+
     const proxyLol = await tryAdsbxEndpoint(
       'proxy-adsb-lol',
       'vite-proxy:adsb.lol',
@@ -795,22 +857,15 @@ export async function fetchFlightsCascade(
     );
     if (proxyLol) return proxyLol;
 
-    const proxyFi = await tryAdsbxEndpoint(
-      'proxy-adsb-fi',
-      'vite-proxy:adsb.fi',
-      `/api-proxy/adsb-fi/api/v2/lat/${latStr}/lon/${lonStr}/dist/${radiusNm}`
+    const proxyAirplanesLive = await tryAdsbxEndpoint(
+      'proxy-airplanes-live',
+      'vite-proxy:airplanes.live',
+      `/api-proxy/airplanes-live/v2/point/${latStr}/${lonStr}/${radiusNm}`
     );
-    if (proxyFi) return proxyFi;
+    if (proxyAirplanesLive) return proxyAirplanesLive;
   }
 
-  // Stage 2: Direct browser cascade
-  const directAirplanesLive = await tryAdsbxEndpoint(
-    'airplanes.live',
-    'airplanes.live',
-    `https://api.airplanes.live/v2/point/${latStr}/${lonStr}/${radiusNm}`
-  );
-  if (directAirplanesLive) return directAirplanesLive;
-
+  // Stage 2: Direct browser cascade (adsb.lol -> airplanes.live -> opensky-network)
   const directAdsbLol = await tryAdsbxEndpoint(
     'adsb.lol',
     'adsb.lol',
@@ -818,67 +873,78 @@ export async function fetchFlightsCascade(
   );
   if (directAdsbLol) return directAdsbLol;
 
-  // Stage 2c: OpenSky bounding box
-  if (flightsCircuitBreaker.canExecute('opensky')) {
-    try {
-      const dLat = radiusKm / 111.32;
-      const cosLat = Math.max(0.05, Math.cos((observer.lat * Math.PI) / 180));
-      const dLon = radiusKm / (111.32 * cosLat);
-      const lamin = Math.max(-90, observer.lat - dLat).toFixed(4);
-      const lamax = Math.min(90, observer.lat + dLat).toFixed(4);
-      const wideLon = Math.abs(observer.lat) > 85 || dLon >= 180;
-      const lomin = wideLon ? '-180.0000' : normalizeLonDeg(observer.lon - dLon).toFixed(4);
-      const lomax = wideLon ? '180.0000' : normalizeLonDeg(observer.lon + dLon).toFixed(4);
-      const effectiveMinLon = Number(lomin) > Number(lomax) ? '-180.0000' : lomin;
-      const effectiveMaxLon = Number(lomin) > Number(lomax) ? '180.0000' : lomax;
+  const directAirplanesLive = await tryAdsbxEndpoint(
+    'airplanes.live',
+    'airplanes.live',
+    `https://api.airplanes.live/v2/point/${latStr}/${lonStr}/${radiusNm}`
+  );
+  if (directAirplanesLive) return directAirplanesLive;
 
-      const openSkyUrl = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${effectiveMinLon}&lamax=${lamax}&lomax=${effectiveMaxLon}`;
-      const data = await flightsCircuitBreaker.execute(
+  // Stage 2c: OpenSky bounding box(es) with antimeridian splitting & polar guard
+  const openSkyPlan = buildOpenSkyBoxes(observer, radiusKm);
+  if (openSkyPlan && flightsCircuitBreaker.canExecute('opensky')) {
+    try {
+      const payloads = await flightsCircuitBreaker.execute(
         () =>
-          fetchJsonWithTimeout<{ states?: unknown }>(openSkyUrl, {
-            timeoutMs,
-            signal: options.signal,
-          }),
+          Promise.all(
+            openSkyPlan.boxes.map(async (box) => {
+              const openSkyUrl = `https://opensky-network.org/api/states/all?lamin=${openSkyPlan.lamin}&lomin=${box.lomin.toFixed(4)}&lamax=${openSkyPlan.lamax}&lomax=${box.lomax.toFixed(4)}`;
+              const data = await fetchJsonWithTimeout<{ states?: unknown }>(openSkyUrl, {
+                timeoutMs,
+                signal: options.signal,
+              });
+              if (!data || typeof data !== 'object' || !Array.isArray(data.states)) {
+                throw new Error('Invalid OpenSky states[] payload');
+              }
+              return data.states;
+            })
+          ),
         'opensky'
       );
 
-      if (!data || typeof data !== 'object' || !Array.isArray(data.states)) {
-        throw new Error('Invalid OpenSky states[] payload');
-      }
-
+      const nowMs = Date.now();
       const entities: FlightEntity[] = [];
       const seenIds = new Set<string>();
-      for (const row of data.states) {
-        if (!Array.isArray(row)) continue;
-        const hex = typeof row[0] === 'string' ? row[0].trim().toLowerCase() : '';
-        const normalized = normalizeOpenSkyState(row, observer, prevMap.get(`flight:${hex}`));
-        if (!normalized || seenIds.has(normalized.id)) continue;
-        if (normalized.topocentric.groundDistKm <= radiusKm * 1.05) {
-          seenIds.add(normalized.id);
-          entities.push(normalized);
+      for (const states of payloads) {
+        for (const row of states) {
+          if (!Array.isArray(row)) continue;
+          const hex = typeof row[0] === 'string' ? row[0].trim().toLowerCase() : '';
+          const normalized = normalizeOpenSkyState(
+            row,
+            observer,
+            prevMap.get(`flight:${hex}`),
+            nowMs
+          );
+          if (!normalized) continue;
+          if (normalized.onGround) continue;
+          if (nowMs - normalized.timestampMs > 60_000 || normalized.timestampMs > nowMs + 60_000) {
+            continue;
+          }
+          if (seenIds.has(normalized.id)) continue;
+          if (normalized.topocentric.groundDistKm <= radiusKm) {
+            seenIds.add(normalized.id);
+            entities.push(normalized);
+          }
         }
       }
 
-      const nowMs = Date.now();
-      if (entities.length > 0) {
-        lastCachedFlightsByKey.set(rateKey, {
-          entities,
-          status: 'live',
-          provider: 'opensky-network',
-          timestampMs: nowMs,
-        });
-        return {
-          entities,
-          status: 'live',
-          provider: 'opensky-network',
-          timestampMs: nowMs,
-        };
-      }
-      sawEmptyLiveResponse = true;
-      emptyLiveProvider = 'opensky-network';
+      lastCachedFlightsByKey.set(rateKey, {
+        entities,
+        status: 'live',
+        provider: 'opensky-network',
+        timestampMs: nowMs,
+      });
+      return {
+        entities,
+        status: 'live',
+        provider: 'opensky-network',
+        timestampMs: nowMs,
+      };
     } catch (err) {
-      errors.push(`opensky-network: ${err instanceof Error ? err.message : String(err)}`);
+      recordFailure('opensky-network', err);
     }
+  } else if (openSkyPlan) {
+    errors.push('opensky-network: circuit open');
   }
 
   // Stage 3: Zero-key CORS JSON relay targeting adsb.lol (strictly Array.isArray(data?.ac))
@@ -894,29 +960,67 @@ export async function fetchFlightsCascade(
   );
   if (relayed) return relayed;
 
-  if (sawEmptyLiveResponse) {
+  // All live providers failed — return strictly verified recent entities or honest empty status (ZERO synthetic aircraft)
+  const nowMs = Date.now();
+  const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+  const errorMsg = errors.length > 0 ? errors.join(' | ') : undefined;
+  const httpStatus = saw429 ? 429 : lastHttpStatus;
+  const previousCached = lastCachedFlightsByKey.get(rateKey);
+
+  const freshVerified: FlightEntity[] = [];
+  for (const entity of prevMap.values()) {
+    if (isVerifiedFreshLiveFlight(entity, observer, radiusKm, nowMs)) {
+      freshVerified.push(entity);
+    }
+  }
+
+  if (freshVerified.length > 0) {
+    const maxEntityTs = freshVerified.reduce(
+      (maxTs, entity) => Math.max(maxTs, entity.timestampMs),
+      0
+    );
+    const status: 'rate-limited' | 'delayed' = saw429 ? 'rate-limited' : 'delayed';
+    const provider = previousCached?.provider ?? 'adsb-cascade';
+    lastCachedFlightsByKey.set(rateKey, {
+      entities: freshVerified,
+      status,
+      provider,
+      timestampMs: maxEntityTs,
+      httpStatus,
+      errorMsg,
+    });
     return {
-      entities: [],
-      status: 'live',
-      provider: emptyLiveProvider,
-      timestampMs: Date.now(),
+      entities: freshVerified,
+      status,
+      provider,
+      timestampMs: maxEntityTs,
+      httpStatus,
+      errorMsg,
     };
   }
 
-  // Stage 4: Relative static fallback snapshot
-  const fallbackRes = await buildStaticFallbackResult(
-    observer,
-    radiusKm,
-    prevMap,
-    errors.length > 0 ? errors.join(' | ') : undefined,
-    options.signal
-  );
+  const failureStatus: 'offline' | 'rate-limited' | 'error' = isOffline
+    ? 'offline'
+    : saw429
+      ? 'rate-limited'
+      : 'error';
+  const preservedTimestampMs = previousCached?.timestampMs ?? 0;
+  const provider = previousCached?.provider ?? 'adsb-cascade';
+
   lastCachedFlightsByKey.set(rateKey, {
-    entities: fallbackRes.entities,
-    status: 'fallback',
-    provider: fallbackRes.provider,
-    timestampMs: fallbackRes.timestampMs,
-    errorMsg: fallbackRes.errorMsg,
+    entities: [],
+    status: failureStatus,
+    provider,
+    timestampMs: preservedTimestampMs,
+    httpStatus,
+    errorMsg,
   });
-  return fallbackRes;
+  return {
+    entities: [],
+    status: failureStatus,
+    provider,
+    timestampMs: preservedTimestampMs,
+    httpStatus,
+    errorMsg,
+  };
 }

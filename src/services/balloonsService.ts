@@ -117,15 +117,25 @@ function appendBalloonTrail(
   altM: number,
   ts: number
 ): TrailPoint[] {
+  const normLon = normalizeLonDeg(lon);
+  const newPoint: TrailPoint = { lon: normLon, lat, altM, ts };
   const base = prev?.trail ? [...prev.trail] : [];
   const last = base[base.length - 1];
+  if (!last) {
+    return [newPoint];
+  }
   if (
-    !last ||
+    ts - last.ts > 300_000 ||
+    haversineDistanceKm(last.lat, last.lon, lat, normLon) > 30
+  ) {
+    return [newPoint];
+  }
+  if (
     Math.abs(last.lat - lat) > 1e-5 ||
-    Math.abs(last.lon - lon) > 1e-5 ||
+    Math.abs(last.lon - normLon) > 1e-5 ||
     Math.abs(ts - last.ts) > 2000
   ) {
-    base.push({ lon, lat, altM, ts });
+    base.push(newPoint);
   }
   return base.length > MAX_TRAIL_POINTS ? base.slice(base.length - MAX_TRAIL_POINTS) : base;
 }
@@ -149,7 +159,7 @@ export function normalizeSondeRecord(
     lat > 90 ||
     lon < -180 ||
     lon > 180 ||
-    (lat === 0 && lon === 0)
+    (Math.abs(lat) < 1e-4 && Math.abs(lon) < 1e-4)
   ) {
     return null;
   }
