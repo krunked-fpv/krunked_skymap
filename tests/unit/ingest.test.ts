@@ -1,0 +1,977 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { AirspaceData, ObserverLocation } from '../../src/types/sky-contracts';
+import {
+  computeTopocentricLookAngles,
+  greatCircleDestination,
+  haversineDistanceKm,
+  normalizeLonDeg,
+  pointInGeoJsonFeature,
+} from '../../src/services/geoHelpers';
+import {
+  CircuitBreaker,
+  CircuitOpenError,
+  HttpError,
+  TokenBucketRateLimiter,
+  fetchJsonWithTimeout,
+  fetchTextWithTimeout,
+} from '../../src/services/httpClient';
+import {
+  classifyMilitary,
+  clearFlightsServiceCache,
+  fetchFlightsCascade,
+  normalizeAdsbxAircraft,
+  normalizeOpenSkyState,
+} from '../../src/services/flightsService';
+import {
+  clearTleCache,
+  loadInitialTles,
+  parseTleText,
+  refreshTlesIfStale,
+} from '../../src/services/satellitesService';
+import { fetchBalloons, normalizeSondeRecord } from '../../src/services/balloonsService';
+import {
+  evaluateDroneAirspaceCompliance,
+  fetchAirspace,
+  isInsideContinentalUsOrTerritories,
+} from '../../src/services/airspaceService';
+import {
+  OpenDroneIdClient,
+  normalizeOdidPayload,
+  stepSimulatedDrones,
+} from '../../src/services/openDroneIdService';
+import {
+  parseDirectCoordinates,
+  searchLocation,
+} from '../../src/services/geocodingService';
+
+const DCA_OBSERVER: ObserverLocation = {
+  lat: 38.8512,
+  lon: -77.0402,
+  altM: 12,
+  label: 'DC / Potomac Corridor',
+  source: 'preset',
+};
+
+const TOKYO_OBSERVER: ObserverLocation = {
+  lat: 35.5494,
+  lon: 139.7798,
+  altM: 11,
+  label: 'Tokyo Haneda / Kanto',
+  source: 'preset',
+};
+
+const SAMPLE_ISS_TLE = [
+  'ISS (ZARYA)',
+  '1 25544U 98067A   26324.51234567  .00016717  00000-0  10270-3 0  9005',
+  '2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.72125391563537',
+].join('\n');
+
+const SAMPLE_NOAA_TLE = [
+  '0 NOAA 19',
+  '1 33591U 09005A   26324.21000000  .00000123  00000-0  91234-4 0  9991',
+  '2 33591  99.1900 120.5000 0014500  45.1000 315.1000 14.12500000800001',
+].join('\n');
+
+const SAMPLE_AIRSPACE: AirspaceData = {
+  usCoverage: true,
+  uasfm: {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        properties: { CEILING: 200, UNIT: 'FT', APT1_ICAO: 'KDCA' },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [-77.08, 38.82],
+              [-77.0, 38.82],
+              [-77.0, 38.88],
+              [-77.08, 38.88],
+              [-77.08, 38.82],
+            ],
+          ],
+        },
+      },
+      {
+        type: 'Feature',
+        properties: { CEILING: 400, UNIT: 'FT', APT1_ICAO: 'KIAD' },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [-77.2, 38.82],
+              [-77.06, 38.82],
+              [-77.06, 38.88],
+              [-77.2, 38.88],
+              [-77.2, 38.82],
+            ],
+          ],
+        },
+      },
+      {
+        type: 'Feature',
+        properties: { CEILING: 0, UNIT: 'FT', APT1_ICAO: 'KDCA-RWY' },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [-77.045, 38.845],
+              [-77.035, 38.845],
+              [-77.035, 38.855],
+              [-77.045, 38.855],
+              [-77.045, 38.845],
+            ],
+          ],
+        },
+      },
+    ],
+  },
+  sua: {
+    type: 'FeatureCollection',
+    features: [
+      {
+        type: 'Feature',
+        properties: { NAME: 'DC FRZ P-56', TYPE_CODE: 'P' },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [
+            [
+              [-77.05, 38.89],
+              [-77.01, 38.89],
+              [-77.01, 38.91],
+              [-77.05, 38.91],
+              [-77.05, 38.89],
+            ],
+          ],
+        },
+      },
+    ],
+  },
+};
+
+describe('geoHelpers self-contained WGS-84 & GeoJSON primitives', () => {
+  it('computes zenith look angle, greatCircleDestination roundtrip, and polygon holes', () => {
+    const zenith = computeTopocentricLookAngles(
+      { lat: 38.8512, lon: -77.0402, altM: 12 },
+      { lat: 38.8512, lon: -77.0402, altM: 10012 }
+    );
+    expect(zenith.elevationDeg).toBeCloseTo(90, 4);
+    expect(zenith.slantRangeKm).toBeCloseTo(10, 3);
+    expect(zenith.belowHorizon).toBe(false);
+
+    const dest = greatCircleDestination(38.8512, -77.0402, 90, 50);
+    expect(haversineDistanceKm(38.8512, -77.0402, dest.lat, dest.lon)).toBeCloseTo(50, 1);
+    expect(normalizeLonDeg(185)).toBe(-175);
+    expect(normalizeLonDeg(-190)).toBe(170);
+
+    const donutFeature: GeoJSON.Feature = {
+      type: 'Feature',
+      properties: {},
+      geometry: {
+        type: 'Polygon',
+        coordinates: [
+          [
+            [-1, -1],
+            [1, -1],
+            [1, 1],
+            [-1, 1],
+            [-1, -1],
+          ],
+          [
+            [-0.25, -0.25],
+            [0.25, -0.25],
+            [0.25, 0.25],
+            [-0.25, 0.25],
+            [-0.25, -0.25],
+          ],
+        ],
+      },
+    };
+    expect(pointInGeoJsonFeature(0.5, 0.5, donutFeature)).toBe(true);
+    expect(pointInGeoJsonFeature(0, 0, donutFeature)).toBe(false);
+  });
+});
+
+describe('httpClient resilience primitives', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('enforces TokenBucketRateLimiter >= 10s per key while isolating separate keys', () => {
+    let now = 100_000;
+    const limiter = new TokenBucketRateLimiter({
+      minIntervalMs: 10_000,
+      capacity: 1,
+      nowFn: () => now,
+    });
+
+    expect(limiter.tryConsume('key-a')).toBe(true);
+    expect(limiter.tryConsume('key-a')).toBe(false);
+    expect(limiter.tryConsume('key-b')).toBe(true);
+
+    now += 9_999;
+    expect(limiter.canConsume('key-a')).toBe(false);
+    expect(limiter.getWaitMs('key-a')).toBe(1);
+
+    now += 1;
+    expect(limiter.tryConsume('key-a')).toBe(true);
+  });
+
+  it('opens CircuitBreaker after failure threshold and recovers after cooldown', async () => {
+    let now = 50_000;
+    const breaker = new CircuitBreaker({
+      failureThreshold: 2,
+      resetTimeoutMs: 30_000,
+      nowFn: () => now,
+    });
+
+    await expect(
+      breaker.execute(async () => {
+        throw new Error('upstream 503');
+      }, 'adsb.lol')
+    ).rejects.toThrow('upstream 503');
+    expect(breaker.getState('adsb.lol')).toBe('closed');
+
+    await expect(
+      breaker.execute(async () => {
+        throw new Error('upstream 503');
+      }, 'adsb.lol')
+    ).rejects.toThrow('upstream 503');
+    expect(breaker.getState('adsb.lol')).toBe('open');
+
+    await expect(
+      breaker.execute(async () => 'ok', 'adsb.lol')
+    ).rejects.toBeInstanceOf(CircuitOpenError);
+
+    now += 30_001;
+    expect(breaker.getState('adsb.lol')).toBe('half-open');
+    const result = await breaker.execute(async () => 'recovered', 'adsb.lol');
+    expect(result).toBe('recovered');
+    expect(breaker.getState('adsb.lol')).toBe('closed');
+  });
+
+  it('fetches text, throws HttpError on non-2xx, and aborts on timeout', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValueOnce(new Response('PLAIN TLE TEXT', { status: 200 }))
+        .mockResolvedValueOnce(
+          new Response('Too Many Requests', { status: 429, statusText: 'Too Many Requests' })
+        )
+    );
+
+    await expect(fetchTextWithTimeout('https://example.test/tle')).resolves.toBe('PLAIN TLE TEXT');
+    await expect(fetchJsonWithTimeout('https://example.test/api')).rejects.toBeInstanceOf(
+      HttpError
+    );
+
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockImplementation(
+        (_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(init.signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+            });
+          })
+      )
+    );
+
+    const promise = fetchJsonWithTimeout('https://example.test/slow', { timeoutMs: 1200 });
+    const assertion = expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.advanceTimersByTimeAsync(1250);
+    await assertion;
+  });
+});
+
+describe('flightsService classification, normalization & cascade', () => {
+  beforeEach(() => {
+    clearFlightsServiceCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('accurately classifies military targets by dbFlags, ICAO hex ranges, and callsign', () => {
+    // Civil US N-number tail boundary (A00001 - ADF7C7) vs US DoD (ADF7C8 - AFFFFF)
+    expect(classifyMilitary('a00001', 'N1', 0)).toBe(false);
+    expect(classifyMilitary('adf7c7', 'N99999', 0)).toBe(false);
+    expect(classifyMilitary('adf7c8', 'N/A', 0)).toBe(true);
+    expect(classifyMilitary('ae1234', 'BOXER12', 0)).toBe(true);
+    expect(classifyMilitary('afffff', '', 0)).toBe(true);
+
+    // UK RAF (43C000-43CFFF), Luftwaffe (3F4000-3FBFFF), RAAF (7CF800-7CFFFF)
+    expect(classifyMilitary('43c123', 'RRR221', 0)).toBe(true);
+    expect(classifyMilitary('3f4100', 'GAF101', 0)).toBe(true);
+    expect(classifyMilitary('7cf812', 'ASY401', 0)).toBe(true);
+
+    // dbFlags bit 0
+    expect(classifyMilitary('a12345', 'UAL418', 1)).toBe(true);
+    expect(classifyMilitary('a12345', 'UAL418', 8)).toBe(false); // LADD only
+
+    // Callsigns
+    expect(classifyMilitary('a11111', 'RCH842', 0)).toBe(true);
+    expect(classifyMilitary('a11111', 'SAM45', 0)).toBe(true);
+    expect(classifyMilitary('a11111', 'PAT104', 0)).toBe(true);
+    expect(classifyMilitary('a11111', 'UAL418', 0)).toBe(false);
+    expect(classifyMilitary('a11111', 'SAMA100', 0)).toBe(false);
+  });
+
+  it('normalizes ADSBx v2 edge cases: ground, negative baro alt, nulls, squawk 7700, trails', () => {
+    const grounded = normalizeAdsbxAircraft(
+      {
+        hex: 'A1B2C3',
+        flight: 'DAL902  ',
+        lat: 38.85,
+        lon: -77.04,
+        alt_baro: 'ground',
+        gs: null,
+        track: null,
+        baro_rate: null,
+        t: 'A359',
+        category: 'A5',
+        dbFlags: 8,
+      },
+      DCA_OBSERVER
+    );
+
+    expect(grounded).not.toBeNull();
+    expect(grounded?.id).toBe('flight:a1b2c3');
+    expect(grounded?.callsign).toBe('DAL902');
+    expect(grounded?.onGround).toBe(true);
+    expect(grounded?.altBaroM).toBe(0);
+    expect(grounded?.altM).toBe(0);
+    expect(grounded?.speedMs).toBe(0);
+    expect(grounded?.headingDeg).toBe(0);
+    expect(grounded?.vertRateMs).toBe(0);
+    expect(grounded?.airframeClass).toBe('heavy');
+    expect(grounded?.isLadd).toBe(true);
+
+    // Negative barometric altitude (high local QNH) without alt_geom
+    const negBaro = normalizeAdsbxAircraft(
+      {
+        hex: 'a22222',
+        flight: 'TEST01',
+        lat: 38.9,
+        lon: -77.02,
+        alt_baro: -200,
+        gs: 120,
+        track: 365,
+        squawk: '7700',
+      },
+      DCA_OBSERVER
+    );
+    expect(negBaro).not.toBeNull();
+    expect(negBaro?.onGround).toBe(false);
+    expect(negBaro?.altBaroM).toBeCloseTo(-60.96, 2);
+    expect(negBaro?.altM).toBe(0);
+    expect(negBaro?.headingDeg).toBe(5);
+    expect(negBaro?.emergencyFlag).toContain('7700');
+
+    // Trail preservation
+    const secondTick = normalizeAdsbxAircraft(
+      {
+        hex: 'a22222',
+        flight: 'TEST01',
+        lat: 38.92,
+        lon: -77.0,
+        alt_baro: 1500,
+        gs: 140,
+        track: 45,
+      },
+      DCA_OBSERVER,
+      negBaro ?? undefined,
+      Date.now() + 5000
+    );
+    expect(secondTick?.trail.length).toBe(2);
+
+    // Malformed / missing coordinates rejected cleanly
+    expect(
+      normalizeAdsbxAircraft({ hex: 'a12345', lat: null, lon: -77.04 }, DCA_OBSERVER)
+    ).toBeNull();
+    expect(
+      normalizeAdsbxAircraft({ hex: '', lat: 38.85, lon: -77.04 }, DCA_OBSERVER)
+    ).toBeNull();
+    expect(
+      normalizeAdsbxAircraft({ hex: 'a12345', lat: 95, lon: -77.04 }, DCA_OBSERVER)
+    ).toBeNull();
+  });
+
+  it('normalizes OpenSky state tuples and drops malformed rows safely', () => {
+    const milTuple = [
+      'ae4567',
+      'RCH312 ',
+      'United States',
+      1760000000,
+      1760000005,
+      -77.12,
+      38.95,
+      7315.2,
+      false,
+      235.5,
+      280,
+      -3.2,
+      null,
+      7400.0,
+      '4411',
+      false,
+      0,
+    ];
+    const entity = normalizeOpenSkyState(milTuple, DCA_OBSERVER);
+    expect(entity).not.toBeNull();
+    expect(entity?.category).toBe('military');
+    expect(entity?.isMilitary).toBe(true);
+    expect(entity?.callsign).toBe('RCH312');
+    expect(entity?.altM).toBe(7400);
+    expect(entity?.altBaroM).toBe(7315.2);
+    expect(entity?.speedMs).toBe(235.5);
+    expect(entity?.topocentric.groundDistKm).toBeGreaterThan(5);
+
+    // Null lat/lon or short tuple returns null
+    expect(
+      normalizeOpenSkyState(['a11111', 'UAL1', 'US', null, 1, null, 38.9, 1000, false, 100, 90], DCA_OBSERVER)
+    ).toBeNull();
+    expect(normalizeOpenSkyState(['a11111', 'BAD'], DCA_OBSERVER)).toBeNull();
+  });
+
+  it('uses localhost Vite proxies first, enforces 10s rate-limit cache, and cascades through codetabs & fallback', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'localhost' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('/api-proxy/adsb-lol/')) {
+          return new Response(
+            JSON.stringify({
+              ac: [{ hex: 'a11111', flight: 'AAL100', lat: 38.86, lon: -77.05, alt_baro: 9000, gs: 280, track: 90 }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('err', { status: 500 });
+      })
+    );
+
+    const liveProxyRes = await fetchFlightsCascade(DCA_OBSERVER, 120);
+    expect(liveProxyRes.status).toBe('live');
+    expect(liveProxyRes.provider).toBe('vite-proxy:adsb.lol');
+    expect(liveProxyRes.entities).toHaveLength(1);
+
+    // Immediate second call hits 10s rate-limit cache without invoking fetch again
+    const cachedRes = await fetchFlightsCascade(DCA_OBSERVER, 120);
+    expect(cachedRes.status).toBe('cached');
+    expect(cachedRes.entities).toHaveLength(1);
+
+    // Test codetabs relay with valid ac[] schema
+    vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('api.codetabs.com')) {
+          return new Response(
+            JSON.stringify({
+              ac: [{ hex: 'a77777', flight: 'JAL12', lat: 35.58, lon: 139.8, alt_baro: 12000, gs: 320, track: 45 }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
+    );
+    const relayRes = await fetchFlightsCascade(TOKYO_OBSERVER, 130, undefined, { force: true });
+    expect(relayRes.status).toBe('live');
+    expect(relayRes.provider).toBe('codetabs-relay:adsb.lol');
+
+    // Test codetabs schema rejection -> relative static fallback snapshot
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('api.codetabs.com')) {
+          return new Response(JSON.stringify({ Error: 'Proxy limit reached' }), { status: 200 });
+        }
+        if (url.includes('fallback-flights.json')) {
+          return new Response(
+            JSON.stringify({
+              origin: { lat: 38.8512, lon: -77.0402 },
+              ac: [
+                {
+                  hex: 'a88888',
+                  flight: 'ANA108',
+                  dLat: 0.08,
+                  dLon: -0.1,
+                  alt_baro: 18000,
+                  gs: 390,
+                  track: 90,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Service Unavailable', { status: 503 });
+      })
+    );
+
+    const fallbackRes = await fetchFlightsCascade(TOKYO_OBSERVER, 130, undefined, { force: true });
+    expect(fallbackRes.status).toBe('fallback');
+    expect(fallbackRes.provider).toBe('seeded-snapshot');
+    expect(fallbackRes.entities).toHaveLength(1);
+    expect(fallbackRes.entities[0].lat).toBeCloseTo(TOKYO_OBSERVER.lat + 0.08, 4);
+    expect(fallbackRes.entities[0].lon).toBeCloseTo(TOKYO_OBSERVER.lon - 0.1, 4);
+    expect(fallbackRes.entities[0].topocentric.groundDistKm).toBeLessThan(20);
+  });
+});
+
+describe('satellitesService TLE parsing & 2-hour IndexedDB TTL', () => {
+  beforeEach(() => {
+    clearTleCache();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('parses 3-line, 2-line, Space-Track 0-prefixed, and Alpha-5 TLE sets while skipping bad pairs', () => {
+    const twoLineIss = SAMPLE_ISS_TLE.split('\n').slice(1).join('\n');
+    const alpha5 = [
+      'STARLINK-99999',
+      '1 T0123U 24001A   26324.50000000  .00010000  00000-0  50000-4 0  9990',
+      '2 T0123  53.2100 100.0000 0001500  80.0000 280.0000 15.06400000000012',
+    ].join('\n');
+    const mismatched = [
+      'BROKEN SAT',
+      '1 12345U 99001A   26324.50000000  .00000000  00000-0  00000-0 0  9991',
+      '2 54321  51.6000 100.0000 0001000  10.0000  20.0000 15.50000000000010',
+    ].join('\n');
+
+    const parsedStations = parseTleText(
+      `${SAMPLE_ISS_TLE}\r\n${SAMPLE_NOAA_TLE}\n${mismatched}\nGARBAGE LINE`,
+      'stations'
+    );
+    expect(parsedStations).toHaveLength(2);
+    expect(parsedStations[0]).toMatchObject({ name: 'ISS (ZARYA)', noradId: 25544, group: 'stations' });
+    expect(parsedStations[1]).toMatchObject({ name: 'NOAA 19', noradId: 33591, group: 'stations' });
+
+    const parsedTwoLine = parseTleText(twoLineIss, 'visual');
+    expect(parsedTwoLine).toHaveLength(1);
+    expect(parsedTwoLine[0].name).toBe('SAT-25544');
+    expect(parsedTwoLine[0].noradId).toBe(25544);
+
+    const parsedAlpha5 = parseTleText(alpha5, 'starlink');
+    expect(parsedAlpha5).toHaveLength(1);
+    expect(parsedAlpha5[0].noradId).toBe(270123);
+  });
+
+  it('loads cold-start static TLEs with deduplication and enforces 2-hour cache TTL', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/tle/stations.tle')) return new Response(SAMPLE_ISS_TLE, { status: 200 });
+        if (url.includes('/tle/visual.tle')) return new Response(`${SAMPLE_ISS_TLE}\n${SAMPLE_NOAA_TLE}`, { status: 200 });
+        if (url.includes('/tle/starlink.tle')) return new Response('', { status: 200 });
+        return new Response('', { status: 404 });
+      })
+    );
+    const coldTles = await loadInitialTles();
+    expect(coldTles).toHaveLength(2);
+    expect(coldTles.find((r) => r.noradId === 25544)?.group).toBe('stations');
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('GROUP=stations')) return new Response(SAMPLE_ISS_TLE, { status: 200 });
+      if (url.includes('GROUP=visual')) return new Response(SAMPLE_NOAA_TLE, { status: 200 });
+      if (url.includes('GROUP=starlink')) return new Response('', { status: 200 });
+      return new Response('', { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const t0 = 1_700_000_000_000;
+    const first = await refreshTlesIfStale(false, { nowMs: t0 });
+    expect(first.status).toBe('live');
+    expect(first.fromNetwork).toBe(true);
+    expect(first.records).toHaveLength(2);
+    const initialCalls = fetchMock.mock.calls.length;
+
+    // 1h 59m later -> still cached, zero network calls
+    const cached = await refreshTlesIfStale(false, { nowMs: t0 + 7_140_000 });
+    expect(cached.status).toBe('cached');
+    expect(cached.fromNetwork).toBe(false);
+    expect(fetchMock.mock.calls.length).toBe(initialCalls);
+
+    // Force refresh -> hits network
+    const forced = await refreshTlesIfStale(true, { nowMs: t0 + 7_140_000 });
+    expect(forced.status).toBe('live');
+    expect(forced.fromNetwork).toBe(true);
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(initialCalls);
+
+    // Offline after TTL expiry -> falls back cleanly to stale cache without throwing
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('Network offline')));
+    const offlineStale = await refreshTlesIfStale(false, { nowMs: t0 + 15_000_000 });
+    expect(offlineStale.status).toBe('cached');
+    expect(offlineStale.records).toHaveLength(2);
+  });
+});
+
+describe('balloonsService SondeHub parsing & nearestSondeHint', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('classifies burstState, merges /sondes + /amateur, and computes nearestSondeHint when 0 local', async () => {
+    const asc = normalizeSondeRecord(
+      { serial: 'R100', lat: 38.86, lon: -77.05, alt: 5200, vel_v: 5.4, vel_h: 18, type: 'RS41' },
+      DCA_OBSERVER
+    );
+    const desc = normalizeSondeRecord(
+      { serial: 'R101', lat: 38.86, lon: -77.05, alt: 9000, vel_v: -9.8, vel_h: 22 },
+      DCA_OBSERVER
+    );
+    const floater = normalizeSondeRecord(
+      { serial: 'HAB1', lat: 38.86, lon: -77.05, alt: 14000, vspeed: 0.2, hspeed: 14 },
+      DCA_OBSERVER,
+      { isAmateur: true }
+    );
+    expect(asc?.burstState).toBe('ascending');
+    expect(desc?.burstState).toBe('descending');
+    expect(floater?.burstState).toBe('float');
+
+    // Live local balloons from both endpoints
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/sondes')) {
+          return new Response(
+            JSON.stringify([
+              {
+                serial: 'R4100999',
+                lat: 38.9,
+                lon: -77.01,
+                alt: 12400,
+                vel_v: 5.1,
+                vel_h: 16.5,
+                subtype: 'RS41-SGP',
+                temp: -42.3,
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/amateur')) {
+          return new Response(
+            JSON.stringify({
+              'W3HAB-11': {
+                payload_callsign: 'W3HAB-11',
+                lat: 38.82,
+                lon: -77.12,
+                alt: 18500,
+                vspeed: -6.5,
+                hspeed: 24.0,
+              },
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('{}', { status: 404 });
+      })
+    );
+    const liveRes = await fetchBalloons(DCA_OBSERVER, 120);
+    expect(liveRes.status).toBe('live');
+    expect(liveRes.entities).toHaveLength(2);
+    expect(liveRes.nearestSondeHint).toBeNull();
+
+    // 0 balloons inside radiusKm -> widened hint
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('distance=1000000')) {
+          return new Response(
+            JSON.stringify([
+              {
+                serial: 'S9991234',
+                lat: 40.4,
+                lon: -76.9,
+                alt: 18200,
+                vel_v: 4.9,
+                vel_h: 25,
+                type: 'RS41',
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/sondes')) {
+          return new Response(JSON.stringify([]), { status: 200 });
+        }
+        if (url.includes('/amateur')) {
+          return new Response(JSON.stringify({}), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      })
+    );
+
+    const hintRes = await fetchBalloons(DCA_OBSERVER, 120);
+    expect(hintRes.status).toBe('live');
+    expect(hintRes.entities).toHaveLength(0);
+    expect(hintRes.nearestSondeHint).toContain('S9991234');
+    expect(hintRes.nearestSondeHint).toContain('km');
+  });
+});
+
+describe('airspaceService & openDroneIdService compliance', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('detects US territorial coverage accurately', () => {
+    expect(isInsideContinentalUsOrTerritories(38.8512, -77.0402)).toBe(true); // DCA
+    expect(isInsideContinentalUsOrTerritories(34.0522, -118.2437)).toBe(true); // LAX
+    expect(isInsideContinentalUsOrTerritories(61.1743, -149.9981)).toBe(true); // Anchorage
+    expect(isInsideContinentalUsOrTerritories(21.3069, -157.8583)).toBe(true); // Honolulu
+    expect(isInsideContinentalUsOrTerritories(18.4655, -66.1057)).toBe(true); // San Juan
+    expect(isInsideContinentalUsOrTerritories(51.47, -0.4543)).toBe(false); // London
+    expect(isInsideContinentalUsOrTerritories(35.5494, 139.7798)).toBe(false); // Tokyo
+  });
+
+  it('evaluates drone UASFM ceilings, overlapping grids, 0ft grids, and TFR/P-56 breaches', () => {
+    const compliant = evaluateDroneAirspaceCompliance(38.865, -77.07, 150 * 0.3048, SAMPLE_AIRSPACE);
+    expect(compliant).toEqual({ faaCeilingFt: 200, ceilingBreach: false, tfrBreach: false });
+
+    const breaching = evaluateDroneAirspaceCompliance(38.865, -77.07, 480 * 0.3048, SAMPLE_AIRSPACE);
+    expect(breaching).toEqual({ faaCeilingFt: 200, ceilingBreach: true, tfrBreach: false });
+
+    const zeroGrid = evaluateDroneAirspaceCompliance(38.85, -77.04, 15, SAMPLE_AIRSPACE);
+    expect(zeroGrid).toEqual({ faaCeilingFt: 0, ceilingBreach: true, tfrBreach: false });
+
+    const p56 = evaluateDroneAirspaceCompliance(38.9, -77.03, 50, SAMPLE_AIRSPACE);
+    expect(p56.tfrBreach).toBe(true);
+
+    const open = evaluateDroneAirspaceCompliance(39.1, -77.5, 100, SAMPLE_AIRSPACE);
+    expect(open).toEqual({ faaCeilingFt: null, ceilingBreach: false, tfrBreach: false });
+  });
+
+  it('caps UASFM ArcGIS query envelope to ±0.35°, skips outside US, and falls back to seeded GeoJSON', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const tokyoAirspace = await fetchAirspace(TOKYO_OBSERVER, 130);
+    expect(tokyoAirspace.airspace.usCoverage).toBe(false);
+    expect(tokyoAirspace.airspace.uasfm.features).toHaveLength(0);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Verify FAA ArcGIS query parameters & envelope <= ±0.35° even when radiusKm is 200
+    const arcgisSpy = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('FAA_UAS_FacilityMap_Data')) {
+        return new Response(JSON.stringify(SAMPLE_AIRSPACE.uasfm), { status: 200 });
+      }
+      if (url.includes('Boundary_Airspace')) {
+        return new Response(JSON.stringify(SAMPLE_AIRSPACE.sua), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ type: 'FeatureCollection', features: [] }),
+        { status: 200 }
+      );
+    });
+    vi.stubGlobal('fetch', arcgisSpy);
+
+    const liveUs = await fetchAirspace(DCA_OBSERVER, 200);
+    expect(liveUs.status).toBe('live');
+    expect(liveUs.airspace.uasfm.features).toHaveLength(3);
+    const uasfmUrl = String(
+      arcgisSpy.mock.calls.find((c) => String(c[0]).includes('FAA_UAS_FacilityMap_Data'))?.[0] ?? ''
+    );
+    const parsedUasfmUrl = new URL(uasfmUrl);
+    const whereClause = parsedUasfmUrl.searchParams.get('where') ?? '';
+    const latMatch = whereClause.match(/LATITUDE BETWEEN ([-\d.]+) AND ([-\d.]+)/);
+    expect(latMatch).not.toBeNull();
+    if (latMatch) {
+      const span = Number.parseFloat(latMatch[2]) - Number.parseFloat(latMatch[1]);
+      expect(span).toBeLessThanOrEqual(0.7001); // ±0.35° max
+    }
+    expect(parsedUasfmUrl.searchParams.get('resultRecordCount')).toBe('1000');
+
+    // Fall back to ./data/fallback-airspace.geojson when US fetches fail
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('fallback-airspace.geojson')) {
+          return new Response(
+            JSON.stringify({ uasfm: SAMPLE_AIRSPACE.uasfm, sua: SAMPLE_AIRSPACE.sua }),
+            { status: 200 }
+          );
+        }
+        return new Response('ArcGIS Down', { status: 500 });
+      })
+    );
+
+    const dcFallback = await fetchAirspace(DCA_OBSERVER, 120);
+    expect(dcFallback.status).toBe('fallback');
+    expect(dcFallback.airspace.usCoverage).toBe(true);
+    expect(dcFallback.airspace.uasfm.features.length).toBeGreaterThan(0);
+  });
+
+  it('steps 4 simulated ASTM F3411 drones, normalizes ODID JSON, and runs OpenDroneIdClient HTTP polling', async () => {
+    const drones = stepSimulatedDrones(DCA_OBSERVER, 120, 12, SAMPLE_AIRSPACE);
+    expect(drones).toHaveLength(4);
+    for (const d of drones) {
+      expect(d.isSimulated).toBe(true);
+      expect(Number.isFinite(d.operatorLat)).toBe(true);
+      expect(Number.isFinite(d.operatorLon)).toBe(true);
+      expect(d.operatorDistM).toBeGreaterThan(0);
+    }
+
+    const breacher = drones.find((d) => d.callsign === 'UAS-BREACH-480');
+    expect(breacher).toBeDefined();
+    expect(Math.round((breacher?.altAglM ?? 0) / 0.3048)).toBe(480);
+    expect(breacher?.ceilingBreach).toBe(true);
+    expect(breacher?.emergencyFlag).toBe('UASFM BREACH');
+
+    const parsedLive = normalizeOdidPayload(
+      {
+        drones: [
+          {
+            BasicID: { UASID: 'LIVE-UAS-99', UAType: 'vtol' },
+            Location: {
+              Latitude: 38.865,
+              Longitude: -77.07,
+              Height: 146.3, // ~480 ft AGL inside 200 ft cell
+              SpeedHorizontal: 18,
+              Direction: 90,
+            },
+            System: { OperatorLatitude: 38.863, OperatorLongitude: -77.071 },
+          },
+          {
+            uasId: 'INVALID-SENTINEL',
+            lat: 0,
+            lon: 0,
+          },
+        ],
+      },
+      DCA_OBSERVER,
+      SAMPLE_AIRSPACE
+    );
+    expect(parsedLive).toHaveLength(1);
+    expect(parsedLive[0].uasId).toBe('LIVE-UAS-99');
+    expect(parsedLive[0].uaType).toBe('vtol');
+    expect(parsedLive[0].ceilingBreach).toBe(true);
+    expect(parsedLive[0].isSimulated).toBe(false);
+
+    // OpenDroneIdClient rejects unsafe protocols and polls HTTP cleanly
+    const statuses: Array<{ transport: string; connected: boolean; lastError?: string }> = [];
+    const received: number[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify([{ uasId: 'HTTP-DRONE-1', lat: 38.865, lon: -77.07, altAglM: 50 }]),
+          { status: 200 }
+        )
+      )
+    );
+
+    const client = new OpenDroneIdClient(DCA_OBSERVER, SAMPLE_AIRSPACE, {
+      onDrones: (items) => received.push(items.length),
+      onStatus: (s) => statuses.push(s),
+    });
+
+    client.connect('ftp://invalid.local/stream');
+    expect(statuses[statuses.length - 1].connected).toBe(false);
+    expect(statuses[statuses.length - 1].lastError).toContain('Unsupported protocol');
+
+    client.connect('http://127.0.0.1:8088/odid.json', 5000);
+    await vi.waitFor(() => {
+      expect(received).toEqual([1]);
+    });
+    expect(statuses[statuses.length - 1]).toMatchObject({ transport: 'http', connected: true });
+    client.disconnect();
+  });
+});
+
+describe('geocodingService coordinate parsing & multi-provider search', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('parses decimal, N/S/E/W hemisphere, and DMS coordinate formats cleanly', () => {
+    const p1 = parseDirectCoordinates('38.85, -77.04');
+    expect(p1).toMatchObject({ lat: 38.85, lon: -77.04 });
+
+    const p2 = parseDirectCoordinates('34.9054N 117.8839W');
+    expect(p2?.lat).toBeCloseTo(34.9054, 4);
+    expect(p2?.lon).toBeCloseTo(-117.8839, 4);
+
+    const p3 = parseDirectCoordinates('34.9054° N, 117.8839° W');
+    expect(p3?.lat).toBeCloseTo(34.9054, 4);
+    expect(p3?.lon).toBeCloseTo(-117.8839, 4);
+
+    const p4 = parseDirectCoordinates('N34.9054 W117.8839');
+    expect(p4?.lat).toBeCloseTo(34.9054, 4);
+    expect(p4?.lon).toBeCloseTo(-117.8839, 4);
+
+    const p5 = parseDirectCoordinates(`38°51'04"N 77°02'25"W`);
+    expect(p5?.lat).toBeCloseTo(38.8511, 3);
+    expect(p5?.lon).toBeCloseTo(-77.0403, 3);
+
+    expect(parseDirectCoordinates('95.0, -77.04')).toBeNull();
+    expect(parseDirectCoordinates('Edwards Air Force Base')).toBeNull();
+  });
+
+  it('falls back cleanly from Open-Meteo to Nominatim and never throws offline', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('geocoding-api.open-meteo.com')) {
+          return new Response(JSON.stringify({ results: [] }), { status: 200 });
+        }
+        if (url.includes('nominatim.openstreetmap.org')) {
+          return new Response(
+            JSON.stringify([
+              {
+                name: 'Edwards Air Force Base',
+                display_name: 'Edwards Air Force Base, Kern County, California, United States',
+                lat: '34.9054',
+                lon: '-117.8839',
+              },
+            ]),
+            { status: 200 }
+          );
+        }
+        return new Response('error', { status: 500 });
+      })
+    );
+
+    const results = await searchLocation('Edwards AFB');
+    expect(results).toHaveLength(1);
+    expect(results[0].source).toBe('nominatim');
+    expect(results[0].lat).toBeCloseTo(34.9054, 4);
+
+    // Direct coords shortcut requires zero fetch
+    const fetchSpy = vi.fn();
+    vi.stubGlobal('fetch', fetchSpy);
+    const directRes = await searchLocation('28.5729, -80.6490');
+    expect(directRes).toHaveLength(1);
+    expect(directRes[0].source).toBe('coords');
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    // Total outage returns [] safely
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
+    await expect(searchLocation('Cape Canaveral')).resolves.toEqual([]);
+  });
+});
