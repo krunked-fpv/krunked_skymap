@@ -239,9 +239,10 @@ select {
 .topbar-brand-group {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
-  flex-shrink: 1;
+  flex: 0 1 auto;
+  overflow: hidden;
 }
 
 .topbar-crest {
@@ -253,6 +254,7 @@ select {
   background: rgba(34, 211, 238, 0.08);
   border: 1px solid rgba(34, 211, 238, 0.24);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .topbar-crest-dot {
@@ -277,7 +279,9 @@ select {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  max-width: 240px;
+  max-width: 280px;
+  flex: 0 1 280px;
+  overflow: hidden;
   padding: 4px 8px;
   border-radius: var(--radius-sm);
   background: rgba(15, 24, 42, 0.72);
@@ -287,6 +291,8 @@ select {
 }
 
 .topbar-observer-label {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -295,10 +301,17 @@ select {
 }
 
 .topbar-observer-coords {
+  flex-shrink: 0;
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+@media (max-width: 1520px) {
+  .topbar-observer-coords {
+    display: none;
+  }
 }
 
 .topbar-counters {
@@ -1682,4 +1695,52 @@ select {
   .modal-url-row {
     flex-direction: column;
   }
+}
+
+/* ==========================================================================
+   MapLibre Dark Cockpit Control Overrides
+   ========================================================================== */
+
+.maplibregl-ctrl-group {
+  background: rgba(11, 17, 30, 0.88) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(120, 190, 255, 0.2) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.52) !important;
+}
+
+.maplibregl-ctrl-group button {
+  background: transparent !important;
+  border-color: rgba(120, 190, 255, 0.14) !important;
+}
+
+.maplibregl-ctrl-group button:hover {
+  background: rgba(34, 211, 238, 0.14) !important;
+}
+
+.maplibregl-ctrl-icon {
+  filter: invert(0.88) hue-rotate(175deg) brightness(1.08);
+}
+
+.maplibregl-ctrl-scale {
+  background: rgba(11, 17, 30, 0.84) !important;
+  border-color: rgba(34, 211, 238, 0.55) !important;
+  color: #cbd5e1 !important;
+  font-family: var(--font-mono) !important;
+  font-size: 10px !important;
+}
+
+.maplibregl-ctrl-attrib {
+  background: rgba(6, 9, 15, 0.78) !important;
+  color: #94a3b8 !important;
+  border: 1px solid rgba(120, 190, 255, 0.12);
+}
+
+.maplibregl-ctrl-attrib a {
+  color: #38bdf8 !important;
+}
+
+.maplibregl-ctrl-attrib-button {
+  background-color: rgba(11, 17, 30, 0.9) !important;
+  filter: invert(0.82);
 }

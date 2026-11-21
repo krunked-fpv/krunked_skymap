@@ -84,17 +84,22 @@ const TACTICAL_STYLE: maplibregl.StyleSpecification = {
   version: 8,
   name: 'Krunked Obsidian Tactical',
   sources: {
-    'carto-dark': {
+    'esri-dark-base': {
       type: 'raster',
       tiles: [
-        'https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
-        'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+        'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
       ],
       tileSize: 256,
-      maxzoom: 19,
-      attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+      maxzoom: 16,
+      attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ',
+    },
+    'esri-dark-ref': {
+      type: 'raster',
+      tiles: [
+        'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}',
+      ],
+      tileSize: 256,
+      maxzoom: 16,
     },
   },
   layers: [
@@ -106,14 +111,23 @@ const TACTICAL_STYLE: maplibregl.StyleSpecification = {
       },
     },
     {
-      id: 'carto-dark-tiles',
+      id: 'esri-dark-base-tiles',
       type: 'raster',
-      source: 'carto-dark',
+      source: 'esri-dark-base',
       paint: {
-        'raster-opacity': 0.9,
-        'raster-brightness-max': 0.88,
-        'raster-contrast': 0.14,
-        'raster-saturation': -0.35,
+        'raster-opacity': 0.94,
+        'raster-brightness-max': 0.78,
+        'raster-contrast': 0.24,
+        'raster-saturation': -0.25,
+      },
+    },
+    {
+      id: 'esri-dark-ref-tiles',
+      type: 'raster',
+      source: 'esri-dark-ref',
+      paint: {
+        'raster-opacity': 0.65,
+        'raster-brightness-max': 0.85,
       },
     },
   ],
@@ -953,8 +967,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
     map.on('touchstart', handleDragStart);
     map.on('touchend', handleDragEnd);
 
-    map.on('load', () => {
-      if (cancelled) return;
+    let layersInitialized = false;
+    const initMapLayers = () => {
+      if (cancelled || layersInitialized) return;
+      layersInitialized = true;
       mapLoadedRef.current = true;
       registerTacticalSprites(map);
       registerSourcesAndLayers(map);
@@ -985,6 +1001,22 @@ export function TacticalMap({ className }: TacticalMapProps) {
         buildObserverFc(st.observer.lat, st.observer.lon, st.observer.label)
       );
 
+      const { entitiesFc, operatorsFc } = buildEntitiesAndOperatorsFc(
+        st.layers,
+        st.selectedId,
+        st.hoveredId,
+        performance.now()
+      );
+      (map.getSource(SOURCE_IDS.entities) as maplibregl.GeoJSONSource | undefined)?.setData(
+        entitiesFc
+      );
+      (map.getSource(SOURCE_IDS.operators) as maplibregl.GeoJSONSource | undefined)?.setData(
+        operatorsFc
+      );
+      (map.getSource(SOURCE_IDS.entityTrails) as maplibregl.GeoJSONSource | undefined)?.setData(
+        buildTrailsAndVectorsFc(st.layers)
+      );
+
       const droneVis = st.layers.drone ? 'visible' : 'none';
       map.setLayoutProperty(LAYER_IDS.uasfmFill, 'visibility', droneVis);
       map.setLayoutProperty(LAYER_IDS.uasfmOutline, 'visibility', droneVis);
@@ -993,7 +1025,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
       map.on('mousemove', LAYER_IDS.entitiesSymbol, handleMouseMove);
       map.on('mouseleave', LAYER_IDS.entitiesSymbol, handleMouseLeave);
       map.on('click', LAYER_IDS.entitiesSymbol, handleClick);
-    });
+    };
+
+    map.on('style.load', initMapLayers);
+    map.on('load', initMapLayers);
 
     const resizeObserver = new ResizeObserver(() => {
       if (mapRef.current) {
@@ -1164,11 +1199,16 @@ export function TacticalMap({ className }: TacticalMapProps) {
         observer.lat,
         observer.lon
       );
-      if (shiftKm > 1) {
+      if (shiftKm > 250) {
+        map.jumpTo({
+          center: [normalizeLonDeg(observer.lon), observer.lat],
+          zoom: zoomForRadiusKm(radiusKm, observer.lat),
+        });
+      } else if (shiftKm > 1) {
         map.flyTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
-          duration: 1100,
+          duration: 650,
           essential: true,
         });
       }

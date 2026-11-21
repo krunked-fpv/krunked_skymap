@@ -9,7 +9,11 @@ import {
   type UnitSystem,
 } from './types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore, type UrlHydrationPatch } from './store/useSkyStore';
-import { computeTopocentricLookAngles, extrapolateDeadReckoning } from './math/geodesy';
+import {
+  computeTopocentricLookAngles,
+  extrapolateDeadReckoning,
+  haversineDistanceKm,
+} from './math/geodesy';
 import { AstroClient } from './workers/astroClient';
 import { fetchFlightsCascade } from './services/flightsService';
 import { loadInitialTles, refreshTlesIfStale } from './services/satellitesService';
@@ -153,6 +157,10 @@ export default function App() {
   const zenithNotifiedRef = useRef<Set<string>>(new Set());
   const alertNotifiedRef = useRef<Set<string>>(new Set());
   const prevSelectedIdRef = useRef<string | null>(null);
+  const lastFetchedCoordsRef = useRef<{ lat: number; lon: number }>({
+    lat: observer.lat,
+    lon: observer.lon,
+  });
 
   // 1. Hydrate from URL permalink immediately once & honor pre-granted geolocation non-blockingly
   useEffect(() => {
@@ -196,16 +204,19 @@ export default function App() {
             // Permissions API unsupported — keep default hub
           });
       }
-      const handleHashChange = () => {
-        const nextPatch = parseUrlHashPatch();
-        if (nextPatch) {
-          useSkyStore.getState().hydrateFromUrlState(nextPatch);
-        }
-      };
-      window.addEventListener('hashchange', handleHashChange);
-      return () => window.removeEventListener('hashchange', handleHashChange);
     }
-    return undefined;
+  }, []);
+
+  // Listen for manual URL hash edits cleanly across React StrictMode mounts
+  useEffect(() => {
+    const handleHashChange = () => {
+      const nextPatch = parseUrlHashPatch();
+      if (nextPatch) {
+        useSkyStore.getState().hydrateFromUrlState(nextPatch);
+      }
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
   }, []);
 
   // 2. Debounced URL Hash Permalink Synchronization
@@ -409,16 +420,7 @@ export default function App() {
       });
     } finally {
       flightsInFlightRef.current = false;
-      const handleHashChange = () => {
-        const nextPatch = parseUrlHashPatch();
-        if (nextPatch) {
-          useSkyStore.getState().hydrateFromUrlState(nextPatch);
-        }
-      };
-      window.addEventListener('hashchange', handleHashChange);
-      return () => window.removeEventListener('hashchange', handleHashChange);
     }
-    return undefined;
   }, []);
 
   const runBalloonsRefresh = useCallback(async () => {
@@ -456,16 +458,7 @@ export default function App() {
       });
     } finally {
       balloonsInFlightRef.current = false;
-      const handleHashChange = () => {
-        const nextPatch = parseUrlHashPatch();
-        if (nextPatch) {
-          useSkyStore.getState().hydrateFromUrlState(nextPatch);
-        }
-      };
-      window.addEventListener('hashchange', handleHashChange);
-      return () => window.removeEventListener('hashchange', handleHashChange);
     }
-    return undefined;
   }, []);
 
   const runAirspaceRefresh = useCallback(async () => {
@@ -494,20 +487,30 @@ export default function App() {
       });
     } finally {
       airspaceInFlightRef.current = false;
-      const handleHashChange = () => {
-        const nextPatch = parseUrlHashPatch();
-        if (nextPatch) {
-          useSkyStore.getState().hydrateFromUrlState(nextPatch);
-        }
-      };
-      window.addEventListener('hashchange', handleHashChange);
-      return () => window.removeEventListener('hashchange', handleHashChange);
     }
-    return undefined;
   }, []);
 
-  // Debounced immediate sweep when observer or radius changes
+  // Refresh feeds on observer/radius change (purging distant targets immediately on >50km jumps)
   useEffect(() => {
+    const jumpKm = haversineDistanceKm(
+      lastFetchedCoordsRef.current.lat,
+      lastFetchedCoordsRef.current.lon,
+      observer.lat,
+      observer.lon
+    );
+    lastFetchedCoordsRef.current = { lat: observer.lat, lon: observer.lon };
+
+    if (jumpKm > 50) {
+      liveKinematicsRegistry.rawFlights.clear();
+      liveKinematicsRegistry.rawBalloons.clear();
+      liveKinematicsRegistry.rawDrones.clear();
+      liveKinematicsRegistry.version += 1;
+      void runFlightsRefresh(true);
+      void runBalloonsRefresh();
+      void runAirspaceRefresh();
+      return undefined;
+    }
+
     const timer = window.setTimeout(() => {
       void runFlightsRefresh(true);
       void runBalloonsRefresh();
@@ -926,16 +929,7 @@ export default function App() {
       void tacticalAudio.unlock().then(() => {
         tacticalAudio.playTargetLock();
       });
-      const handleHashChange = () => {
-        const nextPatch = parseUrlHashPatch();
-        if (nextPatch) {
-          useSkyStore.getState().hydrateFromUrlState(nextPatch);
-        }
-      };
-      window.addEventListener('hashchange', handleHashChange);
-      return () => window.removeEventListener('hashchange', handleHashChange);
     }
-    return undefined;
   }, []);
 
   return (
