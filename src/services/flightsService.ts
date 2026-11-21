@@ -730,7 +730,8 @@ export async function fetchFlightsCascade(
     options.rateLimitKey ??
     `adsb:${observer.lat.toFixed(2)},${observer.lon.toFixed(2)}:r${Math.round(radiusKm)}`;
 
-  if (!options.force && !adsbRateLimiter.tryConsume(rateKey)) {
+  const rateAllowed = adsbRateLimiter.tryConsume(rateKey);
+  if (!options.force && !rateAllowed) {
     const cached = lastCachedFlightsByKey.get(rateKey);
     if (cached) {
       return {

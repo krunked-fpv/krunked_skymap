@@ -1260,10 +1260,11 @@ describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Sprint 02 Render Probe
   });
 
   it('[DEFECT-S2-01] App.tsx >50km observer jump clears rawFlights without resetting feeds.flights.lastUpdatedMs, leaking prior region timestamp on offline/error', () => {
-    const jumpBlock = appSourceRaw.slice(
-      appSourceRaw.indexOf('if (jumpKm > 50)'),
-      appSourceRaw.indexOf('const timer = window.setTimeout')
-    );
+    const jumpStart = appSourceRaw.indexOf('if (jumpKm > 50)');
+    expect(jumpStart).toBeGreaterThan(-1);
+    const jumpEnd = appSourceRaw.indexOf('const timer = window.setTimeout', jumpStart);
+    expect(jumpEnd).toBeGreaterThan(jumpStart);
+    const jumpBlock = appSourceRaw.slice(jumpStart, jumpEnd);
     expect(
       jumpBlock.includes('lastUpdatedMs: null'),
       'App.tsx jumpKm > 50 clears rawFlights without resetting feeds.flights.lastUpdatedMs to null, leaving stale prior-region timestamp in HUD on failure/offline'

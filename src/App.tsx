@@ -597,6 +597,14 @@ export default function App() {
       liveKinematicsRegistry.rawBalloons.clear();
       liveKinematicsRegistry.rawDrones.clear();
       liveKinematicsRegistry.version += 1;
+      useSkyStore.getState().setFeedState('flights', {
+        lastUpdatedMs: null,
+        lastCheckedMs: null,
+        httpStatus: undefined,
+        provider: 'adsb-cascade',
+        count: 0,
+        errorMsg: undefined,
+      });
       void runFlightsRefresh(true);
       void runBalloonsRefresh();
       void runAirspaceRefresh();

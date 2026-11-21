@@ -274,3 +274,20 @@ All 18 findings (`[DEFECT-01]`..`[DEFECT-18]`) identified in Round 1 were surgic
   const rateAllowed = adsbRateLimiter.tryConsume(rateKey);
   if (!options.force && !rateAllowed) {
   ```
+
+---
+
+### Sprint 02 Round 2 — Remediation & Verification Sign-Off
+
+Both Low defects (`[DEFECT-S2-01]`, `[DEFECT-S2-02]`) were remediated on `main`:
+
+| Defect ID | File Updated | Verification Status |
+| :--- | :--- | :--- |
+| `[DEFECT-S2-01]` | `src/App.tsx` | Fixed & Verified (`jumpKm > 50` resets `feeds.flights` diagnostics including `lastUpdatedMs: null`) |
+| `[DEFECT-S2-02]` | `src/services/flightsService.ts` | Fixed & Verified (`adsbRateLimiter.tryConsume(rateKey)` evaluated prior to `!options.force` check) |
+
+#### Sprint 02 Final Open Defect Tally
+- **Critical:** **0**
+- **High:** **0**
+- **Medium:** **0**
+- **Low:** **0**
