@@ -458,7 +458,7 @@ export default function App() {
   }, [selectedId, observer, workerReady]);
 
   // 4. Data Feed Runners (Flights, Balloons, FAA Airspace)
-  const runFlightsRefresh = useCallback(async (force = false) => {
+  const runFlightsRefresh = useCallback(async (force = false, resetBreakers = false) => {
     if (typeof document !== 'undefined' && document.hidden && !force) return;
     if (flightsInFlightRef.current) return;
     flightsInFlightRef.current = true;
@@ -474,7 +474,7 @@ export default function App() {
         st.observer,
         st.radiusKm,
         liveKinematicsRegistry.rawFlights,
-        { force }
+        { force, resetBreakers }
       );
       const nextMap = new Map<string, (typeof res.entities)[number]>();
       for (const f of res.entities) {
@@ -515,7 +515,7 @@ export default function App() {
     }
   }, []);
 
-  const runBalloonsRefresh = useCallback(async () => {
+  const runBalloonsRefresh = useCallback(async (force = false) => {
     if (balloonsInFlightRef.current) return;
     balloonsInFlightRef.current = true;
     const st = useSkyStore.getState();
@@ -525,7 +525,8 @@ export default function App() {
       const res = await fetchBalloons(
         st.observer,
         st.radiusKm,
-        liveKinematicsRegistry.rawBalloons
+        liveKinematicsRegistry.rawBalloons,
+        { force }
       );
       const nextMap = new Map<string, (typeof res.entities)[number]>();
       for (const b of res.entities) {
@@ -605,15 +606,15 @@ export default function App() {
         count: 0,
         errorMsg: undefined,
       });
-      void runFlightsRefresh(true);
-      void runBalloonsRefresh();
+      void runFlightsRefresh(true, true);
+      void runBalloonsRefresh(true);
       void runAirspaceRefresh();
       return undefined;
     }
 
     const timer = window.setTimeout(() => {
-      void runFlightsRefresh(true);
-      void runBalloonsRefresh();
+      void runFlightsRefresh(true, true);
+      void runBalloonsRefresh(true);
       void runAirspaceRefresh();
     }, 280);
     return () => window.clearTimeout(timer);
@@ -623,8 +624,8 @@ export default function App() {
   useEffect(() => {
     if (sweepPulseCounter === 0) return;
     tacticalAudio.playSweepPulse();
-    void runFlightsRefresh(true);
-    void runBalloonsRefresh();
+    void runFlightsRefresh(true, true);
+    void runBalloonsRefresh(true);
     void runAirspaceRefresh();
     if (astroClientRef.current && useSkyStore.getState().workerReady) {
       astroClientRef.current.tick(Date.now());
@@ -644,7 +645,7 @@ export default function App() {
         (store.layers.flight || store.layers.military)
       ) {
         const shouldForce = nowMs - lastFlightsAttemptMsRef.current >= 9_800;
-        void runFlightsRefresh(shouldForce);
+        void runFlightsRefresh(shouldForce, false);
       }
       if (feeds.balloons.nextRefreshSec <= 0 && store.layers.balloon) {
         void runBalloonsRefresh();
@@ -679,10 +680,10 @@ export default function App() {
     const handleOnline = () => {
       const st = useSkyStore.getState();
       if (st.layers.flight || st.layers.military) {
-        void runFlightsRefresh(true);
+        void runFlightsRefresh(true, true);
       }
       if (st.layers.balloon) {
-        void runBalloonsRefresh();
+        void runBalloonsRefresh(true);
       }
       if (st.layers.drone) {
         void runAirspaceRefresh();
