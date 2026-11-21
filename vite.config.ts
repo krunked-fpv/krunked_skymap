@@ -34,7 +34,6 @@ export default defineConfig({
       output: {
         manualChunks: {
           maplibre: ['maplibre-gl'],
-          astro: ['satellite.js'],
         },
       },
     },

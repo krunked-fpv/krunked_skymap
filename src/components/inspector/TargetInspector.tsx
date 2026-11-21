@@ -95,6 +95,8 @@ export function TargetInspector() {
     const params = new URLSearchParams();
     params.set('lat', observer.lat.toFixed(4));
     params.set('lon', observer.lon.toFixed(4));
+    params.set('alt', String(Math.round(observer.altM)));
+    params.set('label', observer.label);
     params.set('r', String(radiusKm));
     params.set('units', units);
     params.set('layout', layout);

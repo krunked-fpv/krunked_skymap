@@ -34,22 +34,22 @@ export function formatHeading(headingDeg: number): string {
 
 export function formatSpeed(speedMs: number, units: UnitSystem): string {
   if (!Number.isFinite(speedMs)) return '—';
+  if (Math.abs(speedMs) >= 1500) {
+    return `${(speedMs / 1000).toFixed(2)} km/s`;
+  }
   if (units === 'aviation') {
     const knots = speedMs * 1.94384449;
     return `${Math.round(knots).toLocaleString()} kt`;
-  }
-  if (Math.abs(speedMs) >= 1500) {
-    return `${(speedMs / 1000).toFixed(2)} km/s`;
   }
   return `${Math.round(speedMs * 3.6).toLocaleString()} km/h`;
 }
 
 export function formatAltitude(altM: number, units: UnitSystem, forceFeet = false): string {
   if (!Number.isFinite(altM)) return '—';
+  if (!forceFeet && altM >= 100_000) {
+    return `${(altM / 1000).toFixed(1)} km`;
+  }
   if (units === 'aviation') {
-    if (!forceFeet && altM >= 60_000) {
-      return `${(altM / 1852).toFixed(1)} NM`;
-    }
     const ft = Math.round(altM * 3.2808399);
     if (!forceFeet && ft >= 18_000) {
       const fl = Math.round(ft / 100);
@@ -126,7 +126,11 @@ export function formatAzEl(azimuthDeg: number, elevationDeg: number): {
 
 export function formatDoppler(dopplerHz: number): string {
   if (!Number.isFinite(dopplerHz)) return '—';
-  const rounded = Math.round(dopplerHz);
-  const sign = rounded > 0 ? '+' : '';
-  return `${sign}${rounded.toLocaleString()} Hz`;
+  if (Math.abs(dopplerHz) < 0.5) return '0 Hz';
+  const sign = dopplerHz > 0 ? '+' : '-';
+  const absHz = Math.abs(dopplerHz);
+  if (absHz >= 1000) {
+    return `${sign}${(absHz / 1000).toFixed(2)} kHz`;
+  }
+  return `${sign}${Math.round(absHz)} Hz`;
 }

@@ -274,10 +274,12 @@ export async function fetchBalloons(
     ),
   ]);
 
+  const partialErrors = [sondesRes, amateurRes]
+    .filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+    .map((r) => (r.reason instanceof Error ? r.reason.message : String(r.reason)));
+
   if (sondesRes.status === 'rejected' && amateurRes.status === 'rejected') {
-    const msg = [sondesRes.reason, amateurRes.reason]
-      .map((r) => (r instanceof Error ? r.message : String(r)))
-      .join(' | ');
+    const msg = partialErrors.join(' | ');
     return {
       entities: [],
       status: 'error',
@@ -348,10 +350,14 @@ export async function fetchBalloons(
     if (sondesRes.status === 'fulfilled') {
       try {
         const widenedUrl = `https://api.v2.sondehub.org/sondes?lat=${latStr}&lon=${lonStr}&distance=${WIDENED_SEARCH_METERS}&last=10800`;
-        const widenedPayload = await fetchJsonWithTimeout<unknown>(widenedUrl, {
-          timeoutMs: 3500,
-          signal: options.signal,
-        });
+        const widenedPayload = await balloonsCircuitBreaker.execute(
+          () =>
+            fetchJsonWithTimeout<unknown>(widenedUrl, {
+              timeoutMs: 3500,
+              signal: options.signal,
+            }),
+          'sondehub-widened'
+        );
         for (const item of extractRecordsFromPayload(widenedPayload)) {
           const entity = normalizeSondeRecord(item.raw, observer, {
             isAmateur: false,
@@ -379,9 +385,10 @@ export async function fetchBalloons(
 
   return {
     entities,
-    status: 'live',
+    status: sondesRes.status === 'rejected' && entities.length === 0 ? 'error' : 'live',
     provider: 'sondehub-v2',
     timestampMs: Date.now(),
     nearestSondeHint,
+    errorMsg: partialErrors.length > 0 ? partialErrors.join(' | ') : undefined,
   };
 }

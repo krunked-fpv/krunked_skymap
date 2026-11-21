@@ -153,10 +153,11 @@ export function computeTopocentricLookAngles(
   let elevationDeg = Math.atan2(u, horizM) * RAD_TO_DEG;
   const azimuthDeg = horizM < 1e-9 ? 0 : normalizeAzimuthDeg(Math.atan2(e, n) * RAD_TO_DEG);
 
-  // Apply Bennett atmospheric refraction only near/above the horizon to avoid the -4.4 deg pole.
-  if (applyRefraction && elevationDeg > -1 && elevationDeg < 89.8) {
+  // Apply Bennett atmospheric refraction with a smooth ramp across [-2.0, -0.5] deg near the horizon.
+  if (applyRefraction && elevationDeg > -2.0 && elevationDeg < 89.8) {
+    const ramp = elevationDeg >= -0.5 ? 1 : Math.max(0, Math.min(1, (elevationDeg + 2.0) / 1.5));
     const argDeg = elevationDeg + 7.31 / (elevationDeg + 4.4);
-    const refractionDeg = 1 / Math.tan(argDeg * DEG_TO_RAD) / 60;
+    const refractionDeg = (1 / Math.tan(argDeg * DEG_TO_RAD) / 60) * ramp;
     if (Number.isFinite(refractionDeg) && refractionDeg > 0) {
       elevationDeg = Math.min(90, elevationDeg + refractionDeg);
     }
@@ -450,19 +451,23 @@ export function geodesicCirclePolygon(
     const poleLat = enclosesNorthPole ? 90 : -90;
     const split = splitAntimeridianLine([...rawPoints, rawPoints[0]]);
     if (split.length >= 2) {
-      const merged = [...split[split.length - 1], ...split[0].slice(1)];
+      const ordered = [...split[split.length - 1], ...split[0].slice(1)];
       for (let i = 1; i < split.length - 1; i++) {
-        merged.push(...split[i]);
+        ordered.push(...split[i].slice(1));
       }
-      const startPt = merged[0];
-      const endPt = merged[merged.length - 1];
+      const startPt = ordered[0];
+      const endPt = ordered[ordered.length - 1];
       const endEdgeLon = endPt[0] < 0 ? -180 : 180;
       const startEdgeLon = startPt[0] < 0 ? -180 : 180;
-      merged.push([endEdgeLon, poleLat]);
+      ordered.push([endEdgeLon, poleLat]);
       if (startEdgeLon !== endEdgeLon) {
-        merged.push([startEdgeLon, poleLat]);
+        const midSteps = endEdgeLon < startEdgeLon ? [-90, 0, 90] : [90, 0, -90];
+        for (const lonStep of midSteps) {
+          ordered.push([lonStep, poleLat]);
+        }
+        ordered.push([startEdgeLon, poleLat]);
       }
-      const closed = finalizeClosedRing(merged, 0);
+      const closed = finalizeClosedRing(ordered, 0);
       return closed ? [closed] : [];
     }
     const closed = finalizeClosedRing(rawPoints, 0);

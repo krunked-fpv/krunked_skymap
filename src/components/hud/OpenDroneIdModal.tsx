@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { AlertTriangle, Check, Copy, Radio, Wifi, WifiOff, X } from 'lucide-react';
 import { useSkyStore } from '../../store/useSkyStore';
 
@@ -32,6 +32,15 @@ export function OpenDroneIdModal() {
   const [urlInput, setUrlInput] = useState(odidConfig.endpointUrl);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [schemaCopied, setSchemaCopied] = useState(false);
+  const copyTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current !== null) {
+        window.clearTimeout(copyTimeoutRef.current);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (odidModalOpen) {
@@ -107,7 +116,13 @@ export function OpenDroneIdModal() {
       if (navigator.clipboard?.writeText) {
         await navigator.clipboard.writeText(ASTM_F3411_SAMPLE);
         setSchemaCopied(true);
-        window.setTimeout(() => setSchemaCopied(false), 1800);
+        if (copyTimeoutRef.current !== null) {
+          window.clearTimeout(copyTimeoutRef.current);
+        }
+        copyTimeoutRef.current = window.setTimeout(() => {
+          setSchemaCopied(false);
+          copyTimeoutRef.current = null;
+        }, 1800);
       }
     } catch {
       // Ignore clipboard failures in restricted frames

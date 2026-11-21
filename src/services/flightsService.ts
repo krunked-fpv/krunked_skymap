@@ -79,7 +79,13 @@ export const flightsCircuitBreaker = new CircuitBreaker({
 
 const lastCachedFlightsByKey = new Map<
   string,
-  { entities: FlightEntity[]; provider: string; timestampMs: number }
+  {
+    entities: FlightEntity[];
+    status: 'live' | 'fallback';
+    provider: string;
+    timestampMs: number;
+    errorMsg?: string;
+  }
 >();
 
 export function clearFlightsServiceCache(): void {
@@ -200,28 +206,6 @@ const PROP_TYPE_PREFIXES = new Set([
   'SF34',
 ]);
 
-const FAST_MIL_TYPE_PREFIXES = new Set([
-  'F15',
-  'F16',
-  'F18',
-  'FA18',
-  'F22',
-  'F35',
-  'T38',
-  'T6',
-  'T45',
-  'EUFI',
-  'RFAL',
-  'GRIP',
-  'B1',
-  'B2',
-  'B52',
-  'A10',
-  'U2',
-  'MQ9',
-  'RQ4',
-]);
-
 function deriveCountryFromIcaoHex(hex: string): string {
   const clean = hex.replace(/^~/, '').toLowerCase();
   const num = Number.parseInt(clean, 16);
@@ -283,13 +267,6 @@ function classifyAirframeClass(
     return 'heli';
   }
   if (isMilitary) {
-    if (
-      FAST_MIL_TYPE_PREFIXES.has(t) ||
-      FAST_MIL_TYPE_PREFIXES.has(t.slice(0, 3)) ||
-      speedMs > 220
-    ) {
-      return 'fast-mil';
-    }
     return 'fast-mil';
   }
   if (
@@ -720,16 +697,19 @@ export async function fetchFlightsCascade(
   const latStr = observer.lat.toFixed(4);
   const lonStr = observer.lon.toFixed(4);
   const radiusNm = Math.max(1, Math.min(250, Math.round(radiusKm / 1.852)));
-  const rateKey = options.rateLimitKey ?? `adsb:${observer.lat.toFixed(2)},${observer.lon.toFixed(2)}`;
+  const rateKey =
+    options.rateLimitKey ??
+    `adsb:${observer.lat.toFixed(2)},${observer.lon.toFixed(2)}:r${Math.round(radiusKm)}`;
 
   if (!options.force && !adsbRateLimiter.tryConsume(rateKey)) {
     const cached = lastCachedFlightsByKey.get(rateKey);
     if (cached) {
       return {
         entities: cached.entities,
-        status: 'cached',
+        status: cached.status === 'fallback' ? 'fallback' : 'cached',
         provider: cached.provider,
         timestampMs: cached.timestampMs,
+        errorMsg: cached.errorMsg,
       };
     }
     if (prevMap.size > 0) {
@@ -740,6 +720,12 @@ export async function fetchFlightsCascade(
         timestampMs: Date.now(),
       };
     }
+    return {
+      entities: [],
+      status: 'cached',
+      provider: 'rate-limit-cooldown',
+      timestampMs: Date.now(),
+    };
   }
 
   const errors: string[] = [];
@@ -784,6 +770,7 @@ export async function fetchFlightsCascade(
       }
       lastCachedFlightsByKey.set(rateKey, {
         entities,
+        status: 'live',
         provider: providerLabel,
         timestampMs: nowMs,
       });
@@ -835,14 +822,17 @@ export async function fetchFlightsCascade(
   if (flightsCircuitBreaker.canExecute('opensky')) {
     try {
       const dLat = radiusKm / 111.32;
-      const cosLat = Math.max(0.1, Math.cos((observer.lat * Math.PI) / 180));
+      const cosLat = Math.max(0.05, Math.cos((observer.lat * Math.PI) / 180));
       const dLon = radiusKm / (111.32 * cosLat);
       const lamin = Math.max(-90, observer.lat - dLat).toFixed(4);
       const lamax = Math.min(90, observer.lat + dLat).toFixed(4);
-      const lomin = Math.max(-180, observer.lon - dLon).toFixed(4);
-      const lomax = Math.min(180, observer.lon + dLon).toFixed(4);
+      const wideLon = Math.abs(observer.lat) > 85 || dLon >= 180;
+      const lomin = wideLon ? '-180.0000' : normalizeLonDeg(observer.lon - dLon).toFixed(4);
+      const lomax = wideLon ? '180.0000' : normalizeLonDeg(observer.lon + dLon).toFixed(4);
+      const effectiveMinLon = Number(lomin) > Number(lomax) ? '-180.0000' : lomin;
+      const effectiveMaxLon = Number(lomin) > Number(lomax) ? '180.0000' : lomax;
 
-      const openSkyUrl = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${lomin}&lamax=${lamax}&lomax=${lomax}`;
+      const openSkyUrl = `https://opensky-network.org/api/states/all?lamin=${lamin}&lomin=${effectiveMinLon}&lamax=${lamax}&lomax=${effectiveMaxLon}`;
       const data = await flightsCircuitBreaker.execute(
         () =>
           fetchJsonWithTimeout<{ states?: unknown }>(openSkyUrl, {
@@ -873,6 +863,7 @@ export async function fetchFlightsCascade(
       if (entities.length > 0) {
         lastCachedFlightsByKey.set(rateKey, {
           entities,
+          status: 'live',
           provider: 'opensky-network',
           timestampMs: nowMs,
         });
@@ -913,11 +904,19 @@ export async function fetchFlightsCascade(
   }
 
   // Stage 4: Relative static fallback snapshot
-  return buildStaticFallbackResult(
+  const fallbackRes = await buildStaticFallbackResult(
     observer,
     radiusKm,
     prevMap,
     errors.length > 0 ? errors.join(' | ') : undefined,
     options.signal
   );
+  lastCachedFlightsByKey.set(rateKey, {
+    entities: fallbackRes.entities,
+    status: 'fallback',
+    provider: fallbackRes.provider,
+    timestampMs: fallbackRes.timestampMs,
+    errorMsg: fallbackRes.errorMsg,
+  });
+  return fallbackRes;
 }

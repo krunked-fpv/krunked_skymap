@@ -179,3 +179,26 @@ Toolchains verified inside `c:\krunked_skymap\.worktrees\astro-redteam`:
 - **Location:** [OpenDroneIdModal.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/OpenDroneIdModal.tsx#L110), [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L285-L294), [TacticalMap.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/map/TacticalMap.tsx#L117-L261), [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L75-L160)
 - **Root Cause:** `OpenDroneIdModal` leaves a `1800ms` `setTimeout` uncleaned on close/unmount; `classifyAirframeClass` has a redundant branch returning `'fast-mil'`; `TacticalMap` and `PolarSkyDome` reimplement `geodesy.ts` primitives locally.
 - **Surgical Fix:** Store/clear timeout ref in `OpenDroneIdModal`, collapse redundant branch in `classifyAirframeClass`, and reuse `src/math/geodesy.ts` in UI components.
+
+
+---
+
+## Round 2 — Remediation & Verification Sign-Off
+
+All 18 findings (`[DEFECT-01]`..`[DEFECT-18]`) identified in Round 1 were surgically remediated on `main`:
+
+| Defect IDs | Files Updated | Verification Status |
+| :--- | :--- | :--- |
+| `[DEFECT-01]`, `[DEFECT-17]` | `src/workers/astro.worker.ts` | Fixed & Verified (`chaos.test.ts` Challenge 3 green; `-12°` pass-arc clipping margin) |
+| `[DEFECT-02]`, `[DEFECT-16]` | `src/math/geodesy.ts` | Fixed & Verified (`chaos.test.ts` Challenge 1 & 2 green; smooth polar closure & Bennett ramp) |
+| `[DEFECT-03]`, `[DEFECT-04]`, `[DEFECT-05]`, `[DEFECT-06]`, `[DEFECT-08]`, `[DEFECT-15]` | `src/App.tsx` | Fixed & Verified (`sat-` prefix match + `workerReady` dependency, `21_600_000 ms` balloon window, `alt`/`label` permalink + `hashchange`, WS merge + disconnect cleanup, centralized audio + `dispose()`) |
+| `[DEFECT-05]`, `[DEFECT-11]`, `[DEFECT-18]` | `src/components/inspector/unitFormatters.ts`, `TargetInspector.tsx`, `ControlDock.tsx`, `OpenDroneIdModal.tsx` | Fixed & Verified (consistent orbital km / km/s / kHz formatting, permalink `alt`/`label`, post-pick dropdown suppression, timeout cleanup) |
+| `[DEFECT-07]`, `[DEFECT-08]`, `[DEFECT-12]`, `[DEFECT-18]` | `src/components/skydome/PolarSkyDome.tsx`, `src/components/map/TacticalMap.tsx` | Fixed & Verified (shared `geodesy.ts` integration, `layers.satellite` OrbitOverlay gating, hidden-pane idle skip, clean hover/cursor reset) |
+| `[DEFECT-06]`, `[DEFECT-09]`, `[DEFECT-13]`, `[DEFECT-14]`, `[DEFECT-18]` | `src/services/flightsService.ts`, `airspaceService.ts`, `balloonsService.ts`, `openDroneIdService.ts` | Fixed & Verified (status-preserving rate-limiter cache, primary UASFM fallback guard, `LOWER_VAL` floor checks, 120s ODID stale pruning) |
+| `[DEFECT-10]` | `src/workers/astroClient.ts` | Fixed & Verified (`computeOrbit` & `initTles` promises reject cleanly on worker `error` messages) |
+
+### Final Open Defect Tally
+- **Critical:** **0**
+- **High:** **0**
+- **Medium:** **0**
+- **Low:** **0**

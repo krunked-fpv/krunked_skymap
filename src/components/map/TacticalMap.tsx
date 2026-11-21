@@ -12,6 +12,13 @@ import {
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
 import { registerTacticalSprites, resolveSpriteForEntity } from '../../assets/sprites/tacticalSprites';
+import {
+  geodesicCirclePolygon,
+  greatCircleDestination,
+  haversineDistanceKm,
+  normalizeLonDeg,
+  splitAntimeridianLine,
+} from '../../math/geodesy';
 
 export interface TacticalMapProps {
   className?: string;
@@ -32,9 +39,7 @@ interface HoverTooltipState {
   alertTag: string | null;
 }
 
-const EARTH_RADIUS_KM = 6371.0088;
 const DEG_TO_RAD = Math.PI / 180;
-const RAD_TO_DEG = 180 / Math.PI;
 
 const EMPTY_FC: GeoJSON.FeatureCollection = {
   type: 'FeatureCollection',
@@ -114,150 +119,23 @@ const TACTICAL_STYLE: maplibregl.StyleSpecification = {
   ],
 };
 
-function normalizeLonDeg(lon: number): number {
-  if (!Number.isFinite(lon)) return 0;
-  let normalized = (((lon + 180) % 360) + 360) % 360 - 180;
-  if (normalized === -180 && lon > 0) normalized = 180;
-  return normalized;
-}
-
-function haversineDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  if (
-    !Number.isFinite(lat1) ||
-    !Number.isFinite(lon1) ||
-    !Number.isFinite(lat2) ||
-    !Number.isFinite(lon2)
-  ) {
-    return 0;
-  }
-  const phi1 = lat1 * DEG_TO_RAD;
-  const phi2 = lat2 * DEG_TO_RAD;
-  const dPhi = (lat2 - lat1) * DEG_TO_RAD;
-  const dLambda = (lon2 - lon1) * DEG_TO_RAD;
-  const sinDPhi = Math.sin(dPhi * 0.5);
-  const sinDLambda = Math.sin(dLambda * 0.5);
-  const a = Math.max(
-    0,
-    Math.min(1, sinDPhi * sinDPhi + Math.cos(phi1) * Math.cos(phi2) * sinDLambda * sinDLambda)
-  );
-  return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(a));
-}
-
-function greatCircleDestination(
-  latDeg: number,
-  lonDeg: number,
-  bearingDeg: number,
-  distKm: number
-): { lat: number; lon: number } {
-  const delta = distKm / EARTH_RADIUS_KM;
-  const theta = bearingDeg * DEG_TO_RAD;
-  const phi1 = latDeg * DEG_TO_RAD;
-  const lambda1 = lonDeg * DEG_TO_RAD;
-
-  const sinPhi1 = Math.sin(phi1);
-  const cosPhi1 = Math.cos(phi1);
-  const sinDelta = Math.sin(delta);
-  const cosDelta = Math.cos(delta);
-
-  const sinPhi2 = Math.max(-1, Math.min(1, sinPhi1 * cosDelta + cosPhi1 * sinDelta * Math.cos(theta)));
-  const phi2 = Math.asin(sinPhi2);
-  const y = Math.sin(theta) * sinDelta * cosPhi1;
-  const x = cosDelta - sinPhi1 * sinPhi2;
-  const lambda2 = lambda1 + Math.atan2(y, x);
-
-  return {
-    lat: phi2 * RAD_TO_DEG,
-    lon: normalizeLonDeg(lambda2 * RAD_TO_DEG),
-  };
-}
-
-function splitAntimeridianLine(coords: Array<[number, number]>): Array<Array<[number, number]>> {
-  const valid: Array<[number, number]> = [];
-  for (const pt of coords) {
-    if (pt && Number.isFinite(pt[0]) && Number.isFinite(pt[1])) {
-      valid.push([normalizeLonDeg(pt[0]), Math.max(-89.999, Math.min(89.999, pt[1]))]);
-    }
-  }
-  if (valid.length < 2) return [];
-
-  const segments: Array<Array<[number, number]>> = [];
-  let current: Array<[number, number]> = [valid[0]];
-
-  for (let i = 1; i < valid.length; i++) {
-    const [lonA, latA] = valid[i - 1];
-    const [lonB, latB] = valid[i];
-    const diff = lonB - lonA;
-
-    if (Math.abs(diff) > 180) {
-      if (lonA >= 0 && lonB < 0) {
-        const lonBUnwrapped = lonB + 360;
-        const span = lonBUnwrapped - lonA;
-        const t = span !== 0 ? Math.max(0, Math.min(1, (180 - lonA) / span)) : 0.5;
-        const latCross = latA + t * (latB - latA);
-        if (current[current.length - 1][0] !== 180) {
-          current.push([180, latCross]);
-        }
-        if (current.length >= 2) segments.push(current);
-        current = [
-          [-180, latCross],
-          [lonB, latB],
-        ];
-      } else {
-        const lonBUnwrapped = lonB - 360;
-        const span = lonBUnwrapped - lonA;
-        const t = span !== 0 ? Math.max(0, Math.min(1, (-180 - lonA) / span)) : 0.5;
-        const latCross = latA + t * (latB - latA);
-        if (current[current.length - 1][0] !== -180) {
-          current.push([-180, latCross]);
-        }
-        if (current.length >= 2) segments.push(current);
-        current = [
-          [180, latCross],
-          [lonB, latB],
-        ];
-      }
-    } else {
-      current.push([lonB, latB]);
-    }
-  }
-
-  if (current.length >= 2) {
-    segments.push(current);
-  }
-  return segments;
-}
-
 function buildGeodesicCircle(
   latDeg: number,
   lonDeg: number,
   radiusKm: number,
   steps = 96
-): { segments: Array<Array<[number, number]>>; closedRing: Array<[number, number]> | null } {
-  if (!Number.isFinite(latDeg) || !Number.isFinite(lonDeg) || !Number.isFinite(radiusKm) || radiusKm <= 0) {
-    return { segments: [], closedRing: null };
-  }
-  const ring: Array<[number, number]> = [];
-  let crossesAntimeridian = false;
-
-  for (let i = 0; i <= steps; i++) {
-    const bearing = (i / steps) * 360;
-    const pt = greatCircleDestination(latDeg, lonDeg, bearing, radiusKm);
-    const coord: [number, number] = [pt.lon, Math.max(-85.05, Math.min(85.05, pt.lat))];
-    if (ring.length > 0 && Math.abs(coord[0] - ring[ring.length - 1][0]) > 180) {
-      crossesAntimeridian = true;
+): {
+  polygons: Array<Array<[number, number]>>;
+  segments: Array<Array<[number, number]>>;
+} {
+  const polygons = geodesicCirclePolygon(latDeg, lonDeg, radiusKm, steps);
+  const segments: Array<Array<[number, number]>> = [];
+  for (const ring of polygons) {
+    for (const seg of splitAntimeridianLine(ring)) {
+      segments.push(seg);
     }
-    ring.push(coord);
   }
-
-  if (ring.length > 1) {
-    ring[ring.length - 1] = [ring[0][0], ring[0][1]];
-  }
-
-  const segments = splitAntimeridianLine(ring);
-  return {
-    segments,
-    closedRing: !crossesAntimeridian && segments.length === 1 ? ring : null,
-  };
+  return { polygons, segments };
 }
 
 function zoomForRadiusKm(radiusKm: number, latDeg = 38): number {
@@ -374,13 +252,13 @@ function buildScanRingFc(lat: number, lon: number, radiusKm: number): GeoJSON.Fe
   const half = buildGeodesicCircle(lat, lon, radiusKm * 0.5, 96);
   const features: GeoJSON.Feature[] = [];
 
-  if (outer.closedRing) {
+  if (outer.polygons.length > 0) {
     features.push({
       type: 'Feature',
       properties: { kind: 'outer-fill' },
       geometry: {
-        type: 'Polygon',
-        coordinates: [outer.closedRing],
+        type: 'MultiPolygon',
+        coordinates: outer.polygons.map((r) => [r]),
       },
     });
   }
@@ -425,9 +303,9 @@ function buildObserverFc(lat: number, lon: number, label: string): GeoJSON.Featu
   };
 }
 
-function buildOrbitOverlayFc(): GeoJSON.FeatureCollection {
+function buildOrbitOverlayFc(satelliteLayerVisible: boolean): GeoJSON.FeatureCollection {
   const overlay = liveKinematicsRegistry.orbitOverlay;
-  if (!overlay) return EMPTY_FC;
+  if (!satelliteLayerVisible || !overlay) return EMPTY_FC;
 
   const features: GeoJSON.Feature[] = [];
   const trackSegments: Array<Array<[number, number]>> = [];
@@ -461,13 +339,13 @@ function buildOrbitOverlayFc(): GeoJSON.FeatureCollection {
       Math.min(overlay.footprintRadiusKm, 9500),
       96
     );
-    if (footprint.closedRing) {
+    if (footprint.polygons.length > 0) {
       features.push({
         type: 'Feature',
         properties: { kind: 'footprint-fill', noradId: overlay.noradId },
         geometry: {
-          type: 'Polygon',
-          coordinates: [footprint.closedRing],
+          type: 'MultiPolygon',
+          coordinates: footprint.polygons.map((r) => [r]),
         },
       });
     }
@@ -1147,6 +1025,16 @@ export function TacticalMap({ className }: TacticalMapProps) {
       if (!activeMap || !mapLoadedRef.current) return;
 
       const state = useSkyStore.getState();
+      if (state.layout === 'dome') {
+        lastEntityVersion = -1;
+        if (hoverCoordsRef.current !== null) {
+          hoverCoordsRef.current = null;
+          setHoverTip(null);
+          activeMap.getCanvas().style.cursor = '';
+        }
+        return;
+      }
+
       const layersKey = `${state.layers.flight}-${state.layers.military}-${state.layers.satellite}-${state.layers.balloon}-${state.layers.drone}`;
       const versionChanged = liveKinematicsRegistry.version !== lastEntityVersion;
       const stateChanged =
@@ -1188,14 +1076,15 @@ export function TacticalMap({ className }: TacticalMapProps) {
         )?.setData(buildTrailsAndVectorsFc(state.layers));
       }
 
-      // Orbit overlay update (on overlay change or every ~120ms for moving footprint)
-      const overlayChanged = liveKinematicsRegistry.orbitOverlay !== lastOrbitOverlayRef;
+      // Orbit overlay update (on overlay change, layer toggle, or every ~120ms for moving footprint)
+      const overlayChanged =
+        liveKinematicsRegistry.orbitOverlay !== lastOrbitOverlayRef || stateChanged;
       if (overlayChanged || (liveKinematicsRegistry.orbitOverlay && versionChanged)) {
         lastOrbitOverlayRef = liveKinematicsRegistry.orbitOverlay;
         const orbitSrc = activeMap.getSource(SOURCE_IDS.orbitOverlay) as
           | maplibregl.GeoJSONSource
           | undefined;
-        orbitSrc?.setData(buildOrbitOverlayFc());
+        orbitSrc?.setData(buildOrbitOverlayFc(state.layers.satellite));
       }
 
       // Smooth camera follow when followSelected is enabled
@@ -1227,11 +1116,15 @@ export function TacticalMap({ className }: TacticalMapProps) {
       if (hc && nowMs - lastTipSyncMs >= 200) {
         lastTipSyncMs = nowMs;
         const hoveredEntity = liveKinematicsRegistry.entities.get(hc.id);
-        if (hoveredEntity) {
+        if (hoveredEntity && state.layers[hoveredEntity.category]) {
           setHoverTip(buildHoverTooltip(hoveredEntity, hc.x, hc.y, state.units));
         } else {
           hoverCoordsRef.current = null;
           setHoverTip(null);
+          activeMap.getCanvas().style.cursor = '';
+          if (state.hoveredId === hc.id) {
+            state.setHoveredId(null);
+          }
         }
       }
     };

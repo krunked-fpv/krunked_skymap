@@ -9,16 +9,11 @@ import {
   type SkyEntity,
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
-import { tacticalAudio } from '../../audio/tacticalAudio';
+import { computeTopocentricLookAngles, greatCircleDestination } from '../../math/geodesy';
 
 export interface PolarSkyDomeProps {
   className?: string;
 }
-
-const WGS84_A = 6378137.0;
-const WGS84_F = 1 / 298.257223563;
-const WGS84_E2 = WGS84_F * (2 - WGS84_F);
-const EARTH_MEAN_RADIUS_KM = 6371.0;
 
 const EL_MAX = 90;
 const EL_MIN = -5;
@@ -71,93 +66,6 @@ const COMPASS_BEACONS: Array<{ label: string; azDeg: number; cardinal: boolean }
   { label: 'W', azDeg: 270, cardinal: true },
   { label: 'NW', azDeg: 315, cardinal: false },
 ];
-
-function computeLookAnglesWgs84(
-  obsLatDeg: number,
-  obsLonDeg: number,
-  obsAltM: number,
-  tgtLatDeg: number,
-  tgtLonDeg: number,
-  tgtAltM: number
-): { azDeg: number; elDeg: number } | null {
-  if (
-    !Number.isFinite(obsLatDeg) ||
-    !Number.isFinite(obsLonDeg) ||
-    !Number.isFinite(obsAltM) ||
-    !Number.isFinite(tgtLatDeg) ||
-    !Number.isFinite(tgtLonDeg) ||
-    !Number.isFinite(tgtAltM)
-  ) {
-    return null;
-  }
-
-  const oLat = (obsLatDeg * Math.PI) / 180;
-  const oLon = (obsLonDeg * Math.PI) / 180;
-  const oSinLat = Math.sin(oLat);
-  const oCosLat = Math.cos(oLat);
-  const oSinLon = Math.sin(oLon);
-  const oCosLon = Math.cos(oLon);
-  const oN = WGS84_A / Math.sqrt(1 - WGS84_E2 * oSinLat * oSinLat);
-  const ox = (oN + obsAltM) * oCosLat * oCosLon;
-  const oy = (oN + obsAltM) * oCosLat * oSinLon;
-  const oz = (oN * (1 - WGS84_E2) + obsAltM) * oSinLat;
-
-  const tLat = (tgtLatDeg * Math.PI) / 180;
-  const tLon = (tgtLonDeg * Math.PI) / 180;
-  const tSinLat = Math.sin(tLat);
-  const tCosLat = Math.cos(tLat);
-  const tSinLon = Math.sin(tLon);
-  const tCosLon = Math.cos(tLon);
-  const tN = WGS84_A / Math.sqrt(1 - WGS84_E2 * tSinLat * tSinLat);
-  const tx = (tN + tgtAltM) * tCosLat * tCosLon;
-  const ty = (tN + tgtAltM) * tCosLat * tSinLon;
-  const tz = (tN * (1 - WGS84_E2) + tgtAltM) * tSinLat;
-
-  const dx = tx - ox;
-  const dy = ty - oy;
-  const dz = tz - oz;
-
-  if (Math.hypot(dx, dy, dz) < 1e-2) {
-    return { azDeg: 0, elDeg: 90 };
-  }
-
-  const e = -oSinLon * dx + oCosLon * dy;
-  const n = -oSinLat * oCosLon * dx - oSinLat * oSinLon * dy + oCosLat * dz;
-  const u = oCosLat * oCosLon * dx + oCosLat * oSinLon * dy + oSinLat * dz;
-
-  const horiz = Math.hypot(e, n);
-  const azDeg = (((Math.atan2(e, n) * 180) / Math.PI) + 360) % 360;
-  const elDeg = (Math.atan2(u, horiz) * 180) / Math.PI;
-  return { azDeg, elDeg };
-}
-
-function greatCircleStep(
-  latDeg: number,
-  lonDeg: number,
-  bearingDeg: number,
-  distKm: number
-): { lat: number; lon: number } {
-  const angularDist = distKm / EARTH_MEAN_RADIUS_KM;
-  const bearing = (bearingDeg * Math.PI) / 180;
-  const lat1 = (latDeg * Math.PI) / 180;
-  const lon1 = (lonDeg * Math.PI) / 180;
-
-  const sinLat1 = Math.sin(lat1);
-  const cosLat1 = Math.cos(lat1);
-  const sinAd = Math.sin(angularDist);
-  const cosAd = Math.cos(angularDist);
-
-  const sinLat2 = sinLat1 * cosAd + cosLat1 * sinAd * Math.cos(bearing);
-  const lat2 = Math.asin(Math.max(-1, Math.min(1, sinLat2)));
-  const y = Math.sin(bearing) * sinAd * cosLat1;
-  const x = cosAd - sinLat1 * Math.sin(lat2);
-  const lon2 = lon1 + Math.atan2(y, x);
-
-  return {
-    lat: (lat2 * 180) / Math.PI,
-    lon: ((((lon2 * 180) / Math.PI) + 540) % 360) - 180,
-  };
-}
 
 function elToRadius(elDeg: number, outerRadius: number): number {
   const clamped = Math.max(EL_MIN, Math.min(EL_MAX, elDeg));
@@ -214,11 +122,13 @@ function projectHeadingAngle(
   }
 
   const stepKm = entity.category === 'satellite' ? 18 : 2;
-  const fwd = greatCircleStep(entity.lat, entity.lon, headingDeg, stepKm);
-  const look = computeLookAnglesWgs84(obsLat, obsLon, obsAltM, fwd.lat, fwd.lon, entity.altM);
-  if (!look) return fallbackAngle;
-
-  const pt = azElToCanvas(look.azDeg, look.elDeg, cx, cy, outerRadius);
+  const fwd = greatCircleDestination(entity.lat, entity.lon, headingDeg, stepKm);
+  const look = computeTopocentricLookAngles(
+    { lat: obsLat, lon: obsLon, altM: obsAltM },
+    { lat: fwd.lat, lon: fwd.lon, altM: entity.altM },
+    false
+  );
+  const pt = azElToCanvas(look.azimuthDeg, look.elevationDeg, cx, cy, outerRadius);
   const dx = pt.x - baseX;
   const dy = pt.y - baseY;
   if (Math.hypot(dx, dy) < 0.25) return fallbackAngle;
@@ -865,10 +775,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const renderedHitsRef = useRef<RenderedTargetHit[]>([]);
   const polarTrailsRef = useRef<Map<string, PolarPoint[]>>(new Map());
   const lastTrailSampleRef = useRef<Map<string, number>>(new Map());
-  const zenithChimedRef = useRef<Set<string>>(new Set());
-  const hazardAlertedRef = useRef<Set<string>>(new Set());
-  const audioStabilizeUntilRef = useRef<number>(0);
   const lastObserverKeyRef = useRef<string>('');
+  const pointerInsideRef = useRef<boolean>(false);
   const sweepAzRef = useRef<number>(0);
   const lastFrameMsRef = useRef<number>(0);
   const pulseWaveStartRef = useRef<number | null>(null);
@@ -888,7 +796,6 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     if (sweepPulseCounter > prevPulseCounterRef.current) {
       prevPulseCounterRef.current = sweepPulseCounter;
       pulseWaveStartRef.current = performance.now();
-      tacticalAudio.playSweepPulse();
     } else {
       prevPulseCounterRef.current = sweepPulseCounter;
     }
@@ -898,6 +805,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
+    canvas.style.cursor = 'crosshair';
 
     const updateCanvasSize = (width: number, height: number) => {
       if (width <= 0 || height <= 0) {
@@ -964,20 +872,18 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       lastFrameMsRef.current = nowMs;
 
       const state = useSkyStore.getState();
+      if (state.layout === 'map') return;
 
       if (state.sweepEnabled) {
         sweepAzRef.current = (sweepAzRef.current + dtMs * SWEEP_DEG_PER_MS) % 360;
       }
 
-      // Reset trail caches & audio stabilization window on observer change
+      // Reset trail caches on observer change
       const obsKey = `${state.observer.lat.toFixed(4)},${state.observer.lon.toFixed(4)}`;
       if (obsKey !== lastObserverKeyRef.current) {
         lastObserverKeyRef.current = obsKey;
         polarTrailsRef.current.clear();
         lastTrailSampleRef.current.clear();
-        zenithChimedRef.current.clear();
-        hazardAlertedRef.current.clear();
-        audioStabilizeUntilRef.current = nowMs + 1500;
       }
 
       if (
@@ -998,8 +904,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         nowMs
       );
 
-      // 2. Selected satellite pass arc & TCA star
-      if (liveKinematicsRegistry.orbitOverlay) {
+      // 2. Selected satellite pass arc & TCA star (gated on satellite layer visibility)
+      if (state.layers.satellite && liveKinematicsRegistry.orbitOverlay) {
         drawOrbitPassArc(
           ctx,
           liveKinematicsRegistry.orbitOverlay,
@@ -1026,8 +932,6 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       }> = [];
 
       const activeIds = new Set<string>();
-      const canTriggerAutoAudio =
-        state.audioEnabled && nowMs > audioStabilizeUntilRef.current;
 
       liveKinematicsRegistry.entities.forEach((entity) => {
         if (!state.layers[entity.category]) return;
@@ -1043,31 +947,6 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         const isEmergency = Boolean(entity.emergencyFlag);
         const isBreach =
           entity.category === 'drone' && (entity.ceilingBreach || entity.tfrBreach);
-
-        // Track subtle event-driven acoustic cues on state transitions
-        if (entity.category === 'satellite') {
-          if (elDeg >= 65) {
-            if (!zenithChimedRef.current.has(entity.id)) {
-              zenithChimedRef.current.add(entity.id);
-              if (canTriggerAutoAudio) {
-                tacticalAudio.playZenithChime();
-              }
-            }
-          } else if (elDeg < 45) {
-            zenithChimedRef.current.delete(entity.id);
-          }
-        }
-
-        if (isEmergency || isBreach) {
-          if (!hazardAlertedRef.current.has(entity.id)) {
-            hazardAlertedRef.current.add(entity.id);
-            if (canTriggerAutoAudio) {
-              tacticalAudio.playAlertTone();
-            }
-          }
-        } else {
-          hazardAlertedRef.current.delete(entity.id);
-        }
 
         const pos = azElToCanvas(azDeg, elDeg, metrics.cx, metrics.cy, metrics.outerRadius);
         const color = getEntityColor(entity);
@@ -1152,23 +1031,20 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         ctx.save();
         ctx.globalAlpha = baseAlpha;
 
-        // Polar breadcrumb trail segment
+        // Polar breadcrumb trail segment (bounded to last few samples)
         if (entity.trail.length > 0) {
           const slice = entity.trail.slice(-MAX_TRAIL_SAMPLES);
           const projected: Array<{ x: number; y: number }> = [];
           for (const tp of slice) {
-            const look = computeLookAnglesWgs84(
-              state.observer.lat,
-              state.observer.lon,
-              state.observer.altM,
-              tp.lat,
-              tp.lon,
-              tp.altM
+            const look = computeTopocentricLookAngles(
+              state.observer,
+              { lat: tp.lat, lon: tp.lon, altM: tp.altM },
+              false
             );
-            if (look && look.elDeg >= -15) {
+            if (look.elevationDeg >= -15) {
               const p = azElToCanvas(
-                look.azDeg,
-                look.elDeg,
+                look.azimuthDeg,
+                look.elevationDeg,
                 metrics.cx,
                 metrics.cy,
                 metrics.outerRadius
@@ -1276,6 +1152,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       }
 
       renderedHitsRef.current = nextHits;
+
+      if (
+        pointerInsideRef.current &&
+        state.hoveredId !== null &&
+        !nextHits.some((h) => h.id === state.hoveredId)
+      ) {
+        canvas.style.cursor = 'crosshair';
+        state.setHoveredId(null);
+      }
 
       // 4. Target callsign labels (highest priority first with non-overlapping collision boxes)
       const placedLabels: LabelBox[] = [];
@@ -1391,6 +1276,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       }
     }
 
+    pointerInsideRef.current = true;
     const hitId = findNearestHit(pt.px, pt.py);
     const canvas = canvasRef.current;
     if (canvas) {
@@ -1410,15 +1296,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     const hitId = findNearestHit(pt.px, pt.py);
     if (!hitId) return;
 
-    const store = useSkyStore.getState();
-    if (store.audioEnabled) {
-      void tacticalAudio.unlock();
-      tacticalAudio.playTargetLock();
-    }
-    store.selectEntity(hitId, true);
+    useSkyStore.getState().selectEntity(hitId, true);
   };
 
   const handleMouseLeave = () => {
+    pointerInsideRef.current = false;
     if (cursorReadoutRef.current) {
       cursorReadoutRef.current.textContent = 'AZ ---.-° · EL --.-°';
     }
@@ -1538,7 +1420,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         onMouseMove={handleMouseMove}
         onClick={handleClick}
         onMouseLeave={handleMouseLeave}
-        style={{ display: 'block', width: '100%', height: '100%', cursor: 'crosshair' }}
+        style={{ display: 'block', width: '100%', height: '100%' }}
       />
 
       {/* Top-Left Scope Header */}

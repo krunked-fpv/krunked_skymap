@@ -222,13 +222,10 @@ export async function fetchAirspace(
     }).then(validateFeatureCollection),
   ]);
 
-  const anySuccess =
-    uasfmRes.status === 'fulfilled' ||
-    suaRes.status === 'fulfilled' ||
-    boundaryRes.status === 'fulfilled';
+  const primaryUasfmOk = uasfmRes.status === 'fulfilled';
 
-  if (anySuccess) {
-    const uasfm = uasfmRes.status === 'fulfilled' ? uasfmRes.value : EMPTY_FC;
+  if (primaryUasfmOk) {
+    const uasfm = uasfmRes.value;
     const suaFeatures: GeoJSON.Feature[] = [];
     if (suaRes.status === 'fulfilled') suaFeatures.push(...suaRes.value.features);
     if (boundaryRes.status === 'fulfilled') suaFeatures.push(...boundaryRes.value.features);
@@ -256,10 +253,17 @@ export async function fetchAirspace(
       signal: options.signal,
     });
     const parsed = parseFallbackGeoJson(fallbackRaw);
+    const liveSuaFeatures: GeoJSON.Feature[] = [];
+    if (suaRes.status === 'fulfilled') liveSuaFeatures.push(...suaRes.value.features);
+    if (boundaryRes.status === 'fulfilled') liveSuaFeatures.push(...boundaryRes.value.features);
+
     return {
       airspace: {
         uasfm: parsed.uasfm,
-        sua: parsed.sua,
+        sua:
+          liveSuaFeatures.length > 0
+            ? { type: 'FeatureCollection', features: liveSuaFeatures }
+            : parsed.sua,
         usCoverage: true,
       },
       status: 'fallback',
@@ -306,6 +310,18 @@ function isLowAltitudeTfrOrRestricted(
   props: Record<string, unknown>,
   altAglFt: number
 ): boolean {
+  const lowerRaw = props.LOWER_VAL ?? props.lower_val;
+  let lowerFt: number | null = null;
+  if (typeof lowerRaw === 'number' && Number.isFinite(lowerRaw)) {
+    lowerFt = lowerRaw;
+  } else if (typeof lowerRaw === 'string' && /^\d+(\.\d+)?$/.test(lowerRaw.trim())) {
+    lowerFt = Number.parseFloat(lowerRaw.trim());
+  }
+
+  if (lowerFt !== null && lowerFt > Math.max(1200, altAglFt)) {
+    return false;
+  }
+
   const typeCode = String(
     props.TYPE_CODE ?? props.type_code ?? props.zoneType ?? props.CLASS ?? ''
   )
@@ -316,15 +332,11 @@ function isLowAltitudeTfrOrRestricted(
     return true;
   }
 
-  const lowerRaw = props.LOWER_VAL ?? props.lower_val;
-  if (typeof lowerRaw === 'number' && Number.isFinite(lowerRaw)) {
-    return lowerRaw <= Math.max(1200, altAglFt);
-  }
-  if (typeof lowerRaw === 'string' && /^\d+(\.\d+)?$/.test(lowerRaw.trim())) {
-    return Number.parseFloat(lowerRaw.trim()) <= Math.max(1200, altAglFt);
+  if (['A', 'W', 'MOA'].includes(typeCode) && lowerFt === null) {
+    return false;
   }
 
-  // Surface / unspecified floor hazard zones (or test features) breach at low altitude
+  // Surface / unspecified floor hazard zones (or generic test features) breach at low altitude
   return true;
 }
 

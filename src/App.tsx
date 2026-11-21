@@ -110,6 +110,8 @@ function buildUrlHashString(): string {
   const params = new URLSearchParams();
   params.set('lat', s.observer.lat.toFixed(4));
   params.set('lon', s.observer.lon.toFixed(4));
+  params.set('alt', String(Math.round(s.observer.altM)));
+  params.set('label', s.observer.label);
   params.set('r', String(s.radiusKm));
   const activeLayers = ALL_CATEGORIES.filter((cat) => s.layers[cat]);
   params.set('layers', activeLayers.join(','));
@@ -132,6 +134,7 @@ export default function App() {
   const units = useSkyStore((s) => s.units);
   const layout = useSkyStore((s) => s.layout);
   const selectedId = useSkyStore((s) => s.selectedId);
+  const workerReady = useSkyStore((s) => s.workerReady);
   const odidConfig = useSkyStore((s) => s.odidConfig);
   const airspace = useSkyStore((s) => s.airspace);
   const sweepPulseCounter = useSkyStore((s) => s.sweepPulseCounter);
@@ -193,7 +196,16 @@ export default function App() {
             // Permissions API unsupported — keep default hub
           });
       }
+      const handleHashChange = () => {
+        const nextPatch = parseUrlHashPatch();
+        if (nextPatch) {
+          useSkyStore.getState().hydrateFromUrlState(nextPatch);
+        }
+      };
+      window.addEventListener('hashchange', handleHashChange);
+      return () => window.removeEventListener('hashchange', handleHashChange);
     }
+    return undefined;
   }, []);
 
   // 2. Debounced URL Hash Permalink Synchronization
@@ -247,6 +259,7 @@ export default function App() {
       },
       onOrbitOverlay: (overlay) => {
         if (disposed) return;
+        if (useSkyStore.getState().selectedId !== `sat-${overlay.noradId}`) return;
         liveKinematicsRegistry.orbitOverlay = overlay;
         liveKinematicsRegistry.version += 1;
       },
@@ -337,14 +350,16 @@ export default function App() {
   // Compute satellite ground track & Sky-Dome pass arc when a satellite is selected
   useEffect(() => {
     const client = astroClientRef.current;
-    if (!selectedId || !selectedId.startsWith('sat:')) {
+    if (!selectedId || !selectedId.startsWith('sat-')) {
       liveKinematicsRegistry.orbitOverlay = null;
       return;
     }
 
     const noradId = Number.parseInt(selectedId.slice(4), 10);
-    if (!Number.isFinite(noradId) || !client) {
-      liveKinematicsRegistry.orbitOverlay = null;
+    if (!Number.isFinite(noradId) || !client || !workerReady) {
+      if (!Number.isFinite(noradId) || !client) {
+        liveKinematicsRegistry.orbitOverlay = null;
+      }
       return;
     }
 
@@ -357,7 +372,7 @@ export default function App() {
     }, 15_000);
 
     return () => window.clearInterval(timer);
-  }, [selectedId, observer]);
+  }, [selectedId, observer, workerReady]);
 
   // 4. Data Feed Runners (Flights, Balloons, FAA Airspace)
   const runFlightsRefresh = useCallback(async (force = false) => {
@@ -394,7 +409,16 @@ export default function App() {
       });
     } finally {
       flightsInFlightRef.current = false;
+      const handleHashChange = () => {
+        const nextPatch = parseUrlHashPatch();
+        if (nextPatch) {
+          useSkyStore.getState().hydrateFromUrlState(nextPatch);
+        }
+      };
+      window.addEventListener('hashchange', handleHashChange);
+      return () => window.removeEventListener('hashchange', handleHashChange);
     }
+    return undefined;
   }, []);
 
   const runBalloonsRefresh = useCallback(async () => {
@@ -432,7 +456,16 @@ export default function App() {
       });
     } finally {
       balloonsInFlightRef.current = false;
+      const handleHashChange = () => {
+        const nextPatch = parseUrlHashPatch();
+        if (nextPatch) {
+          useSkyStore.getState().hydrateFromUrlState(nextPatch);
+        }
+      };
+      window.addEventListener('hashchange', handleHashChange);
+      return () => window.removeEventListener('hashchange', handleHashChange);
     }
+    return undefined;
   }, []);
 
   const runAirspaceRefresh = useCallback(async () => {
@@ -461,7 +494,16 @@ export default function App() {
       });
     } finally {
       airspaceInFlightRef.current = false;
+      const handleHashChange = () => {
+        const nextPatch = parseUrlHashPatch();
+        if (nextPatch) {
+          useSkyStore.getState().hydrateFromUrlState(nextPatch);
+        }
+      };
+      window.addEventListener('hashchange', handleHashChange);
+      return () => window.removeEventListener('hashchange', handleHashChange);
     }
+    return undefined;
   }, []);
 
   // Debounced immediate sweep when observer or radius changes
@@ -509,11 +551,15 @@ export default function App() {
   useEffect(() => {
     const client = new OpenDroneIdClient(observer, airspace, {
       onDrones: (drones) => {
-        const nextMap = new Map<string, DroneEntity>();
+        const nowMs = Date.now();
         for (const d of drones) {
-          nextMap.set(d.id, d);
+          liveWebhookDronesRef.current.set(d.id, d);
         }
-        liveWebhookDronesRef.current = nextMap;
+        for (const [id, existing] of liveWebhookDronesRef.current.entries()) {
+          if (nowMs - existing.timestampMs > 120_000) {
+            liveWebhookDronesRef.current.delete(id);
+          }
+        }
       },
       onStatus: (status) => {
         useSkyStore.getState().updateOdidConfig({
@@ -532,6 +578,7 @@ export default function App() {
 
     return () => {
       client.disconnect();
+      liveWebhookDronesRef.current.clear();
       odidClientRef.current = null;
     };
   }, [odidConfig.endpointUrl, odidConfig.transport]);
@@ -560,18 +607,29 @@ export default function App() {
       }
 
       if (st.odidConfig.connected || liveWebhookDronesRef.current.size > 0) {
+        const nowMs = Date.now();
         for (const [id, drone] of liveWebhookDronesRef.current.entries()) {
+          if (nowMs - drone.timestampMs > 120_000) {
+            liveWebhookDronesRef.current.delete(id);
+            continue;
+          }
           const compliance = evaluateDroneAirspaceCompliance(
             drone.lat,
             drone.lon,
             drone.altAglM,
             st.airspace
           );
+          const emergencyFlag = compliance.tfrBreach
+            ? 'TFR / SUA INCURSION'
+            : compliance.ceilingBreach
+              ? `UASFM ${compliance.faaCeilingFt ?? 0}ft BREACH`
+              : undefined;
           combined.set(id, {
             ...drone,
             faaCeilingFt: compliance.faaCeilingFt,
             ceilingBreach: compliance.ceilingBreach,
             tfrBreach: compliance.tfrBreach,
+            emergencyFlag,
           });
         }
       }
@@ -719,17 +777,18 @@ export default function App() {
             counts[updated.category] += 1;
             counts.total += 1;
             if (topocentric.elevationDeg >= 30) counts.overhead += 1;
-            checkAcousticEvents(updated, true);
+            checkAcousticEvents(updated, st.audioEnabled);
           }
         }
       };
 
       pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 120_000);
-      pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 300_000);
+      pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 21_600_000);
       pushAtmospheric(liveKinematicsRegistry.rawDrones, 3, 60_000);
 
       // Orbital satellites: smooth micro-interpolation between 10Hz SGP4 Worker frames
       for (const [id, sat] of liveKinematicsRegistry.satellites.entries()) {
+        if (!st.satGroups[sat.group]) continue;
         const dtSec = Math.max(0, Math.min(0.25, (nowMs - sat.timestampMs) / 1000));
         const extrap =
           dtSec > 0.005
@@ -766,7 +825,7 @@ export default function App() {
           counts.satellite += 1;
           counts.total += 1;
           if (topocentric.elevationDeg >= 30) counts.overhead += 1;
-          checkAcousticEvents(updated, true);
+          checkAcousticEvents(updated, st.audioEnabled);
         }
       }
 
@@ -806,7 +865,10 @@ export default function App() {
     };
 
     rafId = window.requestAnimationFrame(stepKinematics);
-    return () => window.cancelAnimationFrame(rafId);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      tacticalAudio.dispose();
+    };
   }, []);
 
   // 8. Control Handlers
@@ -864,7 +926,16 @@ export default function App() {
       void tacticalAudio.unlock().then(() => {
         tacticalAudio.playTargetLock();
       });
+      const handleHashChange = () => {
+        const nextPatch = parseUrlHashPatch();
+        if (nextPatch) {
+          useSkyStore.getState().hydrateFromUrlState(nextPatch);
+        }
+      };
+      window.addEventListener('hashchange', handleHashChange);
+      return () => window.removeEventListener('hashchange', handleHashChange);
     }
+    return undefined;
   }, []);
 
   return (

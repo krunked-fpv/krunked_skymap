@@ -238,6 +238,7 @@ export class AstroClient {
       }
       case 'error': {
         this.tickInFlight = false;
+        this.rejectPending(new Error(msg.message));
         this.callbacks.onError?.(msg.message);
         break;
       }

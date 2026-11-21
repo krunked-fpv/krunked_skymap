@@ -617,8 +617,14 @@ export class OpenDroneIdClient {
             this.airspace,
             this.latestDrones
           );
+          const nowMs = Date.now();
           for (const d of drones) {
             this.latestDrones.set(d.id, d);
+          }
+          for (const [id, existing] of this.latestDrones.entries()) {
+            if (nowMs - existing.timestampMs > 120_000) {
+              this.latestDrones.delete(id);
+            }
           }
           this.callbacks.onDrones(drones);
         } catch {
@@ -671,8 +677,14 @@ export class OpenDroneIdClient {
           this.airspace,
           this.latestDrones
         );
+        const nowMs = Date.now();
         for (const d of drones) {
           this.latestDrones.set(d.id, d);
+        }
+        for (const [id, existing] of this.latestDrones.entries()) {
+          if (nowMs - existing.timestampMs > 120_000) {
+            this.latestDrones.delete(id);
+          }
         }
         this.callbacks.onStatus?.({ transport: 'http', connected: true, lastError: undefined });
         this.callbacks.onDrones(drones);

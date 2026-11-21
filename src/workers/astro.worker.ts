@@ -50,8 +50,17 @@ const GROUP_PRIORITY: Record<SatelliteGroup, number> = {
   starlink: 2,
 };
 
-function isFiniteVec3(v: { x: number; y: number; z: number }): boolean {
-  return Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+function isFiniteVec3(v: unknown): v is { x: number; y: number; z: number } {
+  if (!v || typeof v !== 'object') return false;
+  const vec = v as { x?: unknown; y?: unknown; z?: unknown };
+  return (
+    typeof vec.x === 'number' &&
+    Number.isFinite(vec.x) &&
+    typeof vec.y === 'number' &&
+    Number.isFinite(vec.y) &&
+    typeof vec.z === 'number' &&
+    Number.isFinite(vec.z)
+  );
 }
 
 /**
@@ -269,6 +278,7 @@ export function propagateSatellites(
 
     let pv: satellite.PositionAndVelocity;
     try {
+      sat.satrec.error = 0;
       pv = satellite.propagate(sat.satrec, date);
     } catch {
       continue;
@@ -277,6 +287,8 @@ export function propagateSatellites(
     if (
       sat.satrec.error !== 0 ||
       !pv ||
+      !pv.position ||
+      !pv.velocity ||
       typeof pv.position === 'boolean' ||
       typeof pv.velocity === 'boolean' ||
       !isFiniteVec3(pv.position) ||
@@ -403,13 +415,16 @@ export function computeSatelliteOrbitOverlay(
 
     let pv: satellite.PositionAndVelocity;
     try {
+      sat.satrec.error = 0;
       pv = satellite.propagate(sat.satrec, sampleDate);
     } catch {
       continue;
     }
 
     if (
+      sat.satrec.error !== 0 ||
       !pv ||
+      !pv.position ||
       typeof pv.position === 'boolean' ||
       !isFiniteVec3(pv.position)
     ) {
@@ -437,7 +452,7 @@ export function computeSatelliteOrbitOverlay(
     if (!isFiniteVec3(posEcf)) continue;
 
     const look = computeLookAnglesSafe(observer, observerGd, posEcf, lat, lon, altKm);
-    if (look.elevationDeg >= -5) {
+    if (look.elevationDeg >= -12) {
       passArcAzEl.push({
         azDeg: look.azimuthDeg,
         elDeg: look.elevationDeg,
@@ -460,8 +475,15 @@ export function computeSatelliteOrbitOverlay(
     const nowDate = new Date(timestampMs);
     const nowGmst = satellite.gstime(nowDate);
     try {
+      sat.satrec.error = 0;
       const pvNow = satellite.propagate(sat.satrec, nowDate);
-      if (pvNow && typeof pvNow.position !== 'boolean' && isFiniteVec3(pvNow.position)) {
+      if (
+        sat.satrec.error === 0 &&
+        pvNow &&
+        pvNow.position &&
+        typeof pvNow.position !== 'boolean' &&
+        isFiniteVec3(pvNow.position)
+      ) {
         const gdNow = satellite.eciToGeodetic(pvNow.position, nowGmst);
         if (Number.isFinite(gdNow.height) && gdNow.height > 0) {
           const cosLambda = EARTH_MEAN_RADIUS_KM / (EARTH_MEAN_RADIUS_KM + gdNow.height);

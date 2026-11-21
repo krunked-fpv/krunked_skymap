@@ -130,6 +130,7 @@ export function ControlDock({
   const searchBoxRef = useRef<HTMLDivElement | null>(null);
   const debounceRef = useRef<number | null>(null);
   const requestSeqRef = useRef(0);
+  const suppressNextSearchRef = useRef<string | null>(null);
 
   const runSearch = useCallback(
     async (rawQuery: string) => {
@@ -173,6 +174,10 @@ export function ControlDock({
     }
 
     const trimmed = query.trim();
+    if (suppressNextSearchRef.current !== null && suppressNextSearchRef.current === trimmed) {
+      suppressNextSearchRef.current = null;
+      return;
+    }
     if (!trimmed) {
       requestSeqRef.current += 1;
       setResults([]);
@@ -210,6 +215,7 @@ export function ControlDock({
   }, []);
 
   const selectSearchResult = (item: LocationSearchResult) => {
+    suppressNextSearchRef.current = item.label.trim();
     setObserver({
       lat: item.lat,
       lon: item.lon,
