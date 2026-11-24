@@ -450,4 +450,53 @@ npx vitest run --pool=vmThreads
 
 **Test maintenance (not src defects):** sw.js assertions bumped to `krunked-skymap-v4` (prune v1/v2/v3); Sprint 02 polar-trail prune assertion re-anchored because Sprint 04 removed the comment markers (prune logic intact at PolarSkyDome.tsx ~L1656-1659).
 
-Suite: 
+---
+
+## Sprint 05 — Translucent Sky-Dome, Compass/Touch-Lock, Portal Modal, Right +33% PIP & Overhead Lock Audit (Challenge 10)
+
+**Auditor:** `@astro-redteam`  
+**Branch / Worktree:** `sprint/astro-redteam` (`c:\krunked_skymap\.worktrees\astro-redteam`)  
+**Scope:** Merged Sprint 05 deliverables across [geodesy.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/math/geodesy.ts), [useSkyStore.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/store/useSkyStore.ts), [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx), [TopTelemetryBar.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/TopTelemetryBar.tsx), [TacticalMap.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/map/TacticalMap.tsx), [cockpit.css](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/styles/cockpit.css), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx), and [sw.js](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/sw.js).
+
+### Sprint 05 Executive Defect Tally
+
+| Severity | Count | Findings |
+| :--- | :---: | :--- |
+| **Critical** | **0** | None |
+| **High** | **0** | None |
+| **Medium** | **0** | None |
+| **Low** | **2** | Synchronous `requestPermission()` throw guard (`[DEFECT-S5-01]`); queued 250ms search debounce not cleared on palette close (`[DEFECT-S5-02]`) |
+| **Total** | **2** | **50 / 50 passing** in [chaos.test.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/tests/adversarial/chaos.test.ts) (`Challenge 1`–`Challenge 10`; `tsc --noEmit` exit `0`) |
+
+### Challenge 10 & SW v5 Verification Matrix
+
+| Probe | Coverage | Outcome |
+| :--- | :--- | :---: |
+| **SW v5 (C6 & C8)** | `public/sw.js` pinned to `krunked-skymap-v5`; `activate` prunes `v1`–`v4` while preserving `v5`; bypasses cross-origin telemetry, `/api-proxy/`, and live `.json` while caching `manifest.json` | **PASS** |
+| **10.1a** | `359.9° <-> 0.1°` North-crossing jitter (`< 0.5°/step`, never spins `359°`, converges `< 0.01°`); landscape `90°`/`270°`/`180°` screen orientation compensation & iOS `webkitCompassHeading` priority in `extractCompassHeadingDeg` & `deriveCompassHeadingDeg`; rotated `projectToSkyDome` / `projectEnuToSkyDome` / `unprojectFromSkyDome` / `computeSkyDomeTrajectoryTangent` round-trip `< 0.05°` across `0°..359.9°` in both `'hemisphere'` & `'zenith'` modes + smooth zenith overflight at `143.7°` | **PASS** |
+| **10.1b** | Full JSDOM mount of real `PolarSkyDome`: iOS `DeviceOrientationEvent.requestPermission()` `NotAllowedError` rejection & desktop missing-sensor graceful fallback (absent API + 1.5s silent timeout); `< 6px` micro-movement tap target selection without altering heading; CCW pointer drag-and-release parking at `~143.7°` with zero post-release snap-back, automatic compass disengage, and `stopPropagation()` blocking parent/map propagation; `LOCK` strictly blocking drag, `setDomeRotationDeg`, and live compass updates while `N▲` (`resetDomeNorth`) still resets to `000°`; live unlocked `deviceorientationabsolute` North-seam smoothing (`359.9° -> 0.1°`) | **PASS** |
+| **10.2** | Full JSDOM mount of `App` + `ControlDock`: clicking `[data-testid="omnibox-trigger"]` portals `.cockpit-modal-backdrop` directly under `document.body` (escaped `.control-dock-wrap`); `cockpit.css` enforces `pointer-events: auto` and `z-index: 120 >= 100`; inner `.command-palette` clicks do NOT close modal; typing `33.9416, -118.4085` + submitting `[data-testid="command-palette-submit"]` (`GO`) moves observer and closes modal; Hotspot Preset click jumps observer & closes; `X` (`[data-testid="command-palette-close"]`) & outer backdrop (`[data-testid="command-palette-backdrop"]`) both close cleanly | **PASS** |
+| **10.3** | `.stage-map-pane` always `display: block !important` (never `display: none` in `dome` mode); `TacticalMap.tsx` renders continuously in `dome` mode and applies dynamic `setPadding` / `computeLayoutCameraPadding` in `split` mode (`right: 605` at `1440×900`, `bottom: 405` at `390×844`); translucent `.stage-dome-pane` (`rgba(6, 10, 18, 0.30)`, `blur(1px) <= 4px`), transparent root, and `clearRect` without full-canvas `fillRect`; desktop right-side `+33%` PIP (`320×320px`, `right:`, `left: auto`) shifts left `352px` when `.target-inspector.is-open` (`1440px`: PIP `[756, 1076]` vs Inspector `[1088, 1428]` -> `12px` clean gap, zero overlap) and mobile PIP clamps to `min(208px, calc(100vw - 24px))` (`<= 366px` at `390×844`); zero passive `ZENITH` labels in `TopTelemetryBar.tsx` / `PolarSkyDome.tsx`; `[data-testid="topbar-overhead-lock"]` handles `0` targets without throw, locks/cycles fallback targets (`35° -> 25° -> 35°`), and prioritizes/cycles primary cone (`72° -> 50° -> 72°`, excluding `30°`) while opening `TargetInspector` | **PASS** |
+
+### Sprint 05 Low-Severity Hardening Findings
+
+#### `[DEFECT-S5-01]` (Low) — Uncaught Synchronous Throw If `DeviceOrientationEvent.requestPermission()` Throws Before Returning a Promise
+- **File & Lines:** [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L2535-L2556)
+- **Reproduction:** Mock `window.DeviceOrientationEvent = { requestPermission: () => { throw new DOMException('NotAllowedError'); } }` and click `[data-testid="skydome-compass-toggle"]`. Because `DevOrientCtor.requestPermission()` is evaluated as an argument before `Promise.resolve(...)` is entered, a synchronous throw bypasses `.catch(...)`. (Standard iOS Safari rejects asynchronously via Promise, which `.catch()` already handles cleanly.)
+- **Surgical Fix:** Wrap the `DevOrientCtor.requestPermission()` invocation in `try { void Promise.resolve(DevOrientCtor.requestPermission()).then(...).catch(...); } catch { setDomeCompassActive(false); showCompassStatus('Compass permission denied — drag dome to rotate'); }` so synchronous user-gesture invocation is preserved while guarding synchronous throws.
+
+#### `[DEFECT-S5-02]` (Low) — Queued 250ms Location Search Debounce Timer Not Cancelled When Command Palette Closes
+- **File & Lines:** [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L240-L251), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L319-L322)
+- **Reproduction:** Open the Location Command Palette, type a city name (e.g. `Paris`), and dismiss the modal via `X`, backdrop click, or `Esc` within `< 250ms`. Line 248 aborts any in-flight `abortRef.current` request, but leaves `debounceRef.current` armed, triggering a background `onSearchLocation('Paris')` network call 250ms later after the modal is already closed.
+- **Surgical Fix:** Inside the `!commandPaletteOpen` branch at [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L248-L250), clear `debounceRef.current` via `window.clearTimeout(debounceRef.current); debounceRef.current = null;`.
+
+### Verification Commands & Observed Results
+```powershell
+Set-Location "c:\krunked_skymap\.worktrees\astro-redteam"
+$env:PATH = "$env:LOCALAPPDATA\nodejs-v22;$env:PATH"
+npx tsc --noEmit
+npx vitest run tests/adversarial/chaos.test.ts --pool=vmThreads
+```
+- `npx tsc --noEmit` -> **PASS (exit 0)**
+- `npx vitest run tests/adversarial/chaos.test.ts --pool=vmThreads` -> **50 / 50 PASS** (`Challenge 1`–`Challenge 10`, including SW v5 updates and all 4 Sprint 05 Challenge 10 suites)
+
