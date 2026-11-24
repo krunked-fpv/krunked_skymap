@@ -13,16 +13,24 @@ import {
   EMERGENCY_COLOR,
   SATELLITE_ECLIPSED_COLOR,
   SATELLITE_SUNLIT_COLOR,
+  type CelestialPositions,
   type SatelliteOrbitOverlay,
+  type SkyDomeZoomMode,
   type SkyEntity,
   type UnitSystem,
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
 import { tacticalAudio } from '../../audio/tacticalAudio';
 import {
+  computeClosestApproach,
+  computeSkyDomeTrajectoryTangent,
+  computeSolarLunarTopocentric,
   computeTopocentricLookAngles,
-  greatCircleDestination,
+  elevationToVaultNormR,
+  extrapolateDeadReckoning,
   normalizeAzimuthDeg,
+  projectToSkyDome,
+  unprojectFromSkyDome,
 } from '../../math/geodesy';
 import { formatAltitude, formatDistance } from '../../math/units';
 
@@ -30,9 +38,6 @@ export interface PolarSkyDomeProps {
   className?: string;
 }
 
-const EL_MAX = 90;
-const EL_MIN = -5;
-const EL_SPAN = EL_MAX - EL_MIN; // 95 deg linear projection
 const HIT_RADIUS_PX = 13;
 const TOUCH_HIT_RADIUS_PX = 20;
 const TOUCH_DRAG_THRESHOLD_PX = 10;
@@ -43,6 +48,15 @@ const MAX_TRAIL_SAMPLES = 10;
 const MAX_FLIGHT_TRAIL_AGE_MS = 120_000;
 const MAX_BALLOON_TRAIL_AGE_MS = 1_800_000;
 const MAX_TRAIL_SEGMENT_RATIO = 0.45;
+const CELESTIAL_REFRESH_MS = 10_000;
+const TCA_REFRESH_MS = 500;
+const FORWARD_ARC_DTS: readonly number[] = [0, 15, 30, 45, 60];
+const TCA_ARC_STEPS = 6;
+const LIMB_FADE_DEG = 4;
+
+function minElevationFor(zoom: SkyDomeZoomMode): number {
+  return zoom === 'zenith' ? 30 : 0;
+}
 
 interface PolarPoint {
   azDeg: number;
@@ -57,11 +71,24 @@ interface RenderedTargetHit {
   priority: number;
 }
 
-interface LabelBox {
+interface HitPool {
+  items: RenderedTargetHit[];
+  count: number;
+}
+
+interface VisItem {
+  entity: SkyEntity;
+  azDeg: number;
+  elDeg: number;
   x: number;
   y: number;
-  w: number;
-  h: number;
+  color: string;
+  priority: number;
+  isSelected: boolean;
+  isHovered: boolean;
+  isEmergency: boolean;
+  isBreach: boolean;
+  fade: number;
 }
 
 interface CanvasMetrics {
@@ -71,6 +98,29 @@ interface CanvasMetrics {
   cx: number;
   cy: number;
   outerRadius: number;
+}
+
+interface VaultCache {
+  key: string;
+  bg: CanvasGradient | null;
+  vault: CanvasGradient | null;
+  bezel: CanvasGradient | null;
+  sweep: CanvasGradient | null;
+  glow: CanvasGradient | null;
+}
+
+interface CelestialCache {
+  key: string;
+  ts: number;
+  pos: CelestialPositions | null;
+}
+
+interface TcaCacheEntry {
+  ts: number;
+  isApproaching: boolean;
+  tcaSeconds: number;
+  peakAzimuthDeg: number;
+  peakElevationDeg: number;
 }
 
 const MONO_FONT =
@@ -87,73 +137,249 @@ const COMPASS_BEACONS: Array<{ label: string; azDeg: number; cardinal: boolean }
   { label: 'NW', azDeg: 315, cardinal: false },
 ];
 
-function elToRadius(elDeg: number, outerRadius: number): number {
-  const clamped = Math.max(EL_MIN, Math.min(EL_MAX, elDeg));
-  return outerRadius * ((EL_MAX - clamped) / EL_SPAN);
+const DEG2RAD = Math.PI / 180;
+
+/* ------------------------------------------------------------------ */
+/* Pure label layout solver                                            */
+/* ------------------------------------------------------------------ */
+
+export type DomeLabelMode = 'dome' | 'split' | 'pip';
+
+export interface DomeLabelCandidate {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  elDeg: number;
+  slantRangeKm: number;
+  isSelected: boolean;
+  isHovered: boolean;
+  isEmergency: boolean;
+  isBreach: boolean;
+  text: string;
+  color: string;
 }
 
-function azElToCanvas(
-  azDeg: number,
-  elDeg: number,
-  cx: number,
-  cy: number,
-  outerRadius: number
-): { x: number; y: number; r: number } {
-  const r = elToRadius(elDeg, outerRadius);
-  const theta = ((azDeg - 90) * Math.PI) / 180;
-  return {
-    x: cx + r * Math.cos(theta),
-    y: cy + r * Math.sin(theta),
-    r,
-  };
+export interface PlacedDomeLabel {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  anchorX: number;
+  anchorY: number;
+  leaderX: number;
+  leaderY: number;
+  mustShow: boolean;
+  text: string;
+  color: string;
 }
 
-function canvasToAzEl(
-  px: number,
-  py: number,
-  cx: number,
-  cy: number,
-  outerRadius: number
-): { azDeg: number; elDeg: number; inBounds: boolean } {
-  const dx = px - cx;
-  const dy = py - cy;
-  const dist = Math.hypot(dx, dy);
-  const azDeg = (((Math.atan2(dy, dx) * 180) / Math.PI) + 90 + 360) % 360;
-  const elDeg = EL_MAX - (dist / Math.max(1, outerRadius)) * EL_SPAN;
-  return { azDeg, elDeg, inBounds: dist <= outerRadius };
+export interface DomeLabelLayoutOptions {
+  candidates: readonly DomeLabelCandidate[];
+  count?: number;
+  width: number;
+  height: number;
+  cx: number;
+  cy: number;
+  radius: number;
+  mode: DomeLabelMode;
+  zoomMode: SkyDomeZoomMode;
+  labelsEnabled: boolean;
+  /** Reusable output pool; objects are mutated in place. */
+  out?: PlacedDomeLabel[];
+  /** Reusable index scratch array. */
+  order?: number[];
 }
 
-function projectHeadingAngle(
-  entity: SkyEntity,
-  obsLat: number,
-  obsLon: number,
-  obsAltM: number,
-  cx: number,
-  cy: number,
-  outerRadius: number,
-  baseX: number,
-  baseY: number
-): number {
-  const headingDeg = Number.isFinite(entity.headingDeg) ? entity.headingDeg : 0;
-  const fallbackAngle = ((headingDeg - 90) * Math.PI) / 180;
+export interface DomeLabelLayoutResult {
+  labels: PlacedDomeLabel[];
+  count: number;
+}
 
-  if (entity.topocentric.elevationDeg >= 87) {
-    return fallbackAngle;
-  }
+const LABEL_EDGE_MARGIN = 8;
+const LABEL_PAD = 2;
+const LABEL_GAP = 9;
 
-  const stepKm = entity.category === 'satellite' ? 18 : 2;
-  const fwd = greatCircleDestination(entity.lat, entity.lon, headingDeg, stepKm);
-  const look = computeTopocentricLookAngles(
-    { lat: obsLat, lon: obsLon, altM: obsAltM },
-    { lat: fwd.lat, lon: fwd.lon, altM: entity.altM },
-    false
+let rankCandidates: readonly DomeLabelCandidate[] = [];
+
+function rankCompare(ia: number, ib: number): number {
+  const a = rankCandidates[ia];
+  const b = rankCandidates[ib];
+  const pa = a.isSelected ? 2 : a.isHovered ? 1 : 0;
+  const pb = b.isSelected ? 2 : b.isHovered ? 1 : 0;
+  if (pa !== pb) return pb - pa;
+  const aa = a.isEmergency || a.isBreach ? 1 : 0;
+  const ab = b.isEmergency || b.isBreach ? 1 : 0;
+  if (aa !== ab) return ab - aa;
+  if (a.elDeg !== b.elDeg) return b.elDeg - a.elDeg;
+  if (a.slantRangeKm !== b.slantRangeKm) return a.slantRangeKm - b.slantRangeKm;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+function labelBoxValid(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  o: DomeLabelLayoutOptions
+): boolean {
+  const m = LABEL_EDGE_MARGIN;
+  if (x < m || y < m || x + w > o.width - m || y + h > o.height - m) return false;
+  const lim = o.radius - 8;
+  if (lim <= 0) return false;
+  const l2 = lim * lim;
+  const dx0 = x - o.cx;
+  const dx1 = x + w - o.cx;
+  const dy0 = y - o.cy;
+  const dy1 = y + h - o.cy;
+  return (
+    dx0 * dx0 + dy0 * dy0 <= l2 &&
+    dx1 * dx1 + dy0 * dy0 <= l2 &&
+    dx0 * dx0 + dy1 * dy1 <= l2 &&
+    dx1 * dx1 + dy1 * dy1 <= l2
   );
-  const pt = azElToCanvas(look.azimuthDeg, look.elevationDeg, cx, cy, outerRadius);
-  const dx = pt.x - baseX;
-  const dy = pt.y - baseY;
-  if (Math.hypot(dx, dy) < 0.25) return fallbackAngle;
-  return Math.atan2(dy, dx);
 }
+
+function labelOverlaps(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  placed: PlacedDomeLabel[],
+  count: number
+): boolean {
+  for (let i = 0; i < count; i += 1) {
+    const p = placed[i];
+    if (
+      x < p.x + p.w + LABEL_PAD &&
+      x + w + LABEL_PAD > p.x &&
+      y < p.y + p.h + LABEL_PAD &&
+      y + h + LABEL_PAD > p.y
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function solveDomeLabelLayout(o: DomeLabelLayoutOptions): DomeLabelLayoutResult {
+  const labels = o.out ?? [];
+  const n = Math.min(o.count ?? o.candidates.length, o.candidates.length);
+  const order = o.order ?? [];
+  order.length = 0;
+  for (let i = 0; i < n; i += 1) order.push(i);
+  rankCandidates = o.candidates;
+  order.sort(rankCompare);
+
+  const cap = o.mode === 'pip' ? 0 : o.mode === 'split' ? 7 : 12;
+  const minPassiveEl = o.zoomMode === 'zenith' ? 34 : 8;
+  let placedCount = 0;
+  let passive = 0;
+
+  for (let oi = 0; oi < n; oi += 1) {
+    const c = o.candidates[order[oi]];
+    const mustShow = c.isSelected || c.isHovered;
+    if (!mustShow) {
+      if (o.mode === 'pip' || !o.labelsEnabled) continue;
+      if (c.elDeg < minPassiveEl) continue;
+      if (passive >= cap) continue;
+    }
+    const w = c.w;
+    const h = c.h;
+    let bx = 0;
+    let by = 0;
+    let found = false;
+    for (let k = 0; k < 8 && !found; k += 1) {
+      switch (k) {
+        case 0:
+          bx = c.x + LABEL_GAP;
+          by = c.y - h / 2;
+          break;
+        case 1:
+          bx = c.x - w - LABEL_GAP;
+          by = c.y - h / 2;
+          break;
+        case 2:
+          bx = c.x - w / 2;
+          by = c.y - h - LABEL_GAP;
+          break;
+        case 3:
+          bx = c.x - w / 2;
+          by = c.y + LABEL_GAP;
+          break;
+        case 4:
+          bx = c.x + LABEL_GAP * 0.7;
+          by = c.y - h - LABEL_GAP * 0.7;
+          break;
+        case 5:
+          bx = c.x - w - LABEL_GAP * 0.7;
+          by = c.y - h - LABEL_GAP * 0.7;
+          break;
+        case 6:
+          bx = c.x + LABEL_GAP * 0.7;
+          by = c.y + LABEL_GAP * 0.7;
+          break;
+        default:
+          bx = c.x - w - LABEL_GAP * 0.7;
+          by = c.y + LABEL_GAP * 0.7;
+          break;
+      }
+      if (labelBoxValid(bx, by, w, h, o) && !labelOverlaps(bx, by, w, h, labels, placedCount)) {
+        found = true;
+      }
+    }
+    if (!found && mustShow) {
+      // Pull the pill toward the dome center until it satisfies the aperture constraints.
+      for (let s = 1; s <= 12 && !found; s += 1) {
+        const t = s / 12;
+        bx = c.x + (o.cx - c.x) * t - w / 2;
+        by = c.y + (o.cy - c.y) * t - h / 2;
+        if (labelBoxValid(bx, by, w, h, o)) found = true;
+      }
+    }
+    if (!found) continue;
+
+    let slot = labels[placedCount];
+    if (!slot) {
+      slot = {
+        id: '',
+        x: 0,
+        y: 0,
+        w: 0,
+        h: 0,
+        anchorX: 0,
+        anchorY: 0,
+        leaderX: 0,
+        leaderY: 0,
+        mustShow: false,
+        text: '',
+        color: '',
+      };
+      labels.push(slot);
+    }
+    slot.id = c.id;
+    slot.x = bx;
+    slot.y = by;
+    slot.w = w;
+    slot.h = h;
+    slot.anchorX = c.x;
+    slot.anchorY = c.y;
+    slot.leaderX = Math.max(bx, Math.min(bx + w, c.x));
+    slot.leaderY = Math.max(by, Math.min(by + h, c.y));
+    slot.mustShow = mustShow;
+    slot.text = c.text;
+    slot.color = c.color;
+    placedCount += 1;
+    if (!mustShow) passive += 1;
+  }
+  return { labels, count: placedCount };
+}
+
+/* ------------------------------------------------------------------ */
+/* Entity helpers                                                      */
+/* ------------------------------------------------------------------ */
 
 function getEntityColor(entity: SkyEntity): string {
   if (entity.emergencyFlag) return EMERGENCY_COLOR;
@@ -185,6 +411,21 @@ function getEntityPriority(entity: SkyEntity, isSelected: boolean, isHovered: bo
     case 'flight':
       return 36;
   }
+}
+
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+/** Smooth limb fade 0→1 across minEl→minEl+4°. */
+function limbFade(elDeg: number, minEl: number): number {
+  const t = clamp01((elDeg - minEl) / LIMB_FADE_DEG);
+  return t * t * (3 - 2 * t);
+}
+
+/** Atmospheric depth: 0.38 near horizon → 1.0 above 35°. */
+function atmosphericDepth(elDeg: number): number {
+  return 0.38 + 0.62 * clamp01(elDeg / 35);
 }
 
 function drawGlyph(
@@ -438,7 +679,8 @@ function drawOrbitPassArc(
   selectedId: string | null,
   cx: number,
   cy: number,
-  outerRadius: number
+  outerRadius: number,
+  zoom: SkyDomeZoomMode
 ): void {
   if (!selectedId || overlay.passArcAzEl.length < 2) return;
   const selectedEntity = liveKinematicsRegistry.entities.get(selectedId);
@@ -447,12 +689,15 @@ function drawOrbitPassArc(
     (selectedEntity?.category === 'satellite' && selectedEntity.noradId === overlay.noradId);
   if (!matchesSelected) return;
 
+  const minEl = minElevationFor(zoom);
+  const pts = overlay.passArcAzEl;
+
   ctx.save();
   ctx.beginPath();
-  ctx.arc(cx, cy, outerRadius + 1, 0, Math.PI * 2);
+  ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
   ctx.clip();
 
-  const interpolateEdgeAz = (
+  const crossAzimuth = (
     a: { azDeg: number; elDeg: number },
     b: { azDeg: number; elDeg: number }
   ): number => {
@@ -460,51 +705,46 @@ function drawOrbitPassArc(
     if (dAz > 180) dAz -= 360;
     if (dAz < -180) dAz += 360;
     const denom = b.elDeg - a.elDeg;
-    const t = Math.abs(denom) > 1e-6 ? (EL_MIN - a.elDeg) / denom : 0;
+    const t = Math.abs(denom) > 1e-6 ? (minEl - a.elDeg) / denom : 0;
     return (a.azDeg + dAz * t + 360) % 360;
   };
 
   const drawPassPath = () => {
     ctx.beginPath();
     let penDown = false;
-    let prevPt: { azDeg: number; elDeg: number } | null = null;
-    for (const pt of overlay.passArcAzEl) {
+    let prev: { azDeg: number; elDeg: number } | null = null;
+    for (let i = 0; i < pts.length; i += 1) {
+      const pt = pts[i];
       if (!Number.isFinite(pt.azDeg) || !Number.isFinite(pt.elDeg)) {
         penDown = false;
-        prevPt = null;
+        prev = null;
         continue;
       }
-
-      if (pt.elDeg < EL_MIN) {
-        if (penDown && prevPt && prevPt.elDeg >= EL_MIN) {
-          const crossAz = interpolateEdgeAz(prevPt, pt);
-          const edgePos = azElToCanvas(crossAz, EL_MIN, cx, cy, outerRadius);
-          ctx.lineTo(edgePos.x, edgePos.y);
+      if (pt.elDeg < minEl) {
+        if (penDown && prev && prev.elDeg >= minEl) {
+          const e = projectToSkyDome(crossAzimuth(prev, pt), minEl, cx, cy, outerRadius, zoom);
+          ctx.lineTo(e.x, e.y);
         }
         penDown = false;
-        prevPt = pt;
+        prev = pt;
         continue;
       }
-
-      if (!penDown && prevPt && prevPt.elDeg < EL_MIN) {
-        const crossAz = interpolateEdgeAz(prevPt, pt);
-        const edgePos = azElToCanvas(crossAz, EL_MIN, cx, cy, outerRadius);
-        ctx.moveTo(edgePos.x, edgePos.y);
+      if (!penDown && prev && prev.elDeg < minEl) {
+        const e = projectToSkyDome(crossAzimuth(prev, pt), minEl, cx, cy, outerRadius, zoom);
+        ctx.moveTo(e.x, e.y);
         penDown = true;
       }
-
-      const { x, y } = azElToCanvas(pt.azDeg, pt.elDeg, cx, cy, outerRadius);
+      const p = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, outerRadius, zoom);
       if (!penDown) {
-        ctx.moveTo(x, y);
+        ctx.moveTo(p.x, p.y);
         penDown = true;
       } else {
-        ctx.lineTo(x, y);
+        ctx.lineTo(p.x, p.y);
       }
-      prevPt = pt;
+      prev = pt;
     }
   };
 
-  // Ambient orbital arc glow
   drawPassPath();
   ctx.strokeStyle = 'rgba(192, 132, 252, 0.26)';
   ctx.lineWidth = 5;
@@ -512,7 +752,6 @@ function drawOrbitPassArc(
   ctx.lineJoin = 'round';
   ctx.stroke();
 
-  // Dashed orbital pass arc
   drawPassPath();
   ctx.setLineDash([6, 4]);
   ctx.strokeStyle = CATEGORY_COLORS.satellite;
@@ -520,27 +759,29 @@ function drawOrbitPassArc(
   ctx.stroke();
   ctx.setLineDash([]);
 
-  // Find TCA peak marker
-  let peak = overlay.passArcAzEl.find((pt) => pt.isPeak);
-  if (!peak) {
-    let bestEl = -999;
-    for (const pt of overlay.passArcAzEl) {
-      if (pt.elDeg > bestEl) {
-        bestEl = pt.elDeg;
-        peak = pt;
-      }
+  let peak: { azDeg: number; elDeg: number; isPeak?: boolean } | undefined;
+  let bestEl = -999;
+  for (let i = 0; i < pts.length; i += 1) {
+    const pt = pts[i];
+    if (pt.isPeak) {
+      peak = pt;
+      break;
+    }
+    if (pt.elDeg > bestEl) {
+      bestEl = pt.elDeg;
+      peak = pt;
     }
   }
 
-  if (peak && Number.isFinite(peak.azDeg) && Number.isFinite(peak.elDeg) && peak.elDeg >= EL_MIN) {
-    const peakPos = azElToCanvas(peak.azDeg, peak.elDeg, cx, cy, outerRadius);
-    drawTcaStar(ctx, peakPos.x, peakPos.y);
+  if (peak && Number.isFinite(peak.azDeg) && Number.isFinite(peak.elDeg) && peak.elDeg >= minEl) {
+    const pp = projectToSkyDome(peak.azDeg, peak.elDeg, cx, cy, outerRadius, zoom);
+    drawTcaStar(ctx, pp.x, pp.y);
 
     const tcaText = `TCA ${peak.elDeg.toFixed(0)}°`;
     ctx.font = `600 9.5px ${MONO_FONT}`;
     const textW = ctx.measureText(tcaText).width;
-    const tx = Math.min(cx + outerRadius - textW - 10, peakPos.x + 10);
-    const ty = Math.max(cy - outerRadius + 14, peakPos.y - 8);
+    const tx = Math.min(cx + outerRadius - textW - 10, pp.x + 10);
+    const ty = Math.max(cy - outerRadius + 14, pp.y - 8);
 
     ctx.fillStyle = 'rgba(15, 10, 30, 0.85)';
     ctx.strokeStyle = 'rgba(232, 121, 249, 0.55)';
@@ -604,197 +845,232 @@ function drawTargetLockReticle(
   ctx.restore();
 }
 
-function drawRadarGrid(
+function ensureVaultCache(
   ctx: CanvasRenderingContext2D,
-  metrics: CanvasMetrics,
+  m: CanvasMetrics,
+  zoom: SkyDomeZoomMode,
+  cache: VaultCache
+): VaultCache {
+  const key = `${m.width}x${m.height}@${m.dpr}:${zoom}:${m.outerRadius.toFixed(2)}`;
+  if (cache.key === key && cache.vault) return cache;
+  const { cx, cy, outerRadius: R, width, height } = m;
+  cache.key = key;
+
+  const bg = ctx.createRadialGradient(cx, cy, 4, cx, cy, Math.max(width, height) * 0.75);
+  bg.addColorStop(0, '#0B1626');
+  bg.addColorStop(0.6, '#070E1A');
+  bg.addColorStop(1, '#04070D');
+  cache.bg = bg;
+
+  const vault = ctx.createRadialGradient(cx - R * 0.22, cy - R * 0.3, R * 0.04, cx, cy, R);
+  vault.addColorStop(0, 'rgba(48, 104, 150, 0.30)');
+  vault.addColorStop(0.4, 'rgba(20, 44, 76, 0.50)');
+  vault.addColorStop(0.82, 'rgba(8, 17, 32, 0.68)');
+  vault.addColorStop(1, 'rgba(3, 7, 14, 0.86)');
+  cache.vault = vault;
+
+  const bezel = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
+  bezel.addColorStop(0, 'rgba(255, 255, 255, 0.78)');
+  bezel.addColorStop(0.3, 'rgba(180, 225, 255, 0.22)');
+  bezel.addColorStop(0.62, 'rgba(70, 110, 150, 0.08)');
+  bezel.addColorStop(1, 'rgba(255, 255, 255, 0.38)');
+  cache.bezel = bezel;
+
+  if (typeof ctx.createConicGradient === 'function') {
+    const arc = (46 * DEG2RAD);
+    const sweep = ctx.createConicGradient(-arc, 0, 0);
+    const frac = arc / (Math.PI * 2);
+    sweep.addColorStop(0, 'rgba(34, 211, 238, 0)');
+    sweep.addColorStop(frac * 0.7, 'rgba(34, 211, 238, 0.035)');
+    sweep.addColorStop(frac, 'rgba(34, 211, 238, 0.13)');
+    sweep.addColorStop(Math.min(1, frac + 0.002), 'rgba(34, 211, 238, 0)');
+    sweep.addColorStop(1, 'rgba(34, 211, 238, 0)');
+    cache.sweep = sweep;
+  } else {
+    cache.sweep = null;
+  }
+
+  // Twilight glow in a local frame whose +X axis points at the sun azimuth on the bezel.
+  const glow = ctx.createRadialGradient(R, 0, 0, R, 0, R * 0.62);
+  glow.addColorStop(0, 'rgba(255, 176, 96, 0.5)');
+  glow.addColorStop(0.45, 'rgba(236, 110, 140, 0.2)');
+  glow.addColorStop(1, 'rgba(120, 80, 200, 0)');
+  cache.glow = glow;
+  return cache;
+}
+
+function drawVault(
+  ctx: CanvasRenderingContext2D,
+  m: CanvasMetrics,
+  zoom: SkyDomeZoomMode,
+  cache: VaultCache,
   sweepEnabled: boolean,
   sweepAzDeg: number,
   pulseWaveStartMs: number | null,
-  nowMs: number
+  nowMs: number,
+  twilightK: number,
+  sunAzDeg: number
 ): void {
-  const { cx, cy, outerRadius, width, height } = metrics;
-  const horizonR = elToRadius(0, outerRadius);
-  const el30R = elToRadius(30, outerRadius);
-  const el60R = elToRadius(60, outerRadius);
-  const innerSpokeR = elToRadius(78, outerRadius);
+  const { cx, cy, outerRadius: R, width, height } = m;
   const minDim = Math.min(width, height);
   const isPipGrid = minDim <= 260;
   const compact = minDim < 360;
-  const dishBoundaryR = isPipGrid ? horizonR : outerRadius;
+  const minEl = minElevationFor(zoom);
+  ensureVaultCache(ctx, m, zoom, cache);
 
-  // Outer backdrop wash
-  const bgGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, outerRadius * 1.08);
-  bgGrad.addColorStop(0, '#0D192B');
-  bgGrad.addColorStop(0.75, '#070E1A');
-  bgGrad.addColorStop(1, '#050810');
-  ctx.fillStyle = bgGrad;
+  ctx.fillStyle = cache.bg as CanvasGradient;
   ctx.fillRect(0, 0, width, height);
 
-  // Over-The-Horizon (-5 deg to 0 deg) annular skirt shading (omitted in compact PIP to avoid edge clutter)
-  if (!isPipGrid) {
+  // Spherical vault glass
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.fillStyle = cache.vault as CanvasGradient;
+  ctx.fill();
+
+  // Directional twilight glow along the bezel
+  if (twilightK > 0.01) {
     ctx.save();
     ctx.beginPath();
-    ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
-    ctx.arc(cx, cy, horizonR, 0, Math.PI * 2, true);
-    ctx.fillStyle = 'rgba(245, 158, 11, 0.04)';
+    ctx.arc(cx, cy, R + 6, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.translate(cx, cy);
+    ctx.rotate((sunAzDeg - 90) * DEG2RAD);
+    ctx.globalAlpha = Math.min(1, twilightK);
+    ctx.fillStyle = cache.glow as CanvasGradient;
+    ctx.beginPath();
+    ctx.arc(R, 0, R * 0.62, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
 
-  // Above-horizon inner dome fill
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, horizonR, 0, Math.PI * 2);
-  const dishGrad = ctx.createRadialGradient(cx, cy, 2, cx, cy, horizonR);
-  dishGrad.addColorStop(0, 'rgba(34, 211, 238, 0.055)');
-  dishGrad.addColorStop(0.55, 'rgba(15, 29, 52, 0.35)');
-  dishGrad.addColorStop(1, 'rgba(6, 11, 20, 0.55)');
-  ctx.fillStyle = dishGrad;
-  ctx.fill();
-  ctx.restore();
-
-  // Rotating phosphor sweep wedge
+  // Subtle sweep cone
   if (sweepEnabled) {
     ctx.save();
     ctx.beginPath();
-    ctx.arc(cx, cy, dishBoundaryR, 0, Math.PI * 2);
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
     ctx.clip();
-
-    const beamAngleRad = ((sweepAzDeg - 90) * Math.PI) / 180;
-    const sweepArcRad = (46 * Math.PI) / 180;
-
-    if (typeof ctx.createConicGradient === 'function') {
-      const startAngle = beamAngleRad - sweepArcRad;
-      const conic = ctx.createConicGradient(startAngle, cx, cy);
-      const frac = sweepArcRad / (Math.PI * 2);
-      conic.addColorStop(0, 'rgba(34, 211, 238, 0)');
-      conic.addColorStop(frac * 0.72, 'rgba(34, 211, 238, 0.06)');
-      conic.addColorStop(frac, 'rgba(34, 211, 238, 0.21)');
-      conic.addColorStop(Math.min(1, frac + 0.002), 'rgba(34, 211, 238, 0)');
-      conic.addColorStop(1, 'rgba(34, 211, 238, 0)');
-
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      ctx.arc(cx, cy, horizonR, startAngle, beamAngleRad);
-      ctx.closePath();
-      ctx.fillStyle = conic;
-      ctx.fill();
-    } else {
-      const slices = 10;
-      for (let i = 0; i < slices; i += 1) {
-        const a0 = beamAngleRad - ((slices - i) / slices) * sweepArcRad;
-        const a1 = beamAngleRad - ((slices - i - 1) / slices) * sweepArcRad;
-        ctx.beginPath();
-        ctx.moveTo(cx, cy);
-        ctx.arc(cx, cy, horizonR, a0, a1);
-        ctx.closePath();
-        ctx.fillStyle = `rgba(34, 211, 238, ${(i + 1) * 0.018})`;
-        ctx.fill();
-      }
-    }
-
-    // Crisp leading phosphor sweep beam
+    ctx.translate(cx, cy);
+    ctx.rotate((sweepAzDeg - 90) * DEG2RAD);
+    const arc = 46 * DEG2RAD;
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(cx + horizonR * Math.cos(beamAngleRad), cy + horizonR * Math.sin(beamAngleRad));
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.72)';
-    ctx.lineWidth = 1.5;
+    ctx.moveTo(0, 0);
+    ctx.arc(0, 0, R, -arc, 0);
+    ctx.closePath();
+    ctx.fillStyle = cache.sweep ?? 'rgba(34, 211, 238, 0.045)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(R, 0);
+    ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
+    ctx.lineWidth = 1.2;
     ctx.stroke();
     ctx.restore();
   }
 
-  // Manual sweep pulse expanding wave
+  // Manual sweep pulse wave
   if (pulseWaveStartMs !== null) {
     const elapsed = nowMs - pulseWaveStartMs;
     if (elapsed >= 0 && elapsed < PULSE_WAVE_DURATION_MS) {
       const progress = elapsed / PULSE_WAVE_DURATION_MS;
-      const waveR = progress * dishBoundaryR;
-      const alpha = (1 - progress) * 0.75;
       ctx.save();
       ctx.beginPath();
-      ctx.arc(cx, cy, waveR, 0, Math.PI * 2);
-      ctx.strokeStyle = `rgba(34, 211, 238, ${alpha.toFixed(3)})`;
+      ctx.arc(cx, cy, progress * R, 0, Math.PI * 2);
+      ctx.globalAlpha = (1 - progress) * 0.75;
+      ctx.strokeStyle = '#22D3EE';
       ctx.lineWidth = 2.2 * (1 - progress * 0.5);
       ctx.stroke();
       ctx.restore();
     }
   }
 
-  // 15° radial azimuth spokes
-  for (let az = 0; az < 360; az += 15) {
-    const theta = ((az - 90) * Math.PI) / 180;
-    const isCardinal = az % 90 === 0;
-    const isIntercardinal = az % 45 === 0 && !isCardinal;
-    const startR = isCardinal ? 5 : isIntercardinal ? 12 : innerSpokeR;
-
+  // 15° spokes, fading out toward the zenith before 70° elevation
+  const spokeInnerR = elevationToVaultNormR(70, zoom) * R;
+  const SPOKE_SEGS = 4;
+  for (let s = 0; s < SPOKE_SEGS; s += 1) {
+    const r0 = spokeInnerR + ((R - spokeInnerR) * s) / SPOKE_SEGS;
+    const r1 = spokeInnerR + ((R - spokeInnerR) * (s + 1)) / SPOKE_SEGS;
+    const fade = (s + 1) / SPOKE_SEGS;
     ctx.beginPath();
-    ctx.moveTo(cx + startR * Math.cos(theta), cy + startR * Math.sin(theta));
-    ctx.lineTo(cx + dishBoundaryR * Math.cos(theta), cy + dishBoundaryR * Math.sin(theta));
-    ctx.strokeStyle = isCardinal
-      ? 'rgba(56, 189, 248, 0.24)'
-      : isIntercardinal
-      ? 'rgba(120, 190, 255, 0.14)'
-      : 'rgba(120, 190, 255, 0.075)';
-    ctx.lineWidth = isCardinal ? 1 : 0.75;
+    for (let az = 0; az < 360; az += 15) {
+      const th = (az - 90) * DEG2RAD;
+      const cs = Math.cos(th);
+      const sn = Math.sin(th);
+      ctx.moveTo(cx + r0 * cs, cy + r0 * sn);
+      ctx.lineTo(cx + r1 * cs, cy + r1 * sn);
+    }
+    ctx.strokeStyle = `rgba(120, 190, 255, ${(0.2 * fade * fade).toFixed(3)})`;
+    ctx.lineWidth = 0.75;
     ctx.stroke();
   }
 
-  // 5° perimeter bezel ticks on 0° Horizon ring (major 15° ticks only in compact PIP)
+  // Recessed elevation rings
+  const rings = zoom === 'zenith' ? [75, 60, 45] : [60, 30];
+  ctx.beginPath();
+  for (let i = 0; i < rings.length; i += 1) {
+    const r = elevationToVaultNormR(rings[i], zoom) * R + 0.8;
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  }
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.beginPath();
+  for (let i = 0; i < rings.length; i += 1) {
+    const r = elevationToVaultNormR(rings[i], zoom) * R;
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  }
+  ctx.strokeStyle = 'rgba(120, 190, 255, 0.24)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+
+  // Bezel: dark seat, limb ring, 1px specular glass edge
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + 1.5, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(2, 5, 10, 0.9)';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + 0.5, 0, Math.PI * 2);
+  ctx.strokeStyle = cache.bezel as CanvasGradient;
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Exterior 15° ticks (5° minors outside PIP)
+  ctx.beginPath();
   for (let az = 0; az < 360; az += 5) {
     const major = az % 15 === 0;
-    if (isPipGrid && !major) continue;
-    const theta = ((az - 90) * Math.PI) / 180;
-    const tIn = horizonR - (major ? 4.5 : 2.2);
-    const tOut = horizonR;
-    ctx.beginPath();
-    ctx.moveTo(cx + tIn * Math.cos(theta), cy + tIn * Math.sin(theta));
-    ctx.lineTo(cx + tOut * Math.cos(theta), cy + tOut * Math.sin(theta));
-    ctx.strokeStyle = major ? 'rgba(34, 211, 238, 0.45)' : 'rgba(148, 163, 184, 0.22)';
-    ctx.lineWidth = major ? 1 : 0.65;
-    ctx.stroke();
+    if (!major) continue;
+    const th = (az - 90) * DEG2RAD;
+    const cs = Math.cos(th);
+    const sn = Math.sin(th);
+    ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
+    ctx.lineTo(cx + (R + 7) * cs, cy + (R + 7) * sn);
   }
-
-  // Elevation concentric rings: 60° and 30°
-  ctx.save();
-  ctx.setLineDash([4, 4]);
-  for (const r of [el60R, el30R]) {
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(120, 190, 255, 0.22)';
-    ctx.lineWidth = 0.9;
-    ctx.stroke();
-  }
-  ctx.restore();
-
-  // 0° Horizon ring (bright crisp cyan ring)
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, horizonR, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.18)';
-  ctx.lineWidth = 4;
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
+  ctx.lineWidth = 1;
   ctx.stroke();
-
-  ctx.beginPath();
-  ctx.arc(cx, cy, horizonR, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.65)';
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-  ctx.restore();
-
-  // -5° Over-The-Horizon outer skirt boundary
   if (!isPipGrid) {
-    ctx.save();
-    ctx.setLineDash([2, 4]);
     ctx.beginPath();
-    ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
-    ctx.lineWidth = 1;
+    for (let az = 0; az < 360; az += 5) {
+      if (az % 15 === 0) continue;
+      const th = (az - 90) * DEG2RAD;
+      const cs = Math.cos(th);
+      const sn = Math.sin(th);
+      ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
+      ctx.lineTo(cx + (R + 5) * cs, cy + (R + 5) * sn);
+    }
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.24)';
+    ctx.lineWidth = 0.65;
     ctx.stroke();
-    ctx.restore();
   }
 
-  // Zenith 90° precision center crosshair
-  ctx.save();
+  // Zenith crosshair (hemisphere only; the zenith lens is cut off at 30°)
   ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
   ctx.lineWidth = 1;
   ctx.beginPath();
@@ -807,68 +1083,59 @@ function drawRadarGrid(
   ctx.arc(cx, cy, 1.8, 0, Math.PI * 2);
   ctx.fillStyle = '#38BDF8';
   ctx.fill();
-  ctx.restore();
 
-  // Elevation ring annotations slightly offset from North spoke
-  const ringLabels: Array<{ text: string; r: number; color: string }> = [
-    { text: '60°', r: el60R, color: 'rgba(148, 163, 184, 0.78)' },
-    { text: '30°', r: el30R, color: 'rgba(148, 163, 184, 0.78)' },
-    { text: '0°', r: horizonR, color: 'rgba(34, 211, 238, 0.9)' },
-  ];
-  if (!compact && !isPipGrid) {
-    ringLabels.push({ text: '-5°', r: outerRadius, color: 'rgba(245, 158, 11, 0.72)' });
-  }
-
+  // Elevation ring annotations (no sub-horizon labels)
   ctx.save();
   ctx.font = `600 ${isPipGrid ? 8 : compact ? 8.5 : 9.5}px ${MONO_FONT}`;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  const labelTheta = ((-90 + 8) * Math.PI) / 180;
-  for (const item of ringLabels) {
-    const lx = cx + item.r * Math.cos(labelTheta);
-    const ly = cy + item.r * Math.sin(labelTheta);
+  const labelTheta = (-90 + 8) * DEG2RAD;
+  const lcs = Math.cos(labelTheta);
+  const lsn = Math.sin(labelTheta);
+  const ringLabelEls = zoom === 'zenith' ? [75, 60, 45, 30] : [60, 30, 0];
+  for (let i = 0; i < ringLabelEls.length; i += 1) {
+    const el = ringLabelEls[i];
+    const r = elevationToVaultNormR(el, zoom) * R;
+    const lx = cx + r * lcs;
+    const ly = cy + r * lsn;
     ctx.fillStyle = 'rgba(6, 11, 20, 0.78)';
     ctx.fillRect(lx - 2, ly - 5, isPipGrid ? 16 : 20, 10);
-    ctx.fillStyle = item.color;
-    ctx.fillText(item.text, lx, ly);
+    ctx.fillStyle = el === minEl ? 'rgba(34, 211, 238, 0.9)' : 'rgba(148, 163, 184, 0.78)';
+    ctx.fillText(`${el}°`, lx, ly);
   }
   ctx.restore();
 
-  // Cardinal and intercardinal compass labels outside dish perimeter
+  // N/E/S/W badges and intercardinal captions outside the bezel
   ctx.save();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const labelDist = dishBoundaryR + (isPipGrid ? 9.5 : compact ? 11 : 14);
-  for (const beacon of COMPASS_BEACONS) {
+  const badgeR = isPipGrid ? 6.5 : compact ? 8 : 9;
+  for (let i = 0; i < COMPASS_BEACONS.length; i += 1) {
+    const beacon = COMPASS_BEACONS[i];
     if (isPipGrid && !beacon.cardinal) continue;
-    const theta = ((beacon.azDeg - 90) * Math.PI) / 180;
-    const bx = cx + labelDist * Math.cos(theta);
-    const by = cy + labelDist * Math.sin(theta);
-
+    const th = (beacon.azDeg - 90) * DEG2RAD;
     if (beacon.cardinal) {
-      ctx.font = `700 ${isPipGrid ? 9 : compact ? 10 : 11.5}px ${MONO_FONT}`;
+      const dist = R + 8 + badgeR;
+      const bx = cx + dist * Math.cos(th);
+      const by = cy + dist * Math.sin(th);
+      ctx.beginPath();
+      ctx.arc(bx, by, badgeR, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(7, 12, 22, 0.92)';
+      ctx.fill();
+      ctx.strokeStyle = beacon.azDeg === 0 ? 'rgba(34, 211, 238, 0.8)' : 'rgba(148, 163, 184, 0.45)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.font = `700 ${isPipGrid ? 8 : compact ? 9.5 : 11}px ${MONO_FONT}`;
       ctx.fillStyle = beacon.azDeg === 0 ? '#22D3EE' : '#CBD5E1';
+      ctx.fillText(beacon.label, bx, by + 0.5);
     } else {
+      const dist = R + 13;
       ctx.font = `600 ${compact ? 8 : 9}px ${MONO_FONT}`;
       ctx.fillStyle = '#64748B';
+      ctx.fillText(beacon.label, cx + dist * Math.cos(th), cy + dist * Math.sin(th));
     }
-    ctx.fillText(beacon.label, bx, by);
   }
   ctx.restore();
-}
-
-function overlapsExistingLabel(box: LabelBox, existing: LabelBox[]): boolean {
-  for (const other of existing) {
-    if (
-      box.x < other.x + other.w &&
-      box.x + box.w > other.x &&
-      box.y < other.y + other.h &&
-      box.y + box.h > other.y
-    ) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function formatCompactDomeAltitude(entity: SkyEntity, units: UnitSystem): string {
@@ -880,38 +1147,10 @@ function formatCompactDomeAltitude(entity: SkyEntity, units: UnitSystem): string
   return formatted === '---' ? '' : formatted;
 }
 
-function resolveLabelBox(
-  x: number,
-  y: number,
-  boxW: number,
-  boxH: number,
-  canvasW: number,
-  canvasH: number,
-  placed: LabelBox[],
-  mustShow: boolean
-): LabelBox | null {
-  const clampX = (rawX: number) => Math.max(6, Math.min(canvasW - boxW - 6, rawX));
-  const clampY = (rawY: number) => Math.max(6, Math.min(canvasH - boxH - 6, rawY));
-
-  const candidates: LabelBox[] = [
-    { x: clampX(x + 10), y: clampY(y - boxH / 2), w: boxW, h: boxH },
-    { x: clampX(x - boxW - 10), y: clampY(y - boxH / 2), w: boxW, h: boxH },
-    { x: clampX(x - boxW / 2), y: clampY(y - boxH - 10), w: boxW, h: boxH },
-    { x: clampX(x - boxW / 2), y: clampY(y + 10), w: boxW, h: boxH },
-  ];
-
-  for (const candidate of candidates) {
-    if (!overlapsExistingLabel(candidate, placed)) {
-      return candidate;
-    }
-  }
-  return mustShow ? candidates[0] : null;
-}
-
 const DEFAULT_CURSOR_READOUT = 'AZ ---.-° · EL --.-° · RNG ---';
 
 function findNearestHitInList(
-  hits: RenderedTargetHit[],
+  pool: HitPool,
   px: number,
   py: number,
   radiusPx: number
@@ -919,11 +1158,10 @@ function findNearestHitInList(
   let bestId: string | null = null;
   let bestScore = Number.POSITIVE_INFINITY;
 
-  for (let i = 0; i < hits.length; i += 1) {
-    const hit = hits[i];
+  for (let i = 0; i < pool.count; i += 1) {
+    const hit = pool.items[i];
     const dist = Math.hypot(px - hit.x, py - hit.y);
     if (dist <= radiusPx) {
-      // Prefer closer hit, slightly biasing higher priority targets when right on top of each other
       const score = dist - hit.priority * 0.025;
       if (score < bestScore) {
         bestScore = score;
@@ -950,7 +1188,8 @@ function formatCursorReadoutText(
   py: number,
   metrics: CanvasMetrics,
   hitId: string | null,
-  units: UnitSystem
+  units: UnitSystem,
+  zoom: SkyDomeZoomMode
 ): string {
   if (hitId) {
     const entity = liveKinematicsRegistry.entities.get(hitId);
@@ -968,19 +1207,118 @@ function formatCursorReadoutText(
     return DEFAULT_CURSOR_READOUT;
   }
 
-  const { azDeg, elDeg, inBounds } = canvasToAzEl(
-    px,
-    py,
-    metrics.cx,
-    metrics.cy,
-    metrics.outerRadius
-  );
-  if (inBounds) {
-    const { azStr, elStr } = formatReadoutAngles(azDeg, elDeg);
+  const un = unprojectFromSkyDome(px, py, metrics.cx, metrics.cy, metrics.outerRadius, zoom);
+  if (un.inBounds) {
+    const { azStr, elStr } = formatReadoutAngles(un.azimuthDeg, un.elevationDeg);
     return `AZ ${azStr}° · EL ${elStr} · RNG ---`;
   }
 
   return DEFAULT_CURSOR_READOUT;
+}
+
+/* Module-level scratch buffers (zero per-frame allocation). */
+const SC_X = new Float64Array(24);
+const SC_Y = new Float64Array(24);
+const SC_V = new Uint8Array(24);
+
+function projectForwardPoint(
+  entity: SkyEntity,
+  observer: { lat: number; lon: number; altM: number },
+  dtSec: number,
+  idx: number,
+  cx: number,
+  cy: number,
+  R: number,
+  zoom: SkyDomeZoomMode,
+  minEl: number
+): void {
+  const ext = extrapolateDeadReckoning(
+    entity.lat,
+    entity.lon,
+    entity.speedMs,
+    entity.headingDeg,
+    dtSec,
+    entity.altM,
+    Number.isFinite(entity.vertRateMs) ? (entity.vertRateMs as number) : 0
+  );
+  const look = computeTopocentricLookAngles(observer, ext, false);
+  const p = projectToSkyDome(look.azimuthDeg, look.elevationDeg, cx, cy, R, zoom);
+  SC_X[idx] = p.x;
+  SC_Y[idx] = p.y;
+  SC_V[idx] = p.visible && look.elevationDeg >= minEl ? 1 : 0;
+}
+
+function drawTaperedWake(
+  ctx: CanvasRenderingContext2D,
+  n: number,
+  color: string,
+  baseAlpha: number,
+  maxJump: number
+): void {
+  ctx.strokeStyle = color;
+  ctx.lineCap = 'round';
+  const denom = Math.max(1, n - 1);
+  for (let i = 1; i < n; i += 1) {
+    if (!SC_V[i - 1] || !SC_V[i]) continue;
+    if (Math.hypot(SC_X[i] - SC_X[i - 1], SC_Y[i] - SC_Y[i - 1]) > maxJump) continue;
+    const t = i / denom;
+    ctx.globalAlpha = baseAlpha * (0.1 + 0.62 * t);
+    ctx.lineWidth = 0.6 + 1.5 * t;
+    ctx.beginPath();
+    ctx.moveTo(SC_X[i - 1], SC_Y[i - 1]);
+    ctx.lineTo(SC_X[i], SC_Y[i]);
+    ctx.stroke();
+  }
+}
+
+function drawScratchArc(
+  ctx: CanvasRenderingContext2D,
+  n: number,
+  color: string,
+  alpha: number,
+  dash: number[] | null
+): void {
+  ctx.beginPath();
+  let pen = false;
+  for (let i = 0; i < n; i += 1) {
+    if (!SC_V[i]) {
+      pen = false;
+      continue;
+    }
+    if (!pen) {
+      ctx.moveTo(SC_X[i], SC_Y[i]);
+      pen = true;
+    } else {
+      ctx.lineTo(SC_X[i], SC_Y[i]);
+    }
+  }
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.1;
+  if (dash) ctx.setLineDash(dash);
+  ctx.stroke();
+  if (dash) ctx.setLineDash([]);
+}
+
+function createVisItem(entity: SkyEntity): VisItem {
+  return {
+    entity,
+    azDeg: 0,
+    elDeg: 0,
+    x: 0,
+    y: 0,
+    color: '',
+    priority: 0,
+    isSelected: false,
+    isHovered: false,
+    isEmergency: false,
+    isBreach: false,
+    fade: 1,
+  };
+}
+
+function comparePriority(a: VisItem, b: VisItem): number {
+  return a.priority - b.priority;
 }
 
 export function PolarSkyDome({ className }: PolarSkyDomeProps) {
@@ -997,7 +1335,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     outerRadius: 100,
   });
 
-  const renderedHitsRef = useRef<RenderedTargetHit[]>([]);
+  const renderedHitsRef = useRef<HitPool>({ items: [], count: 0 });
+  const zoomRef = useRef<SkyDomeZoomMode>('hemisphere');
   const polarTrailsRef = useRef<Map<string, PolarPoint[]>>(new Map());
   const lastTrailSampleRef = useRef<Map<string, number>>(new Map());
   const lastObserverKeyRef = useRef<string>('');
@@ -1021,6 +1360,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const domeLabelsEnabled = useSkyStore((s) => s.domeLabelsEnabled);
   const setDomeLabelsEnabled = useSkyStore((s) => s.setDomeLabelsEnabled);
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
+  const skyDomeZoom = useSkyStore((s) => s.skyDomeZoom);
+  const toggleSkyDomeZoom = useSkyStore((s) => s.toggleSkyDomeZoom);
   const sweepPulseCounter = useSkyStore((s) => s.sweepPulseCounter);
 
   const isPip = layout === 'map' && skyDomePip;
@@ -1045,7 +1386,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       canvas.height = targetH;
     }
     const minDim = Math.min(width, height);
-    const padding = minDim <= 260 ? 16 : Math.max(24, Math.min(44, minDim * 0.1));
+    const padding = minDim <= 260 ? 24 : Math.max(32, Math.min(48, minDim * 0.1));
     const outerRadius = Math.max(36, minDim / 2 - padding);
     metricsRef.current = {
       width,
@@ -1120,6 +1461,91 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
     let rafId = 0;
 
+    // Persistent per-effect scratch state (zero per-frame allocation)
+    const vaultCache: VaultCache = { key: '', bg: null, vault: null, bezel: null, sweep: null, glow: null };
+    const celestial: CelestialCache = { key: '', ts: -Infinity, pos: null };
+    const tcaCache = new Map<string, TcaCacheEntry>();
+    const visPool: VisItem[] = [];
+    const sorted: VisItem[] = [];
+    const activeIds = new Set<string>();
+    const candPool: DomeLabelCandidate[] = [];
+    const placedPool: PlacedDomeLabel[] = [];
+    const labelOrder: number[] = [];
+    let candCount = 0;
+    let visCount = 0;
+    let stateRef: ReturnType<typeof useSkyStore.getState> | null = null;
+    let frameNowMs = 0;
+    let frameEpochMs = 0;
+    let frameZoom: SkyDomeZoomMode = 'hemisphere';
+    let frameMinEl = 0;
+    let frameMetrics: CanvasMetrics = metricsRef.current;
+
+    const collectEntity = (entity: SkyEntity): void => {
+      const state = stateRef as ReturnType<typeof useSkyStore.getState>;
+      if (!state.layers[entity.category]) return;
+      if (entity.category === 'satellite' && !state.satGroups[entity.group]) return;
+      const { azimuthDeg: azDeg, elevationDeg: elDeg } = entity.topocentric;
+      if (!Number.isFinite(azDeg) || !Number.isFinite(elDeg) || elDeg < frameMinEl) return;
+      const p = projectToSkyDome(
+        azDeg,
+        elDeg,
+        frameMetrics.cx,
+        frameMetrics.cy,
+        frameMetrics.outerRadius,
+        frameZoom
+      );
+      if (!p.visible) return;
+
+      activeIds.add(entity.id);
+      const isSelected = entity.id === state.selectedId;
+      const isHovered = entity.id === state.hoveredId;
+
+      if (entity.trail.length === 0) {
+        const lastSample = lastTrailSampleRef.current.get(entity.id) ?? -Infinity;
+        if (frameNowMs - lastSample >= TRAIL_SAMPLE_INTERVAL_MS) {
+          lastTrailSampleRef.current.set(entity.id, frameNowMs);
+          let pts = polarTrailsRef.current.get(entity.id);
+          if (!pts) {
+            pts = [];
+            polarTrailsRef.current.set(entity.id, pts);
+          }
+          let rec: PolarPoint | undefined;
+          if (pts.length >= MAX_TRAIL_SAMPLES) rec = pts.shift();
+          if (!rec) rec = { azDeg: 0, elDeg: 0, ts: 0 };
+          rec.azDeg = azDeg;
+          rec.elDeg = elDeg;
+          rec.ts = frameNowMs;
+          pts.push(rec);
+          const maxAge =
+            entity.category === 'balloon' ? MAX_BALLOON_TRAIL_AGE_MS : MAX_FLIGHT_TRAIL_AGE_MS;
+          while (pts.length > 0 && frameNowMs - pts[0].ts > maxAge) pts.shift();
+        }
+      } else {
+        polarTrailsRef.current.delete(entity.id);
+        lastTrailSampleRef.current.delete(entity.id);
+      }
+
+      let item = visPool[visCount];
+      if (!item) {
+        item = createVisItem(entity);
+        visPool[visCount] = item;
+      }
+      visCount += 1;
+      item.entity = entity;
+      item.azDeg = azDeg;
+      item.elDeg = elDeg;
+      item.x = p.x;
+      item.y = p.y;
+      item.color = getEntityColor(entity);
+      item.isSelected = isSelected;
+      item.isHovered = isHovered;
+      item.isEmergency = Boolean(entity.emergencyFlag);
+      item.isBreach =
+        entity.category === 'drone' && Boolean(entity.ceilingBreach || entity.tfrBreach);
+      item.priority = getEntityPriority(entity, isSelected, isHovered);
+      item.fade = limbFade(elDeg, frameMinEl);
+    };
+
     const renderFrame = (nowMs: number) => {
       rafId = requestAnimationFrame(renderFrame);
 
@@ -1155,16 +1581,44 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         sweepAzRef.current = (sweepAzRef.current + dtMs * SWEEP_DEG_PER_MS) % 360;
       }
 
-      // Reset trail caches on observer change
-      const obsKey = `${state.observer.lat.toFixed(4)},${state.observer.lon.toFixed(4)}`;
+      const zoom: SkyDomeZoomMode = state.skyDomeZoom === 'zenith' ? 'zenith' : 'hemisphere';
+      const minEl = minElevationFor(zoom);
+      zoomRef.current = zoom;
+      stateRef = state;
+      frameNowMs = nowMs;
+      frameEpochMs = Date.now();
+      frameZoom = zoom;
+      frameMinEl = minEl;
+      frameMetrics = metrics;
+      const { cx, cy, outerRadius: R } = metrics;
+      const observer = state.observer;
+
+      const obsKey = `${observer.lat.toFixed(4)},${observer.lon.toFixed(4)}`;
       if (obsKey !== lastObserverKeyRef.current) {
         lastObserverKeyRef.current = obsKey;
         polarTrailsRef.current.clear();
         lastTrailSampleRef.current.clear();
+        tcaCache.clear();
+        celestial.key = '';
       }
 
       if (pulseWaveStartMsExpired(pulseWaveStartRef.current, nowMs)) {
         pulseWaveStartRef.current = null;
+      }
+
+      // Celestial positions (throttled)
+      if (celestial.key !== obsKey || frameNowMs - celestial.ts >= CELESTIAL_REFRESH_MS) {
+        celestial.key = obsKey;
+        celestial.ts = frameNowMs;
+        celestial.pos = computeSolarLunarTopocentric(observer, frameEpochMs);
+      }
+      const cel = celestial.pos;
+      let twilightK = 0;
+      let sunAz = 0;
+      if (cel && cel.sun.elevationDeg >= -12 && cel.sun.elevationDeg <= 20) {
+        const se = cel.sun.elevationDeg;
+        twilightK = se < 0 ? (se + 12) / 12 : 1 - se / 20;
+        sunAz = cel.sun.azimuthDeg;
       }
 
       ctx.save();
@@ -1173,213 +1627,255 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       ctx.restore();
       ctx.setTransform(metrics.dpr, 0, 0, metrics.dpr, 0, 0);
 
-      // 1. Radar background, OTH skirt, sweep beam, spokes, elevation rings, beacons
-      drawRadarGrid(
+      drawVault(
         ctx,
         metrics,
+        zoom,
+        vaultCache,
         state.sweepEnabled,
         sweepAzRef.current,
         pulseWaveStartRef.current,
-        nowMs
+        nowMs,
+        twilightK,
+        sunAz
       );
 
-      // 2. Selected satellite pass arc & TCA star (gated on satellite layer visibility)
+      const isPipFrame = state.layout === 'map' && state.skyDomePip;
+      const labelMode: DomeLabelMode = isPipFrame
+        ? 'pip'
+        : state.layout === 'split'
+        ? 'split'
+        : 'dome';
+
+      // Collect visible entities (strict culling below minEl)
+      activeIds.clear();
+      visCount = 0;
+      liveKinematicsRegistry.entities.forEach(collectEntity);
+
+      for (const key of polarTrailsRef.current.keys()) {
+        if (!activeIds.has(key)) polarTrailsRef.current.delete(key);
+      }
+      for (const key of lastTrailSampleRef.current.keys()) {
+        if (!activeIds.has(key)) lastTrailSampleRef.current.delete(key);
+      }
+
+      sorted.length = 0;
+      for (let i = 0; i < visCount; i += 1) sorted.push(visPool[i]);
+      sorted.sort(comparePriority);
+
+      const hitPool = renderedHitsRef.current;
+      hitPool.count = 0;
+      const maxTrailJumpPx = R * MAX_TRAIL_SEGMENT_RATIO;
+
+      // Everything below is hard-clipped to the aperture
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(cx, cy, R, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Celestial markers
+      if (cel) {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        if (cel.sun.elevationDeg >= minEl) {
+          const sp = projectToSkyDome(cel.sun.azimuthDeg, cel.sun.elevationDeg, cx, cy, R, zoom);
+          ctx.globalAlpha = 0.5 + 0.5 * limbFade(cel.sun.elevationDeg, minEl);
+          ctx.font = `600 14px ${MONO_FONT}`;
+          ctx.fillStyle = '#FBBF24';
+          ctx.fillText('☀', sp.x, sp.y);
+          if (!isPipFrame) {
+            ctx.font = `600 7px ${MONO_FONT}`;
+            ctx.fillStyle = 'rgba(251, 191, 36, 0.8)';
+            ctx.fillText('SUN', sp.x, sp.y + 11);
+          }
+        }
+        if (cel.moon.elevationDeg >= minEl) {
+          const mp = projectToSkyDome(cel.moon.azimuthDeg, cel.moon.elevationDeg, cx, cy, R, zoom);
+          const illum = Number.isFinite(cel.moon.illuminationFraction)
+            ? cel.moon.illuminationFraction
+            : 0.5;
+          ctx.globalAlpha = (0.4 + 0.6 * illum) * (0.5 + 0.5 * limbFade(cel.moon.elevationDeg, minEl));
+          ctx.font = `600 13px ${MONO_FONT}`;
+          ctx.fillStyle = '#E2E8F0';
+          ctx.fillText('☾', mp.x, mp.y);
+          if (!isPipFrame) {
+            ctx.font = `600 7px ${MONO_FONT}`;
+            ctx.fillStyle = 'rgba(226, 232, 240, 0.75)';
+            ctx.fillText('MOON', mp.x, mp.y + 11);
+          }
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      // Selected satellite pass arc
       if (state.layers.satellite && liveKinematicsRegistry.orbitOverlay) {
         drawOrbitPassArc(
           ctx,
           liveKinematicsRegistry.orbitOverlay,
           state.selectedId,
-          metrics.cx,
-          metrics.cy,
-          metrics.outerRadius
+          cx,
+          cy,
+          R,
+          zoom
         );
       }
 
-      // 3. Collect and prioritize visible entities
-      const visible: Array<{
-        entity: SkyEntity;
-        azDeg: number;
-        elDeg: number;
-        x: number;
-        y: number;
-        color: string;
-        priority: number;
-        isSelected: boolean;
-        isHovered: boolean;
-        isEmergency: boolean;
-        isBreach: boolean;
-      }> = [];
+      let peakMarkerX = NaN;
+      let peakMarkerY = NaN;
+      let peakMarkerEl = 0;
 
-      const activeIds = new Set<string>();
-      const epochNowMs = Date.now();
+      for (let si = 0; si < sorted.length; si += 1) {
+        const item = sorted[si];
+        const entity = item.entity;
+        const { azDeg, elDeg, x, y, color, isSelected, isHovered, isEmergency, isBreach } = item;
+        const focused = isSelected || isHovered;
+        const sinEl = Math.max(0, Math.sin(elDeg * DEG2RAD));
 
-      liveKinematicsRegistry.entities.forEach((entity) => {
-        if (!state.layers[entity.category]) return;
-        if (entity.category === 'satellite' && !state.satGroups[entity.group]) return;
-
-        const { azimuthDeg: azDeg, elevationDeg: elDeg } = entity.topocentric;
-        if (!Number.isFinite(azDeg) || !Number.isFinite(elDeg) || elDeg < -15) return;
-
-        activeIds.add(entity.id);
-
-        const isSelected = entity.id === state.selectedId;
-        const isHovered = entity.id === state.hoveredId;
-        const isEmergency = Boolean(entity.emergencyFlag);
-        const isBreach =
-          entity.category === 'drone' && (entity.ceilingBreach || entity.tfrBreach);
-
-        const pos = azElToCanvas(azDeg, elDeg, metrics.cx, metrics.cy, metrics.outerRadius);
-        const color = getEntityColor(entity);
-        const priority = getEntityPriority(entity, isSelected, isHovered);
-
-        // Update fallback polar trail cache when entity lacks geographic trail points
-        if (entity.trail.length === 0) {
-          const lastSample = lastTrailSampleRef.current.get(entity.id) ?? -Infinity;
-          if (nowMs - lastSample >= TRAIL_SAMPLE_INTERVAL_MS) {
-            lastTrailSampleRef.current.set(entity.id, nowMs);
-            let pts = polarTrailsRef.current.get(entity.id);
-            if (!pts) {
-              pts = [];
-              polarTrailsRef.current.set(entity.id, pts);
-            }
-            pts.push({ azDeg, elDeg, ts: nowMs });
-            const maxAge =
-              entity.category === 'balloon' ? MAX_BALLOON_TRAIL_AGE_MS : MAX_FLIGHT_TRAIL_AGE_MS;
-            while (pts.length > MAX_TRAIL_SAMPLES || (pts.length > 0 && nowMs - pts[0].ts > maxAge)) {
-              pts.shift();
-            }
-          }
-        } else {
-          polarTrailsRef.current.delete(entity.id);
-          lastTrailSampleRef.current.delete(entity.id);
-        }
-
-        visible.push({
-          entity,
-          azDeg,
-          elDeg,
-          x: pos.x,
-          y: pos.y,
-          color,
-          priority,
-          isSelected,
-          isHovered,
-          isEmergency,
-          isBreach,
-        });
-      });
-
-      // Immediately prune stale trail cache entries for dead or hidden targets
-      for (const key of polarTrailsRef.current.keys()) {
-        if (!activeIds.has(key)) {
-          polarTrailsRef.current.delete(key);
-        }
-      }
-      for (const key of lastTrailSampleRef.current.keys()) {
-        if (!activeIds.has(key)) {
-          lastTrailSampleRef.current.delete(key);
-        }
-      }
-
-      // Draw lowest priority first so selected/hovered/alerts sit on top
-      visible.sort((a, b) => a.priority - b.priority);
-
-      const nextHits: RenderedTargetHit[] = [];
-      const maxTrailJumpPx = metrics.outerRadius * MAX_TRAIL_SEGMENT_RATIO;
-
-      for (const item of visible) {
-        const {
-          entity,
-          azDeg,
-          elDeg,
-          x,
-          y,
-          color,
-          priority,
-          isSelected,
-          isHovered,
-          isEmergency,
-          isBreach,
-        } = item;
-
-        const belowHorizon = elDeg < 0;
+        const depth = atmosphericDepth(elDeg);
         const baseAlpha =
-          isSelected || isHovered
-            ? belowHorizon
-              ? 0.88
-              : 1
-            : belowHorizon
-            ? elDeg < -5
-              ? 0.3
-              : 0.44
-            : entity.category === 'satellite' && !entity.sunlit
-            ? 0.72
-            : 0.94;
+          (focused ? item.fade : item.fade * depth) *
+          (entity.category === 'satellite' && !entity.sunlit && !focused ? 0.78 : 0.96);
+        if (baseAlpha <= 0.003) continue;
 
         ctx.save();
         ctx.globalAlpha = baseAlpha;
 
+        // Curved wake
         const maxTrailAgeMs =
           entity.category === 'balloon' ? MAX_BALLOON_TRAIL_AGE_MS : MAX_FLIGHT_TRAIL_AGE_MS;
-
-        // Polar breadcrumb trail segment (bounded to last few fresh samples)
+        let wakeN = 0;
         if (entity.trail.length > 0) {
-          const slice = entity.trail.slice(-MAX_TRAIL_SAMPLES);
-          const projected: Array<{ x: number; y: number }> = [];
-          for (const tp of slice) {
-            if (!Number.isFinite(tp.ts) || epochNowMs - tp.ts > maxTrailAgeMs) {
-              continue;
-            }
+          const start = Math.max(0, entity.trail.length - MAX_TRAIL_SAMPLES);
+          for (let ti = start; ti < entity.trail.length; ti += 1) {
+            const tp = entity.trail[ti];
+            if (!Number.isFinite(tp.ts) || frameEpochMs - tp.ts > maxTrailAgeMs) continue;
             const look = computeTopocentricLookAngles(
-              state.observer,
+              observer,
               { lat: tp.lat, lon: tp.lon, altM: tp.altM },
               false
             );
-            if (look.elevationDeg >= -15) {
-              const p = azElToCanvas(
-                look.azimuthDeg,
-                look.elevationDeg,
-                metrics.cx,
-                metrics.cy,
-                metrics.outerRadius
-              );
-              projected.push({ x: p.x, y: p.y });
-            }
+            const pp = projectToSkyDome(look.azimuthDeg, look.elevationDeg, cx, cy, R, zoom);
+            SC_X[wakeN] = pp.x;
+            SC_Y[wakeN] = pp.y;
+            SC_V[wakeN] = pp.visible && look.elevationDeg >= minEl ? 1 : 0;
+            wakeN += 1;
           }
-          projected.push({ x, y });
-          drawPolarTrail(ctx, projected, color, maxTrailJumpPx);
         } else {
           const cached = polarTrailsRef.current.get(entity.id);
-          if (cached && cached.length > 0) {
-            const fresh = cached.filter((pt) => nowMs - pt.ts <= maxTrailAgeMs);
-            if (fresh.length !== cached.length) {
-              if (fresh.length === 0) {
-                polarTrailsRef.current.delete(entity.id);
-              } else {
-                polarTrailsRef.current.set(entity.id, fresh);
-              }
+          if (cached) {
+            for (let ti = 0; ti < cached.length && wakeN < MAX_TRAIL_SAMPLES; ti += 1) {
+              const pt = cached[ti];
+              if (frameNowMs - pt.ts > maxTrailAgeMs || pt.elDeg < minEl) continue;
+              const pp = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, R, zoom);
+              SC_X[wakeN] = pp.x;
+              SC_Y[wakeN] = pp.y;
+              SC_V[wakeN] = pp.visible ? 1 : 0;
+              wakeN += 1;
             }
-            if (fresh.length > 1) {
-              const projected = fresh.map((pt) => {
-                const p = azElToCanvas(
-                  pt.azDeg,
-                  pt.elDeg,
-                  metrics.cx,
-                  metrics.cy,
-                  metrics.outerRadius
-                );
-                return { x: p.x, y: p.y };
-              });
-              projected.push({ x, y });
-              drawPolarTrail(ctx, projected, color, maxTrailJumpPx);
+          }
+        }
+        if (wakeN > 0) {
+          SC_X[wakeN] = x;
+          SC_Y[wakeN] = y;
+          SC_V[wakeN] = 1;
+          wakeN += 1;
+          if (wakeN > 1) drawTaperedWake(ctx, wakeN, color, baseAlpha, maxTrailJumpPx);
+          ctx.globalAlpha = baseAlpha;
+        }
+
+        // 60s forward arc for moving airborne targets
+        const movingAirborne =
+          entity.category !== 'satellite' &&
+          entity.speedMs > 2 &&
+          entity.headingValid !== false &&
+          Number.isFinite(entity.headingDeg);
+        if (movingAirborne) {
+          for (let k = 0; k < FORWARD_ARC_DTS.length; k += 1) {
+            if (k === 0) {
+              SC_X[0] = x;
+              SC_Y[0] = y;
+              SC_V[0] = 1;
+            } else {
+              projectForwardPoint(
+                entity,
+                observer,
+                FORWARD_ARC_DTS[k],
+                k,
+                cx,
+                cy,
+                R,
+                zoom,
+                minEl
+              );
+            }
+          }
+          drawScratchArc(ctx, FORWARD_ARC_DTS.length, color, baseAlpha * 0.42, [2, 3]);
+          ctx.globalAlpha = baseAlpha;
+
+          // Closest-approach extension for focused targets
+          if (focused) {
+            let tca = tcaCache.get(entity.id);
+            if (!tca || frameNowMs - tca.ts >= TCA_REFRESH_MS) {
+              const res = computeClosestApproach(observer, entity, 600);
+              if (!tca) {
+                if (tcaCache.size > 6) tcaCache.clear();
+                tca = {
+                  ts: 0,
+                  isApproaching: false,
+                  tcaSeconds: 0,
+                  peakAzimuthDeg: 0,
+                  peakElevationDeg: 0,
+                };
+                tcaCache.set(entity.id, tca);
+              }
+              tca.ts = frameNowMs;
+              tca.isApproaching = res.isApproaching;
+              tca.tcaSeconds = res.tcaSeconds;
+              tca.peakAzimuthDeg = res.peakAzimuthDeg;
+              tca.peakElevationDeg = res.peakElevationDeg;
+            }
+            if (tca.isApproaching && Number.isFinite(tca.tcaSeconds)) {
+              const limit = Math.min(tca.tcaSeconds, 300);
+              if (limit > 1) {
+                SC_X[0] = x;
+                SC_Y[0] = y;
+                SC_V[0] = 1;
+                for (let k = 1; k <= TCA_ARC_STEPS; k += 1) {
+                  projectForwardPoint(
+                    entity,
+                    observer,
+                    (limit * k) / TCA_ARC_STEPS,
+                    k,
+                    cx,
+                    cy,
+                    R,
+                    zoom,
+                    minEl
+                  );
+                }
+                drawScratchArc(ctx, TCA_ARC_STEPS + 1, '#E879F9', baseAlpha * 0.8, [5, 4]);
+                ctx.globalAlpha = baseAlpha;
+              }
+              if (
+                isSelected &&
+                Number.isFinite(tca.peakElevationDeg) &&
+                tca.peakElevationDeg >= minEl
+              ) {
+                const pk = projectToSkyDome(tca.peakAzimuthDeg, tca.peakElevationDeg, cx, cy, R, zoom);
+                if (pk.visible) {
+                  peakMarkerX = pk.x;
+                  peakMarkerY = pk.y;
+                  peakMarkerEl = tca.peakElevationDeg;
+                }
+              }
             }
           }
         }
 
-        // Sweep beam phosphor afterglow highlight
-        if (state.sweepEnabled && !belowHorizon) {
+        // Sweep afterglow
+        if (state.sweepEnabled) {
           const sweepLag = (sweepAzRef.current - azDeg + 360) % 360;
-          if (sweepLag >= 0 && sweepLag < 24) {
+          if (sweepLag < 24) {
             const boost = 1 - sweepLag / 24;
             ctx.beginPath();
             ctx.arc(x, y, 7 + (1 - boost) * 4, 0, Math.PI * 2);
@@ -1389,18 +1885,44 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           }
         }
 
-        // Heading vector tick projected cleanly in topocentric dome space
-        const headingAngle = projectHeadingAngle(
-          entity,
-          state.observer.lat,
-          state.observer.lon,
-          state.observer.altM,
-          metrics.cx,
-          metrics.cy,
-          metrics.outerRadius,
-          x,
-          y
-        );
+        // 3D scaling
+        let elScale = 0.55 + 0.8 * Math.pow(sinEl, 0.8);
+        const slant = entity.topocentric.slantRangeKm;
+        if (Number.isFinite(slant) && slant < 40) {
+          elScale += 0.12 * clamp01((40 - Math.max(0, slant)) / 40);
+        }
+        const radialSquash = 0.56 + 0.44 * Math.pow(sinEl, 0.65);
+        const glyphScale =
+          elScale *
+          (isSelected
+            ? 1.22
+            : isHovered
+            ? 1.15
+            : entity.category === 'satellite' && entity.group === 'starlink'
+            ? 0.82
+            : 1);
+
+        // Soft float shadow / glow for high-elevation targets
+        if (elDeg > 45) {
+          const k = clamp01((elDeg - 45) / 45);
+          ctx.beginPath();
+          ctx.ellipse(x + 1.5, y + 5 * glyphScale, 6 * glyphScale, 2.4 * glyphScale, 0, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(0, 0, 0, ${(0.22 + 0.14 * k).toFixed(3)})`;
+          ctx.fill();
+          ctx.beginPath();
+          ctx.arc(x, y, 9 * glyphScale, 0, Math.PI * 2);
+          ctx.strokeStyle = color;
+          ctx.globalAlpha = baseAlpha * 0.12 * (0.5 + k);
+          ctx.lineWidth = 3;
+          ctx.stroke();
+          ctx.globalAlpha = baseAlpha;
+        }
+
+        // Tangent-oriented glyph
+        let headingAngle = computeSkyDomeTrajectoryTangent(observer, entity, cx, cy, R, zoom);
+        if (!Number.isFinite(headingAngle)) {
+          headingAngle = (((Number.isFinite(entity.headingDeg) ? entity.headingDeg : 0) - 90) * Math.PI) / 180;
+        }
 
         const tickLen =
           entity.headingValid === false
@@ -1413,18 +1935,25 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             ? 11.5
             : 10;
 
-        if (entity.headingValid !== false && tickLen > 0) {
+        const theta = (azDeg - 90) * DEG2RAD;
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(theta);
+        ctx.scale(radialSquash, 1);
+        ctx.rotate(-theta);
+        if (tickLen > 0) {
           ctx.beginPath();
-          ctx.moveTo(x, y);
-          ctx.lineTo(x + Math.cos(headingAngle) * tickLen, y + Math.sin(headingAngle) * tickLen);
+          ctx.moveTo(0, 0);
+          ctx.lineTo(Math.cos(headingAngle) * tickLen * elScale, Math.sin(headingAngle) * tickLen * elScale);
           ctx.strokeStyle = color;
           ctx.lineWidth = 1.25;
           ctx.stroke();
         }
+        drawGlyph(ctx, entity, 0, 0, headingAngle, color, glyphScale);
+        ctx.restore();
 
-        // Emergency or UASFM/TFR breach pulsing warning halo
         if (isEmergency || isBreach) {
-          const ringR = 8.5 + 3.2 * Math.sin(nowMs * 0.0085);
+          const ringR = (8.5 + 3.2 * Math.sin(nowMs * 0.0085)) * Math.min(1.3, elScale);
           ctx.beginPath();
           ctx.arc(x, y, ringR, 0, Math.PI * 2);
           ctx.strokeStyle = isEmergency ? EMERGENCY_COLOR : BREACH_COLOR;
@@ -1432,13 +1961,6 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.stroke();
         }
 
-        // Category glyph
-        const glyphScale =
-          (belowHorizon ? 0.84 : 1) *
-          (isSelected ? 1.22 : isHovered ? 1.15 : entity.category === 'satellite' && entity.group === 'starlink' ? 0.82 : 1);
-        drawGlyph(ctx, entity, x, y, headingAngle, color, glyphScale);
-
-        // Hover ring
         if (isHovered && !isSelected) {
           ctx.beginPath();
           ctx.arc(x, y, 10.5, 0, Math.PI * 2);
@@ -1447,111 +1969,194 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.stroke();
         }
 
-        // Target-lock reticle
         if (isSelected) {
           drawTargetLockReticle(ctx, x, y, color, nowMs);
         }
 
         ctx.restore();
 
-        nextHits.push({ id: entity.id, x, y, priority });
+        let hit = hitPool.items[hitPool.count];
+        if (!hit) {
+          hit = { id: '', x: 0, y: 0, priority: 0 };
+          hitPool.items[hitPool.count] = hit;
+        }
+        hit.id = entity.id;
+        hit.x = x;
+        hit.y = y;
+        hit.priority = item.priority;
+        hitPool.count += 1;
       }
 
-      renderedHitsRef.current = nextHits;
+      // Predicted peak-elevation marker (crisp, inside the aperture)
+      if (Number.isFinite(peakMarkerX)) {
+        ctx.save();
+        ctx.translate(peakMarkerX, peakMarkerY);
+        ctx.beginPath();
+        ctx.moveTo(0, -5);
+        ctx.lineTo(4, 0);
+        ctx.lineTo(0, 5);
+        ctx.lineTo(-4, 0);
+        ctx.closePath();
+        ctx.fillStyle = '#F5D0FE';
+        ctx.fill();
+        ctx.strokeStyle = '#E879F9';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.restore();
+      }
 
+      ctx.restore(); // aperture clip
+
+      if (Number.isFinite(peakMarkerX)) {
+        const text = `◆ MAX EL ${Math.round(peakMarkerEl)}°`;
+        ctx.font = `700 9px ${MONO_FONT}`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        const tw = ctx.measureText(text).width + 8;
+        const px = Math.max(8, Math.min(metrics.width - tw - 8, peakMarkerX + 8));
+        const py = Math.max(8, Math.min(metrics.height - 21, peakMarkerY - 18));
+        ctx.fillStyle = 'rgba(15, 10, 30, 0.88)';
+        ctx.strokeStyle = 'rgba(232, 121, 249, 0.65)';
+        ctx.lineWidth = 0.8;
+        ctx.beginPath();
+        traceRoundedRect(ctx, px, py, tw, 13, 3);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#F5D0FE';
+        ctx.fillText(text, px + 4, py + 6.8);
+      }
+
+      // Pointer hover resolution
       const activeUnits = state.units ?? unitsRef.current;
-
       if (pointerInsideRef.current && lastPointerRef.current) {
         const pt = lastPointerRef.current;
-        const liveHitId = findNearestHitInList(nextHits, pt.px, pt.py, HIT_RADIUS_PX);
+        const liveHitId = findNearestHitInList(hitPool, pt.px, pt.py, HIT_RADIUS_PX);
         if (state.hoveredId !== liveHitId) {
           canvas.style.cursor = liveHitId ? 'pointer' : 'crosshair';
           state.setHoveredId(liveHitId);
         }
-        const nextText = formatCursorReadoutText(pt.px, pt.py, metrics, liveHitId, activeUnits);
+        const nextText = formatCursorReadoutText(pt.px, pt.py, metrics, liveHitId, activeUnits, zoom);
         if (cursorReadoutRef.current && cursorReadoutRef.current.textContent !== nextText) {
           cursorReadoutRef.current.textContent = nextText;
         }
-      } else if (
-        pointerInsideRef.current &&
-        state.hoveredId !== null &&
-        !nextHits.some((h) => h.id === state.hoveredId)
-      ) {
-        canvas.style.cursor = 'crosshair';
-        state.setHoveredId(null);
+      } else if (pointerInsideRef.current && state.hoveredId !== null) {
+        let present = false;
+        for (let i = 0; i < hitPool.count; i += 1) {
+          if (hitPool.items[i].id === state.hoveredId) {
+            present = true;
+            break;
+          }
+        }
+        if (!present) {
+          canvas.style.cursor = 'crosshair';
+          state.setHoveredId(null);
+        }
       }
 
-      // 4. Target callsign labels (highest priority first with non-overlapping collision boxes)
-      const placedLabels: LabelBox[] = [];
-      ctx.save();
-      ctx.textAlign = 'left';
-      ctx.textBaseline = 'middle';
-
-      let labelsDrawn = 0;
-      const isPipFrame = state.layout === 'map' && state.skyDomePip;
+      // Labels: build candidates from highest priority downward, then solve layout
       const compactDome = metrics.width < 420 || metrics.height < 360;
-      const maxAutoLabels = isPipFrame ? 0 : metrics.width < 420 ? 12 : 26;
-
-      for (let i = visible.length - 1; i >= 0; i -= 1) {
-        const item = visible[i];
+      candCount = 0;
+      for (let i = sorted.length - 1; i >= 0 && candCount < 40; i -= 1) {
+        const item = sorted[i];
         const mustShow = item.isSelected || item.isHovered;
-        if (!mustShow && !state.domeLabelsEnabled) continue;
-        if (!mustShow && labelsDrawn >= maxAutoLabels) continue;
-
-        const isHighPriority =
-          mustShow || item.isEmergency || item.isBreach || item.priority >= 58;
+        if (!mustShow && (isPipFrame || !state.domeLabelsEnabled)) continue;
+        if (!mustShow && item.elDeg < (zoom === 'zenith' ? 34 : 8)) continue;
+        const isHigh = mustShow || item.isEmergency || item.isBreach || item.priority >= 58;
         const elRounded = Math.round(item.elDeg);
-        const elStr = `${elRounded === 0 ? 0 : elRounded}°`;
-        const altStr = isHighPriority ? formatCompactDomeAltitude(item.entity, activeUnits) : '';
-        const labelText = isHighPriority
-          ? altStr
-            ? `${item.entity.callsign} · ${altStr} · ${elStr}`
-            : `${item.entity.callsign} · ${elStr}`
-          : item.entity.callsign;
-
+        let text: string;
+        if (isPipFrame) {
+          text = item.entity.callsign;
+        } else if (isHigh) {
+          const altStr = formatCompactDomeAltitude(item.entity, activeUnits);
+          text = altStr
+            ? `${item.entity.callsign} · ${altStr} · ${elRounded}°`
+            : `${item.entity.callsign} · ${elRounded}°`;
+        } else {
+          text = item.entity.callsign;
+        }
         ctx.font = mustShow
           ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
           : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
+        let cand = candPool[candCount];
+        if (!cand) {
+          cand = {
+            id: '',
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 15,
+            elDeg: 0,
+            slantRangeKm: 0,
+            isSelected: false,
+            isHovered: false,
+            isEmergency: false,
+            isBreach: false,
+            text: '',
+            color: '',
+          };
+          candPool[candCount] = cand;
+        }
+        candCount += 1;
+        cand.id = item.entity.id;
+        cand.x = item.x;
+        cand.y = item.y;
+        cand.w = ctx.measureText(text).width + 10;
+        cand.h = 15;
+        cand.elDeg = item.elDeg;
+        cand.slantRangeKm = item.entity.topocentric.slantRangeKm;
+        cand.isSelected = item.isSelected;
+        cand.isHovered = item.isHovered;
+        cand.isEmergency = item.isEmergency;
+        cand.isBreach = item.isBreach;
+        cand.text = text;
+        cand.color = item.color;
+      }
 
-        const textW = ctx.measureText(labelText).width;
-        const boxW = textW + 10;
-        const boxH = 15;
+      const layoutResult = solveDomeLabelLayout({
+        candidates: candPool,
+        count: candCount,
+        width: metrics.width,
+        height: metrics.height,
+        cx,
+        cy,
+        radius: R,
+        mode: labelMode,
+        zoomMode: zoom,
+        labelsEnabled: state.domeLabelsEnabled,
+        out: placedPool,
+        order: labelOrder,
+      });
 
-        const box = resolveLabelBox(
-          item.x,
-          item.y,
-          boxW,
-          boxH,
-          metrics.width,
-          metrics.height,
-          placedLabels,
-          mustShow
-        );
-        if (!box) continue;
-
-        placedLabels.push(box);
-        if (!mustShow) labelsDrawn += 1;
-
-        ctx.fillStyle = mustShow ? 'rgba(7, 10, 17, 0.92)' : 'rgba(7, 10, 17, 0.84)';
-        ctx.strokeStyle = mustShow
-          ? item.color
-          : isHighPriority
-          ? 'rgba(255, 255, 255, 0.16)'
-          : 'rgba(255, 255, 255, 0.10)';
-        ctx.lineWidth = mustShow ? 1.1 : 0.75;
+      ctx.save();
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i < layoutResult.count; i += 1) {
+        const lb = layoutResult.labels[i];
+        const dx = lb.leaderX - lb.anchorX;
+        const dy = lb.leaderY - lb.anchorY;
+        const len = Math.hypot(dx, dy);
+        if (len > 6) {
+          const sx = lb.anchorX + (dx / len) * 5;
+          const sy = lb.anchorY + (dy / len) * 5;
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(lb.leaderX, lb.leaderY);
+          ctx.strokeStyle = 'rgba(203, 213, 225, 0.45)';
+          ctx.lineWidth = 1;
+          ctx.stroke();
+        }
+        ctx.font = lb.mustShow
+          ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
+          : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
+        ctx.fillStyle = lb.mustShow ? 'rgba(7, 10, 17, 0.92)' : 'rgba(7, 10, 17, 0.84)';
+        ctx.strokeStyle = lb.mustShow ? lb.color : 'rgba(255, 255, 255, 0.14)';
+        ctx.lineWidth = lb.mustShow ? 1.1 : 0.75;
         ctx.beginPath();
-        traceRoundedRect(ctx, box.x, box.y, box.w, box.h, 3);
+        traceRoundedRect(ctx, lb.x, lb.y, lb.w, lb.h, 3);
         ctx.fill();
         ctx.stroke();
-
-        ctx.fillStyle = mustShow
-          ? '#F8FAFC'
-          : item.elDeg < 0
-          ? '#94A3B8'
-          : isHighPriority
-          ? '#E2E8F0'
-          : '#CBD5E1';
-        ctx.fillText(labelText, box.x + 5, box.y + box.h / 2 + 0.5);
+        ctx.fillStyle = lb.mustShow ? '#F8FAFC' : '#E2E8F0';
+        ctx.fillText(lb.text, lb.x + 5, lb.y + lb.h / 2 + 0.5);
       }
       ctx.restore();
     };
@@ -1584,7 +2189,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const updateCursorReadout = (px: number, py: number, hitId: string | null) => {
     if (!cursorReadoutRef.current) return;
     const activeUnits = useSkyStore.getState().units ?? unitsRef.current;
-    const nextText = formatCursorReadoutText(px, py, metricsRef.current, hitId, activeUnits);
+    const nextText = formatCursorReadoutText(px, py, metricsRef.current, hitId, activeUnits, zoomRef.current);
     if (cursorReadoutRef.current.textContent !== nextText) {
       cursorReadoutRef.current.textContent = nextText;
     }
@@ -2000,7 +2605,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                     fontVariantNumeric: 'tabular-nums',
                   }}
                 >
-                  90° ZEN · 0° HRZ · {orbitalScope === 'cylinder' ? 'CYLINDER' : 'HEMISPHERE'}
+                  {skyDomeZoom === 'zenith' ? '90° ZEN · 30° LIMB · ' : '90° ZEN · 0° HRZ · '}{orbitalScope === 'cylinder' ? 'CYLINDER' : skyDomeZoom === 'zenith' ? 'ZENITH' : 'HEMISPHERE'}
                 </div>
               )}
             </div>
@@ -2036,24 +2641,25 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 <span style={ledStyle(domeLabelsEnabled, '#38BDF8')} />
                 <span>LABELS</span>
               </button>
+              <button
+                type="button"
+                data-testid="skydome-zoom-toggle"
+                aria-pressed={skyDomeZoom === 'zenith'}
+                style={bezelButtonStyle(skyDomeZoom === 'zenith')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleSkyDomeZoom();
+                }}
+              >
+                <span>{skyDomeZoom === 'zenith' ? 'ZENITH 30°+' : 'HEMISPHERE 0°'}</span>
+              </button>
             </div>
 
             {/* Bottom-Right Horizon & Orbital Legend */}
             <div className="skydome-legend" style={legendStyle}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
-                <span>0° HRZ</span>
-              </span>
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                <span
-                  style={{
-                    width: 8,
-                    height: 2,
-                    borderTop: '1px dashed rgba(245, 158, 11, 0.75)',
-                    display: 'inline-block',
-                  }}
-                />
-                <span>-5° OTH</span>
+                <span>{skyDomeZoom === 'zenith' ? '30° LIMB' : '0° HRZ'}</span>
               </span>
               {!isCompact && (
                 <>
@@ -2077,40 +2683,6 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
 function pulseWaveStartMsExpired(startMs: number | null, nowMs: number): boolean {
   return startMs !== null && nowMs - startMs >= PULSE_WAVE_DURATION_MS;
-}
-
-function drawPolarTrail(
-  ctx: CanvasRenderingContext2D,
-  points: Array<{ x: number; y: number }>,
-  color: string,
-  maxSegmentLengthPx: number
-): void {
-  if (points.length < 2) return;
-  for (let i = 1; i < points.length; i += 1) {
-    const p0 = points[i - 1];
-    const p1 = points[i];
-    if (
-      !Number.isFinite(p0.x) ||
-      !Number.isFinite(p0.y) ||
-      !Number.isFinite(p1.x) ||
-      !Number.isFinite(p1.y)
-    ) {
-      continue;
-    }
-    if (Math.hypot(p1.x - p0.x, p1.y - p0.y) > maxSegmentLengthPx) {
-      continue;
-    }
-    const segAlpha = (i / points.length) * 0.5;
-    ctx.save();
-    ctx.globalAlpha *= segAlpha;
-    ctx.beginPath();
-    ctx.moveTo(p0.x, p0.y);
-    ctx.lineTo(p1.x, p1.y);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1.2;
-    ctx.stroke();
-    ctx.restore();
-  }
 }
 
 export default PolarSkyDome;
