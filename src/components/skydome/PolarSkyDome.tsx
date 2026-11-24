@@ -5,7 +5,7 @@ import {
   useState,
   type CSSProperties,
   type MouseEvent,
-  type TouchEvent,
+  type PointerEvent,
 } from 'react';
 import {
   BREACH_COLOR,
@@ -30,6 +30,8 @@ import {
   extrapolateDeadReckoning,
   normalizeAzimuthDeg,
   projectToSkyDome,
+  shortestAngleDeltaDeg,
+  smoothCompassHeadingDeg,
   unprojectFromSkyDome,
 } from '../../math/geodesy';
 import { formatAltitude, formatDistance } from '../../math/units';
@@ -40,7 +42,11 @@ export interface PolarSkyDomeProps {
 
 const HIT_RADIUS_PX = 13;
 const TOUCH_HIT_RADIUS_PX = 20;
-const TOUCH_DRAG_THRESHOLD_PX = 10;
+const DRAG_THRESHOLD_PX = 6;
+const DRAG_CENTER_DEADZONE_PX = 6;
+const COMPASS_SMOOTH_ALPHA = 0.18;
+const COMPASS_PROBE_TIMEOUT_MS = 1500;
+const COMPASS_STATUS_DURATION_MS = 4500;
 const SWEEP_DEG_PER_MS = 0.045; // 1 revolution ~ 8s
 const PULSE_WAVE_DURATION_MS = 950;
 const TRAIL_SAMPLE_INTERVAL_MS = 450;
@@ -53,6 +59,62 @@ const TCA_REFRESH_MS = 500;
 const FORWARD_ARC_DTS: readonly number[] = [0, 15, 30, 45, 60];
 const TCA_ARC_STEPS = 6;
 const LIMB_FADE_DEG = 4;
+
+export type CompassOrientationEvent = Partial<
+  Pick<DeviceOrientationEvent, 'alpha' | 'absolute' | 'type'>
+> & {
+  webkitCompassHeading?: number;
+};
+
+/**
+ * Extract true North-referenced compass heading [0, 360) from a DeviceOrientationEvent.
+ * Supports iOS WebKit `webkitCompassHeading` and Android/Chromium absolute `alpha` with
+ * screen-orientation compensation. Returns null for relative/invalid readings.
+ */
+export function extractCompassHeadingDeg(
+  event: CompassOrientationEvent,
+  screenOrientationAngle?: number
+): number | null {
+  if (!event) return null;
+
+  if (
+    typeof event.webkitCompassHeading === 'number' &&
+    Number.isFinite(event.webkitCompassHeading) &&
+    event.webkitCompassHeading >= 0
+  ) {
+    return normalizeAzimuthDeg(event.webkitCompassHeading);
+  }
+
+  const isAbsolute =
+    event.absolute === true || event.type === 'deviceorientationabsolute';
+  if (isAbsolute && typeof event.alpha === 'number' && Number.isFinite(event.alpha)) {
+    let screenAngle = 0;
+    if (typeof screenOrientationAngle === 'number' && Number.isFinite(screenOrientationAngle)) {
+      screenAngle = screenOrientationAngle;
+    } else if (typeof window !== 'undefined') {
+      const soAngle = window.screen?.orientation?.angle;
+      const legacyAngle = (window as unknown as { orientation?: number }).orientation;
+      if (typeof soAngle === 'number' && Number.isFinite(soAngle)) {
+        screenAngle = soAngle;
+      } else if (typeof legacyAngle === 'number' && Number.isFinite(legacyAngle)) {
+        screenAngle = legacyAngle;
+      }
+    }
+    return normalizeAzimuthDeg(360 - event.alpha + screenAngle);
+  }
+
+  return null;
+}
+
+function resolveCanvasCursor(
+  hitId: string | null,
+  locked: boolean,
+  dragging: boolean
+): string {
+  if (dragging && !locked) return 'grabbing';
+  if (hitId) return 'pointer';
+  return locked ? 'crosshair' : 'grab';
+}
 
 function minElevationFor(zoom: SkyDomeZoomMode): number {
   return zoom === 'zenith' ? 30 : 0;
@@ -102,7 +164,6 @@ interface CanvasMetrics {
 
 interface VaultCache {
   key: string;
-  bg: CanvasGradient | null;
   vault: CanvasGradient | null;
   bezel: CanvasGradient | null;
   sweep: CanvasGradient | null;
@@ -680,7 +741,8 @@ function drawOrbitPassArc(
   cx: number,
   cy: number,
   outerRadius: number,
-  zoom: SkyDomeZoomMode
+  zoom: SkyDomeZoomMode,
+  rotationDeg = 0
 ): void {
   if (!selectedId || overlay.passArcAzEl.length < 2) return;
   const selectedEntity = liveKinematicsRegistry.entities.get(selectedId);
@@ -722,7 +784,15 @@ function drawOrbitPassArc(
       }
       if (pt.elDeg < minEl) {
         if (penDown && prev && prev.elDeg >= minEl) {
-          const e = projectToSkyDome(crossAzimuth(prev, pt), minEl, cx, cy, outerRadius, zoom);
+          const e = projectToSkyDome(
+            crossAzimuth(prev, pt),
+            minEl,
+            cx,
+            cy,
+            outerRadius,
+            zoom,
+            rotationDeg
+          );
           ctx.lineTo(e.x, e.y);
         }
         penDown = false;
@@ -730,11 +800,19 @@ function drawOrbitPassArc(
         continue;
       }
       if (!penDown && prev && prev.elDeg < minEl) {
-        const e = projectToSkyDome(crossAzimuth(prev, pt), minEl, cx, cy, outerRadius, zoom);
+        const e = projectToSkyDome(
+          crossAzimuth(prev, pt),
+          minEl,
+          cx,
+          cy,
+          outerRadius,
+          zoom,
+          rotationDeg
+        );
         ctx.moveTo(e.x, e.y);
         penDown = true;
       }
-      const p = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, outerRadius, zoom);
+      const p = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, outerRadius, zoom, rotationDeg);
       if (!penDown) {
         ctx.moveTo(p.x, p.y);
         penDown = true;
@@ -774,7 +852,7 @@ function drawOrbitPassArc(
   }
 
   if (peak && Number.isFinite(peak.azDeg) && Number.isFinite(peak.elDeg) && peak.elDeg >= minEl) {
-    const pp = projectToSkyDome(peak.azDeg, peak.elDeg, cx, cy, outerRadius, zoom);
+    const pp = projectToSkyDome(peak.azDeg, peak.elDeg, cx, cy, outerRadius, zoom, rotationDeg);
     drawTcaStar(ctx, pp.x, pp.y);
 
     const tcaText = `TCA ${peak.elDeg.toFixed(0)}°`;
@@ -853,36 +931,31 @@ function ensureVaultCache(
 ): VaultCache {
   const key = `${m.width}x${m.height}@${m.dpr}:${zoom}:${m.outerRadius.toFixed(2)}`;
   if (cache.key === key && cache.vault) return cache;
-  const { cx, cy, outerRadius: R, width, height } = m;
+  const { cx, cy, outerRadius: R } = m;
   cache.key = key;
 
-  const bg = ctx.createRadialGradient(cx, cy, 4, cx, cy, Math.max(width, height) * 0.75);
-  bg.addColorStop(0, '#0B1626');
-  bg.addColorStop(0.6, '#070E1A');
-  bg.addColorStop(1, '#04070D');
-  cache.bg = bg;
-
+  // Translucent glass dome wash (0.24–0.38 alpha) so live MapLibre traffic stays visible underneath
   const vault = ctx.createRadialGradient(cx - R * 0.22, cy - R * 0.3, R * 0.04, cx, cy, R);
-  vault.addColorStop(0, 'rgba(48, 104, 150, 0.30)');
-  vault.addColorStop(0.4, 'rgba(20, 44, 76, 0.50)');
-  vault.addColorStop(0.82, 'rgba(8, 17, 32, 0.68)');
-  vault.addColorStop(1, 'rgba(3, 7, 14, 0.86)');
+  vault.addColorStop(0, 'rgba(24, 58, 92, 0.24)');
+  vault.addColorStop(0.4, 'rgba(12, 28, 48, 0.30)');
+  vault.addColorStop(0.82, 'rgba(6, 13, 24, 0.36)');
+  vault.addColorStop(1, 'rgba(4, 8, 16, 0.38)');
   cache.vault = vault;
 
   const bezel = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
-  bezel.addColorStop(0, 'rgba(255, 255, 255, 0.78)');
-  bezel.addColorStop(0.3, 'rgba(180, 225, 255, 0.22)');
-  bezel.addColorStop(0.62, 'rgba(70, 110, 150, 0.08)');
-  bezel.addColorStop(1, 'rgba(255, 255, 255, 0.38)');
+  bezel.addColorStop(0, 'rgba(255, 255, 255, 0.84)');
+  bezel.addColorStop(0.3, 'rgba(180, 225, 255, 0.28)');
+  bezel.addColorStop(0.62, 'rgba(70, 110, 150, 0.12)');
+  bezel.addColorStop(1, 'rgba(255, 255, 255, 0.44)');
   cache.bezel = bezel;
 
   if (typeof ctx.createConicGradient === 'function') {
-    const arc = (46 * DEG2RAD);
+    const arc = 46 * DEG2RAD;
     const sweep = ctx.createConicGradient(-arc, 0, 0);
     const frac = arc / (Math.PI * 2);
     sweep.addColorStop(0, 'rgba(34, 211, 238, 0)');
-    sweep.addColorStop(frac * 0.7, 'rgba(34, 211, 238, 0.035)');
-    sweep.addColorStop(frac, 'rgba(34, 211, 238, 0.13)');
+    sweep.addColorStop(frac * 0.7, 'rgba(34, 211, 238, 0.045)');
+    sweep.addColorStop(frac, 'rgba(34, 211, 238, 0.16)');
     sweep.addColorStop(Math.min(1, frac + 0.002), 'rgba(34, 211, 238, 0)');
     sweep.addColorStop(1, 'rgba(34, 211, 238, 0)');
     cache.sweep = sweep;
@@ -909,19 +982,20 @@ function drawVault(
   pulseWaveStartMs: number | null,
   nowMs: number,
   twilightK: number,
-  sunAzDeg: number
+  sunAzDeg: number,
+  rotationDeg: number,
+  isPipFrame: boolean
 ): void {
   const { cx, cy, outerRadius: R, width, height } = m;
   const minDim = Math.min(width, height);
-  const isPipGrid = minDim <= 260;
+  const isPipGrid = isPipFrame;
   const compact = minDim < 360;
   const minEl = minElevationFor(zoom);
   ensureVaultCache(ctx, m, zoom, cache);
 
-  ctx.fillStyle = cache.bg as CanvasGradient;
-  ctx.fillRect(0, 0, width, height);
+  ctx.globalAlpha = 1;
 
-  // Spherical vault glass
+  // Translucent spherical vault glass only inside the aperture (outside pixels stay 100% transparent)
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
   ctx.fillStyle = cache.vault as CanvasGradient;
@@ -934,7 +1008,7 @@ function drawVault(
     ctx.arc(cx, cy, R + 6, 0, Math.PI * 2);
     ctx.clip();
     ctx.translate(cx, cy);
-    ctx.rotate((sunAzDeg - 90) * DEG2RAD);
+    ctx.rotate((sunAzDeg - rotationDeg - 90) * DEG2RAD);
     ctx.globalAlpha = Math.min(1, twilightK);
     ctx.fillStyle = cache.glow as CanvasGradient;
     ctx.beginPath();
@@ -943,26 +1017,27 @@ function drawVault(
     ctx.restore();
   }
 
-  // Subtle sweep cone
+  // Subtle sweep cone (rotated cohesively with dome heading)
   if (sweepEnabled) {
     ctx.save();
+    ctx.globalAlpha = 1;
     ctx.beginPath();
     ctx.arc(cx, cy, R, 0, Math.PI * 2);
     ctx.clip();
     ctx.translate(cx, cy);
-    ctx.rotate((sweepAzDeg - 90) * DEG2RAD);
+    ctx.rotate((sweepAzDeg - rotationDeg - 90) * DEG2RAD);
     const arc = 46 * DEG2RAD;
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.arc(0, 0, R, -arc, 0);
     ctx.closePath();
-    ctx.fillStyle = cache.sweep ?? 'rgba(34, 211, 238, 0.045)';
+    ctx.fillStyle = cache.sweep ?? 'rgba(34, 211, 238, 0.05)';
     ctx.fill();
     ctx.beginPath();
     ctx.moveTo(0, 0);
     ctx.lineTo(R, 0);
-    ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = 'rgba(34, 211, 238, 0.62)';
+    ctx.lineWidth = 1.25;
     ctx.stroke();
     ctx.restore();
   }
@@ -975,7 +1050,7 @@ function drawVault(
       ctx.save();
       ctx.beginPath();
       ctx.arc(cx, cy, progress * R, 0, Math.PI * 2);
-      ctx.globalAlpha = (1 - progress) * 0.75;
+      ctx.globalAlpha = (1 - progress) * 0.78;
       ctx.strokeStyle = '#22D3EE';
       ctx.lineWidth = 2.2 * (1 - progress * 0.5);
       ctx.stroke();
@@ -983,7 +1058,9 @@ function drawVault(
     }
   }
 
-  // 15° spokes, fading out toward the zenith before 70° elevation
+  ctx.globalAlpha = 1;
+
+  // 15° spokes, fading out toward center above 70° elevation
   const spokeInnerR = elevationToVaultNormR(70, zoom) * R;
   const SPOKE_SEGS = 4;
   for (let s = 0; s < SPOKE_SEGS; s += 1) {
@@ -992,18 +1069,18 @@ function drawVault(
     const fade = (s + 1) / SPOKE_SEGS;
     ctx.beginPath();
     for (let az = 0; az < 360; az += 15) {
-      const th = (az - 90) * DEG2RAD;
+      const th = (az - rotationDeg - 90) * DEG2RAD;
       const cs = Math.cos(th);
       const sn = Math.sin(th);
       ctx.moveTo(cx + r0 * cs, cy + r0 * sn);
       ctx.lineTo(cx + r1 * cs, cy + r1 * sn);
     }
-    ctx.strokeStyle = `rgba(120, 190, 255, ${(0.2 * fade * fade).toFixed(3)})`;
-    ctx.lineWidth = 0.75;
+    ctx.strokeStyle = `rgba(120, 190, 255, ${(0.24 * fade * fade).toFixed(3)})`;
+    ctx.lineWidth = 0.8;
     ctx.stroke();
   }
 
-  // Recessed elevation rings
+  // Recessed elevation rings (100% opaque foreground contrast)
   const rings = zoom === 'zenith' ? [75, 60, 45] : [60, 30];
   ctx.beginPath();
   for (let i = 0; i < rings.length; i += 1) {
@@ -1011,8 +1088,8 @@ function drawVault(
     ctx.moveTo(cx + r, cy);
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
   }
-  ctx.strokeStyle = 'rgba(0, 0, 0, 0.55)';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.58)';
+  ctx.lineWidth = 1.05;
   ctx.stroke();
   ctx.beginPath();
   for (let i = 0; i < rings.length; i += 1) {
@@ -1020,20 +1097,20 @@ function drawVault(
     ctx.moveTo(cx + r, cy);
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
   }
-  ctx.strokeStyle = 'rgba(120, 190, 255, 0.24)';
-  ctx.lineWidth = 0.8;
+  ctx.strokeStyle = 'rgba(120, 190, 255, 0.30)';
+  ctx.lineWidth = 0.9;
   ctx.stroke();
 
   // Bezel: dark seat, limb ring, 1px specular glass edge
   ctx.beginPath();
   ctx.arc(cx, cy, R + 1.5, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(2, 5, 10, 0.9)';
+  ctx.strokeStyle = 'rgba(2, 5, 10, 0.92)';
   ctx.lineWidth = 3;
   ctx.stroke();
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
-  ctx.lineWidth = 1.2;
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.62)';
+  ctx.lineWidth = 1.3;
   ctx.stroke();
   ctx.beginPath();
   ctx.arc(cx, cy, R + 0.5, 0, Math.PI * 2);
@@ -1041,37 +1118,55 @@ function drawVault(
   ctx.lineWidth = 1;
   ctx.stroke();
 
-  // Exterior 15° ticks (5° minors outside PIP)
+  // Exterior 15° ticks (5° minors outside PIP), rotated cohesively with dome heading
   ctx.beginPath();
   for (let az = 0; az < 360; az += 5) {
     const major = az % 15 === 0;
     if (!major) continue;
-    const th = (az - 90) * DEG2RAD;
+    const th = (az - rotationDeg - 90) * DEG2RAD;
     const cs = Math.cos(th);
     const sn = Math.sin(th);
     ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
     ctx.lineTo(cx + (R + 7) * cs, cy + (R + 7) * sn);
   }
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.65)';
+  ctx.lineWidth = 1.05;
   ctx.stroke();
   if (!isPipGrid) {
     ctx.beginPath();
     for (let az = 0; az < 360; az += 5) {
       if (az % 15 === 0) continue;
-      const th = (az - 90) * DEG2RAD;
+      const th = (az - rotationDeg - 90) * DEG2RAD;
       const cs = Math.cos(th);
       const sn = Math.sin(th);
       ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
       ctx.lineTo(cx + (R + 5) * cs, cy + (R + 5) * sn);
     }
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.24)';
-    ctx.lineWidth = 0.65;
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.32)';
+    ctx.lineWidth = 0.7;
     ctx.stroke();
   }
 
-  // Zenith crosshair (hemisphere only; the zenith lens is cut off at 30°)
-  ctx.strokeStyle = 'rgba(56, 189, 248, 0.55)';
+  // Fixed 12-o'clock heading lubber triangle tick on outer bezel
+  ctx.save();
+  ctx.globalAlpha = 1;
+  const lubberHalfW = isPipGrid ? 3.8 : compact ? 4.4 : 5.0;
+  const lubberTipY = cy - R + 1.5;
+  const lubberBaseY = cy - R - (isPipGrid ? 5.2 : 6.4);
+  ctx.beginPath();
+  ctx.moveTo(cx, lubberTipY);
+  ctx.lineTo(cx - lubberHalfW, lubberBaseY);
+  ctx.lineTo(cx + lubberHalfW, lubberBaseY);
+  ctx.closePath();
+  ctx.fillStyle = '#38BDF8';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(4, 8, 16, 0.92)';
+  ctx.lineWidth = 1.1;
+  ctx.stroke();
+  ctx.restore();
+
+  // Center overhead crosshair
+  ctx.strokeStyle = 'rgba(56, 189, 248, 0.65)';
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(cx - 5, cy);
@@ -1084,12 +1179,13 @@ function drawVault(
   ctx.fillStyle = '#38BDF8';
   ctx.fill();
 
-  // Elevation ring annotations (no sub-horizon labels)
+  // Elevation ring annotations at fixed top-right-of-center angle (always upright)
   ctx.save();
+  ctx.globalAlpha = 1;
   ctx.font = `600 ${isPipGrid ? 8 : compact ? 8.5 : 9.5}px ${MONO_FONT}`;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
-  const labelTheta = (-90 + 8) * DEG2RAD;
+  const labelTheta = (-90 + 12) * DEG2RAD;
   const lcs = Math.cos(labelTheta);
   const lsn = Math.sin(labelTheta);
   const ringLabelEls = zoom === 'zenith' ? [75, 60, 45, 30] : [60, 30, 0];
@@ -1098,40 +1194,42 @@ function drawVault(
     const r = elevationToVaultNormR(el, zoom) * R;
     const lx = cx + r * lcs;
     const ly = cy + r * lsn;
-    ctx.fillStyle = 'rgba(6, 11, 20, 0.78)';
+    ctx.fillStyle = 'rgba(6, 11, 20, 0.86)';
     ctx.fillRect(lx - 2, ly - 5, isPipGrid ? 16 : 20, 10);
-    ctx.fillStyle = el === minEl ? 'rgba(34, 211, 238, 0.9)' : 'rgba(148, 163, 184, 0.78)';
+    ctx.fillStyle = el === minEl ? 'rgba(34, 211, 238, 0.96)' : 'rgba(203, 213, 225, 0.88)';
     ctx.fillText(`${el}°`, lx, ly);
   }
   ctx.restore();
 
-  // N/E/S/W badges and intercardinal captions outside the bezel
+  // N/E/S/W badges and intercardinal captions outside the bezel (orbit with rotationDeg, text upright)
   ctx.save();
+  ctx.globalAlpha = 1;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   const badgeR = isPipGrid ? 6.5 : compact ? 8 : 9;
   for (let i = 0; i < COMPASS_BEACONS.length; i += 1) {
     const beacon = COMPASS_BEACONS[i];
     if (isPipGrid && !beacon.cardinal) continue;
-    const th = (beacon.azDeg - 90) * DEG2RAD;
+    const th = (beacon.azDeg - rotationDeg - 90) * DEG2RAD;
     if (beacon.cardinal) {
       const dist = R + 8 + badgeR;
       const bx = cx + dist * Math.cos(th);
       const by = cy + dist * Math.sin(th);
       ctx.beginPath();
       ctx.arc(bx, by, badgeR, 0, Math.PI * 2);
-      ctx.fillStyle = 'rgba(7, 12, 22, 0.92)';
+      ctx.fillStyle = 'rgba(7, 12, 22, 0.95)';
       ctx.fill();
-      ctx.strokeStyle = beacon.azDeg === 0 ? 'rgba(34, 211, 238, 0.8)' : 'rgba(148, 163, 184, 0.45)';
-      ctx.lineWidth = 1;
+      ctx.strokeStyle =
+        beacon.azDeg === 0 ? 'rgba(34, 211, 238, 0.92)' : 'rgba(148, 163, 184, 0.58)';
+      ctx.lineWidth = 1.1;
       ctx.stroke();
       ctx.font = `700 ${isPipGrid ? 8 : compact ? 9.5 : 11}px ${MONO_FONT}`;
-      ctx.fillStyle = beacon.azDeg === 0 ? '#22D3EE' : '#CBD5E1';
+      ctx.fillStyle = beacon.azDeg === 0 ? '#22D3EE' : '#E2E8F0';
       ctx.fillText(beacon.label, bx, by + 0.5);
     } else {
       const dist = R + 13;
       ctx.font = `600 ${compact ? 8 : 9}px ${MONO_FONT}`;
-      ctx.fillStyle = '#64748B';
+      ctx.fillStyle = '#94A3B8';
       ctx.fillText(beacon.label, cx + dist * Math.cos(th), cy + dist * Math.sin(th));
     }
   }
@@ -1189,7 +1287,8 @@ function formatCursorReadoutText(
   metrics: CanvasMetrics,
   hitId: string | null,
   units: UnitSystem,
-  zoom: SkyDomeZoomMode
+  zoom: SkyDomeZoomMode,
+  rotationDeg = 0
 ): string {
   if (hitId) {
     const entity = liveKinematicsRegistry.entities.get(hitId);
@@ -1207,7 +1306,15 @@ function formatCursorReadoutText(
     return DEFAULT_CURSOR_READOUT;
   }
 
-  const un = unprojectFromSkyDome(px, py, metrics.cx, metrics.cy, metrics.outerRadius, zoom);
+  const un = unprojectFromSkyDome(
+    px,
+    py,
+    metrics.cx,
+    metrics.cy,
+    metrics.outerRadius,
+    zoom,
+    rotationDeg
+  );
   if (un.inBounds) {
     const { azStr, elStr } = formatReadoutAngles(un.azimuthDeg, un.elevationDeg);
     return `AZ ${azStr}° · EL ${elStr} · RNG ---`;
@@ -1230,7 +1337,8 @@ function projectForwardPoint(
   cy: number,
   R: number,
   zoom: SkyDomeZoomMode,
-  minEl: number
+  minEl: number,
+  rotationDeg = 0
 ): void {
   const ext = extrapolateDeadReckoning(
     entity.lat,
@@ -1242,7 +1350,7 @@ function projectForwardPoint(
     Number.isFinite(entity.vertRateMs) ? (entity.vertRateMs as number) : 0
   );
   const look = computeTopocentricLookAngles(observer, ext, false);
-  const p = projectToSkyDome(look.azimuthDeg, look.elevationDeg, cx, cy, R, zoom);
+  const p = projectToSkyDome(look.azimuthDeg, look.elevationDeg, cx, cy, R, zoom, rotationDeg);
   SC_X[idx] = p.x;
   SC_Y[idx] = p.y;
   SC_V[idx] = p.visible && look.elevationDeg >= minEl ? 1 : 0;
@@ -1342,13 +1450,26 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const lastObserverKeyRef = useRef<string>('');
   const pointerInsideRef = useRef<boolean>(false);
   const lastPointerRef = useRef<{ px: number; py: number } | null>(null);
-  const touchStartRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
-  const lastTouchEndMsRef = useRef<number>(-Infinity);
+  const dragRef = useRef<{
+    pointerId: number;
+    pointerType: string;
+    startX: number;
+    startY: number;
+    lastAngleDeg: number;
+    hasValidAngle: boolean;
+    moved: boolean;
+  } | null>(null);
+  const isDraggingRef = useRef<boolean>(false);
+  const lastPointerActionMsRef = useRef<number>(-Infinity);
+  const compassTargetDegRef = useRef<number | null>(null);
+  const compassStatusTimerRef = useRef<number | null>(null);
   const sweepAzRef = useRef<number>(0);
   const lastFrameMsRef = useRef<number>(0);
   const pulseWaveStartRef = useRef<number | null>(null);
 
   const [isCompact, setIsCompact] = useState(false);
+  const [showFullLegend, setShowFullLegend] = useState(true);
+  const [compassStatusMsg, setCompassStatusMsg] = useState<string | null>(null);
 
   const layout = useSkyStore((s) => s.layout);
   const setLayout = useSkyStore((s) => s.setLayout);
@@ -1362,14 +1483,45 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
   const skyDomeZoom = useSkyStore((s) => s.skyDomeZoom);
   const toggleSkyDomeZoom = useSkyStore((s) => s.toggleSkyDomeZoom);
+  const domeRotationDeg = useSkyStore((s) => s.domeRotationDeg);
+  const domeRotationLocked = useSkyStore((s) => s.domeRotationLocked);
+  const domeCompassActive = useSkyStore((s) => s.domeCompassActive);
+  const domeCompassSupported = useSkyStore((s) => s.domeCompassSupported);
+  const setDomeRotationDeg = useSkyStore((s) => s.setDomeRotationDeg);
+  const toggleDomeRotationLock = useSkyStore((s) => s.toggleDomeRotationLock);
+  const setDomeCompassActive = useSkyStore((s) => s.setDomeCompassActive);
+  const setDomeCompassSupported = useSkyStore((s) => s.setDomeCompassSupported);
+  const resetDomeNorth = useSkyStore((s) => s.resetDomeNorth);
   const sweepPulseCounter = useSkyStore((s) => s.sweepPulseCounter);
 
   const isPip = layout === 'map' && skyDomePip;
+  const isPipRef = useRef<boolean>(isPip);
+  isPipRef.current = isPip;
 
   const unitsRef = useRef<UnitSystem>(units);
   unitsRef.current = units;
 
   const prevPulseCounterRef = useRef<number>(sweepPulseCounter);
+
+  const showCompassStatus = useCallback((msg: string) => {
+    setCompassStatusMsg(msg);
+    if (compassStatusTimerRef.current !== null) {
+      window.clearTimeout(compassStatusTimerRef.current);
+    }
+    compassStatusTimerRef.current = window.setTimeout(() => {
+      compassStatusTimerRef.current = null;
+      setCompassStatusMsg(null);
+    }, COMPASS_STATUS_DURATION_MS);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (compassStatusTimerRef.current !== null) {
+        window.clearTimeout(compassStatusTimerRef.current);
+        compassStatusTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const updateCanvasSize = useCallback((width: number, height: number) => {
     const canvas = canvasRef.current;
@@ -1386,7 +1538,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       canvas.height = targetH;
     }
     const minDim = Math.min(width, height);
-    const padding = minDim <= 260 ? 24 : Math.max(32, Math.min(48, minDim * 0.1));
+    const padding = isPipRef.current ? 24 : Math.max(32, Math.min(48, minDim * 0.1));
     const outerRadius = Math.max(36, minDim / 2 - padding);
     metricsRef.current = {
       width,
@@ -1397,6 +1549,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       outerRadius,
     };
     setIsCompact(minDim < 360 || width < 420);
+    setShowFullLegend(width >= 680);
   }, []);
 
   useEffect(() => {
@@ -1424,6 +1577,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     if (layout === 'map' && !skyDomePip && pointerInsideRef.current) {
       pointerInsideRef.current = false;
       lastPointerRef.current = null;
+      dragRef.current = null;
+      isDraggingRef.current = false;
       if (cursorReadoutRef.current) {
         cursorReadoutRef.current.textContent = DEFAULT_CURSOR_READOUT;
       }
@@ -1434,11 +1589,73 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     }
   }, [layout, skyDomePip]);
 
+  // Hardware DeviceOrientation compass sensor subscription & probe timeout
+  useEffect(() => {
+    if (!domeCompassActive) {
+      compassTargetDegRef.current = null;
+      return;
+    }
+    if (typeof window === 'undefined' || !('DeviceOrientationEvent' in window)) {
+      useSkyStore.getState().setDomeCompassSupported(false);
+      useSkyStore.getState().setDomeCompassActive(false);
+      showCompassStatus('No device compass detected — drag dome to rotate');
+      return;
+    }
+
+    let receivedValidReading = false;
+    let seenAbsoluteEvent = false;
+    let probeTimer: number | null = window.setTimeout(() => {
+      probeTimer = null;
+      if (!receivedValidReading) {
+        useSkyStore.getState().setDomeCompassSupported(false);
+        useSkyStore.getState().setDomeCompassActive(false);
+        showCompassStatus('No device compass detected — drag dome to rotate');
+      }
+    }, COMPASS_PROBE_TIMEOUT_MS);
+
+    const handleDeviceOrientation = (ev: Event) => {
+      const orientationEv = ev as DeviceOrientationEvent & { webkitCompassHeading?: number };
+      if (ev.type === 'deviceorientationabsolute') {
+        seenAbsoluteEvent = true;
+      } else if (seenAbsoluteEvent && typeof orientationEv.webkitCompassHeading !== 'number') {
+        return;
+      }
+      const heading = extractCompassHeadingDeg(orientationEv);
+      if (heading === null) return;
+      receivedValidReading = true;
+      compassTargetDegRef.current = heading;
+      if (probeTimer !== null) {
+        window.clearTimeout(probeTimer);
+        probeTimer = null;
+      }
+      const st = useSkyStore.getState();
+      if (st.domeCompassSupported !== true) {
+        st.setDomeCompassSupported(true);
+      }
+    };
+
+    window.addEventListener('deviceorientationabsolute', handleDeviceOrientation);
+    window.addEventListener('deviceorientation', handleDeviceOrientation);
+
+    return () => {
+      if (probeTimer !== null) {
+        window.clearTimeout(probeTimer);
+      }
+      window.removeEventListener('deviceorientationabsolute', handleDeviceOrientation);
+      window.removeEventListener('deviceorientation', handleDeviceOrientation);
+      compassTargetDegRef.current = null;
+    };
+  }, [domeCompassActive, showCompassStatus]);
+
   useEffect(() => {
     const container = containerRef.current;
     const canvas = canvasRef.current;
     if (!container || !canvas) return;
-    canvas.style.cursor = 'crosshair';
+    canvas.style.cursor = resolveCanvasCursor(
+      null,
+      useSkyStore.getState().domeRotationLocked,
+      false
+    );
 
     const initialRect = container.getBoundingClientRect();
     updateCanvasSize(initialRect.width, initialRect.height);
@@ -1462,7 +1679,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     let rafId = 0;
 
     // Persistent per-effect scratch state (zero per-frame allocation)
-    const vaultCache: VaultCache = { key: '', bg: null, vault: null, bezel: null, sweep: null, glow: null };
+    const vaultCache: VaultCache = { key: '', vault: null, bezel: null, sweep: null, glow: null };
     const celestial: CelestialCache = { key: '', ts: -Infinity, pos: null };
     const tcaCache = new Map<string, TcaCacheEntry>();
     const visPool: VisItem[] = [];
@@ -1478,6 +1695,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     let frameEpochMs = 0;
     let frameZoom: SkyDomeZoomMode = 'hemisphere';
     let frameMinEl = 0;
+    let frameRotationDeg = 0;
     let frameMetrics: CanvasMetrics = metricsRef.current;
 
     const collectEntity = (entity: SkyEntity): void => {
@@ -1492,7 +1710,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         frameMetrics.cx,
         frameMetrics.cy,
         frameMetrics.outerRadius,
-        frameZoom
+        frameZoom,
+        frameRotationDeg
       );
       if (!p.visible) return;
 
@@ -1581,6 +1800,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         sweepAzRef.current = (sweepAzRef.current + dtMs * SWEEP_DEG_PER_MS) % 360;
       }
 
+      // Wrap-safe 60fps angular smoothing when hardware compass is active, unlocked, and not dragging
+      let rotationDeg = state.domeRotationDeg;
+      if (
+        state.domeCompassActive &&
+        !state.domeRotationLocked &&
+        !isDraggingRef.current &&
+        compassTargetDegRef.current !== null
+      ) {
+        const targetDeg = compassTargetDegRef.current;
+        if (Math.abs(shortestAngleDeltaDeg(rotationDeg, targetDeg)) >= 0.02) {
+          rotationDeg = smoothCompassHeadingDeg(rotationDeg, targetDeg, COMPASS_SMOOTH_ALPHA);
+          state.setDomeRotationDeg(rotationDeg);
+        }
+      }
+
       const zoom: SkyDomeZoomMode = state.skyDomeZoom === 'zenith' ? 'zenith' : 'hemisphere';
       const minEl = minElevationFor(zoom);
       zoomRef.current = zoom;
@@ -1589,9 +1823,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       frameEpochMs = Date.now();
       frameZoom = zoom;
       frameMinEl = minEl;
+      frameRotationDeg = rotationDeg;
       frameMetrics = metrics;
       const { cx, cy, outerRadius: R } = metrics;
       const observer = state.observer;
+      const isPipFrame = state.layout === 'map' && state.skyDomePip;
 
       const obsKey = `${observer.lat.toFixed(4)},${observer.lon.toFixed(4)}`;
       if (obsKey !== lastObserverKeyRef.current) {
@@ -1638,10 +1874,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         pulseWaveStartRef.current,
         nowMs,
         twilightK,
-        sunAz
+        sunAz,
+        rotationDeg,
+        isPipFrame
       );
 
-      const isPipFrame = state.layout === 'map' && state.skyDomePip;
       const labelMode: DomeLabelMode = isPipFrame
         ? 'pip'
         : state.layout === 'split'
@@ -1670,6 +1907,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
       // Everything below is hard-clipped to the aperture
       ctx.save();
+      ctx.globalAlpha = 1;
       ctx.beginPath();
       ctx.arc(cx, cy, R, 0, Math.PI * 2);
       ctx.clip();
@@ -1679,19 +1917,35 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         if (cel.sun.elevationDeg >= minEl) {
-          const sp = projectToSkyDome(cel.sun.azimuthDeg, cel.sun.elevationDeg, cx, cy, R, zoom);
+          const sp = projectToSkyDome(
+            cel.sun.azimuthDeg,
+            cel.sun.elevationDeg,
+            cx,
+            cy,
+            R,
+            zoom,
+            rotationDeg
+          );
           ctx.globalAlpha = 0.5 + 0.5 * limbFade(cel.sun.elevationDeg, minEl);
           ctx.font = `600 14px ${MONO_FONT}`;
           ctx.fillStyle = '#FBBF24';
           ctx.fillText('☀', sp.x, sp.y);
           if (!isPipFrame) {
             ctx.font = `600 7px ${MONO_FONT}`;
-            ctx.fillStyle = 'rgba(251, 191, 36, 0.8)';
+            ctx.fillStyle = 'rgba(251, 191, 36, 0.85)';
             ctx.fillText('SUN', sp.x, sp.y + 11);
           }
         }
         if (cel.moon.elevationDeg >= minEl) {
-          const mp = projectToSkyDome(cel.moon.azimuthDeg, cel.moon.elevationDeg, cx, cy, R, zoom);
+          const mp = projectToSkyDome(
+            cel.moon.azimuthDeg,
+            cel.moon.elevationDeg,
+            cx,
+            cy,
+            R,
+            zoom,
+            rotationDeg
+          );
           const illum = Number.isFinite(cel.moon.illuminationFraction)
             ? cel.moon.illuminationFraction
             : 0.5;
@@ -1701,7 +1955,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.fillText('☾', mp.x, mp.y);
           if (!isPipFrame) {
             ctx.font = `600 7px ${MONO_FONT}`;
-            ctx.fillStyle = 'rgba(226, 232, 240, 0.75)';
+            ctx.fillStyle = 'rgba(226, 232, 240, 0.8)';
             ctx.fillText('MOON', mp.x, mp.y + 11);
           }
         }
@@ -1717,7 +1971,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           cx,
           cy,
           R,
-          zoom
+          zoom,
+          rotationDeg
         );
       }
 
@@ -1735,7 +1990,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         const depth = atmosphericDepth(elDeg);
         const baseAlpha =
           (focused ? item.fade : item.fade * depth) *
-          (entity.category === 'satellite' && !entity.sunlit && !focused ? 0.78 : 0.96);
+          (entity.category === 'satellite' && !entity.sunlit && !focused ? 0.8 : 1.0);
         if (baseAlpha <= 0.003) continue;
 
         ctx.save();
@@ -1755,7 +2010,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
               { lat: tp.lat, lon: tp.lon, altM: tp.altM },
               false
             );
-            const pp = projectToSkyDome(look.azimuthDeg, look.elevationDeg, cx, cy, R, zoom);
+            const pp = projectToSkyDome(
+              look.azimuthDeg,
+              look.elevationDeg,
+              cx,
+              cy,
+              R,
+              zoom,
+              rotationDeg
+            );
             SC_X[wakeN] = pp.x;
             SC_Y[wakeN] = pp.y;
             SC_V[wakeN] = pp.visible && look.elevationDeg >= minEl ? 1 : 0;
@@ -1767,7 +2030,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             for (let ti = 0; ti < cached.length && wakeN < MAX_TRAIL_SAMPLES; ti += 1) {
               const pt = cached[ti];
               if (frameNowMs - pt.ts > maxTrailAgeMs || pt.elDeg < minEl) continue;
-              const pp = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, R, zoom);
+              const pp = projectToSkyDome(pt.azDeg, pt.elDeg, cx, cy, R, zoom, rotationDeg);
               SC_X[wakeN] = pp.x;
               SC_Y[wakeN] = pp.y;
               SC_V[wakeN] = pp.visible ? 1 : 0;
@@ -1806,11 +2069,12 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 cy,
                 R,
                 zoom,
-                minEl
+                minEl,
+                rotationDeg
               );
             }
           }
-          drawScratchArc(ctx, FORWARD_ARC_DTS.length, color, baseAlpha * 0.42, [2, 3]);
+          drawScratchArc(ctx, FORWARD_ARC_DTS.length, color, baseAlpha * 0.48, [2, 3]);
           ctx.globalAlpha = baseAlpha;
 
           // Closest-approach extension for focused targets
@@ -1851,10 +2115,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                     cy,
                     R,
                     zoom,
-                    minEl
+                    minEl,
+                    rotationDeg
                   );
                 }
-                drawScratchArc(ctx, TCA_ARC_STEPS + 1, '#E879F9', baseAlpha * 0.8, [5, 4]);
+                drawScratchArc(ctx, TCA_ARC_STEPS + 1, '#E879F9', baseAlpha * 0.85, [5, 4]);
                 ctx.globalAlpha = baseAlpha;
               }
               if (
@@ -1862,7 +2127,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 Number.isFinite(tca.peakElevationDeg) &&
                 tca.peakElevationDeg >= minEl
               ) {
-                const pk = projectToSkyDome(tca.peakAzimuthDeg, tca.peakElevationDeg, cx, cy, R, zoom);
+                const pk = projectToSkyDome(
+                  tca.peakAzimuthDeg,
+                  tca.peakElevationDeg,
+                  cx,
+                  cy,
+                  R,
+                  zoom,
+                  rotationDeg
+                );
                 if (pk.visible) {
                   peakMarkerX = pk.x;
                   peakMarkerY = pk.y;
@@ -1873,15 +2146,17 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           }
         }
 
-        // Sweep afterglow
+        // Sweep afterglow (rotation-aware screen azimuth lag)
         if (state.sweepEnabled) {
-          const sweepLag = (sweepAzRef.current - azDeg + 360) % 360;
+          const displaySweepAz = normalizeAzimuthDeg(sweepAzRef.current - rotationDeg);
+          const displayEntityAz = normalizeAzimuthDeg(azDeg - rotationDeg);
+          const sweepLag = (displaySweepAz - displayEntityAz + 360) % 360;
           if (sweepLag < 24) {
             const boost = 1 - sweepLag / 24;
             ctx.beginPath();
             ctx.arc(x, y, 7 + (1 - boost) * 4, 0, Math.PI * 2);
-            ctx.strokeStyle = `rgba(34, 211, 238, ${(boost * 0.45).toFixed(3)})`;
-            ctx.lineWidth = 1.1;
+            ctx.strokeStyle = `rgba(34, 211, 238, ${(boost * 0.5).toFixed(3)})`;
+            ctx.lineWidth = 1.15;
             ctx.stroke();
           }
         }
@@ -1919,10 +2194,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.globalAlpha = baseAlpha;
         }
 
-        // Tangent-oriented glyph
-        let headingAngle = computeSkyDomeTrajectoryTangent(observer, entity, cx, cy, R, zoom);
+        // Tangent-oriented glyph rotated cohesively with dome heading
+        let headingAngle = computeSkyDomeTrajectoryTangent(
+          observer,
+          entity,
+          cx,
+          cy,
+          R,
+          zoom,
+          rotationDeg
+        );
         if (!Number.isFinite(headingAngle)) {
-          headingAngle = (((Number.isFinite(entity.headingDeg) ? entity.headingDeg : 0) - 90) * Math.PI) / 180;
+          headingAngle =
+            (((Number.isFinite(entity.headingDeg) ? entity.headingDeg : 0) - rotationDeg - 90) *
+              Math.PI) /
+            180;
         }
 
         const tickLen =
@@ -1936,7 +2222,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             ? 11.5
             : 10;
 
-        const theta = (azDeg - 90) * DEG2RAD;
+        const theta = (azDeg - rotationDeg - 90) * DEG2RAD;
         ctx.save();
         ctx.translate(x, y);
         ctx.rotate(theta);
@@ -1991,6 +2277,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       // Predicted peak-elevation marker (crisp, inside the aperture)
       if (Number.isFinite(peakMarkerX)) {
         ctx.save();
+        ctx.globalAlpha = 1;
         ctx.translate(peakMarkerX, peakMarkerY);
         ctx.beginPath();
         ctx.moveTo(0, -5);
@@ -2009,6 +2296,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       ctx.restore(); // aperture clip
 
       if (Number.isFinite(peakMarkerX)) {
+        ctx.save();
+        ctx.globalAlpha = 1;
         const text = `◆ MAX EL ${Math.round(peakMarkerEl)}°`;
         ctx.font = `700 9px ${MONO_FONT}`;
         ctx.textAlign = 'left';
@@ -2016,41 +2305,58 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         const tw = ctx.measureText(text).width + 8;
         const px = Math.max(8, Math.min(metrics.width - tw - 8, peakMarkerX + 8));
         const py = Math.max(8, Math.min(metrics.height - 21, peakMarkerY - 18));
-        ctx.fillStyle = 'rgba(15, 10, 30, 0.88)';
-        ctx.strokeStyle = 'rgba(232, 121, 249, 0.65)';
-        ctx.lineWidth = 0.8;
+        ctx.fillStyle = 'rgba(15, 10, 30, 0.9)';
+        ctx.strokeStyle = 'rgba(232, 121, 249, 0.72)';
+        ctx.lineWidth = 0.85;
         ctx.beginPath();
         traceRoundedRect(ctx, px, py, tw, 13, 3);
         ctx.fill();
         ctx.stroke();
         ctx.fillStyle = '#F5D0FE';
         ctx.fillText(text, px + 4, py + 6.8);
+        ctx.restore();
       }
 
-      // Pointer hover resolution
+      // Pointer hover resolution & cursor sync
       const activeUnits = state.units ?? unitsRef.current;
-      if (pointerInsideRef.current && lastPointerRef.current) {
+      if (pointerInsideRef.current && lastPointerRef.current && !isDraggingRef.current) {
         const pt = lastPointerRef.current;
         const liveHitId = findNearestHitInList(hitPool, pt.px, pt.py, HIT_RADIUS_PX);
+        const nextCursor = resolveCanvasCursor(liveHitId, state.domeRotationLocked, false);
+        if (canvas.style.cursor !== nextCursor) {
+          canvas.style.cursor = nextCursor;
+        }
         if (state.hoveredId !== liveHitId) {
-          canvas.style.cursor = liveHitId ? 'pointer' : 'crosshair';
           state.setHoveredId(liveHitId);
         }
-        const nextText = formatCursorReadoutText(pt.px, pt.py, metrics, liveHitId, activeUnits, zoom);
+        const nextText = formatCursorReadoutText(
+          pt.px,
+          pt.py,
+          metrics,
+          liveHitId,
+          activeUnits,
+          zoom,
+          rotationDeg
+        );
         if (cursorReadoutRef.current && cursorReadoutRef.current.textContent !== nextText) {
           cursorReadoutRef.current.textContent = nextText;
         }
-      } else if (pointerInsideRef.current && state.hoveredId !== null) {
-        let present = false;
-        for (let i = 0; i < hitPool.count; i += 1) {
-          if (hitPool.items[i].id === state.hoveredId) {
-            present = true;
-            break;
-          }
+      } else if (!isDraggingRef.current) {
+        const idleCursor = resolveCanvasCursor(null, state.domeRotationLocked, false);
+        if (canvas.style.cursor !== idleCursor) {
+          canvas.style.cursor = idleCursor;
         }
-        if (!present) {
-          canvas.style.cursor = 'crosshair';
-          state.setHoveredId(null);
+        if (pointerInsideRef.current && state.hoveredId !== null) {
+          let present = false;
+          for (let i = 0; i < hitPool.count; i += 1) {
+            if (hitPool.items[i].id === state.hoveredId) {
+              present = true;
+              break;
+            }
+          }
+          if (!present) {
+            state.setHoveredId(null);
+          }
         }
       }
 
@@ -2129,6 +2435,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       });
 
       ctx.save();
+      ctx.globalAlpha = 1;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
       for (let i = 0; i < layoutResult.count; i += 1) {
@@ -2142,16 +2449,16 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.beginPath();
           ctx.moveTo(sx, sy);
           ctx.lineTo(lb.leaderX, lb.leaderY);
-          ctx.strokeStyle = 'rgba(203, 213, 225, 0.45)';
+          ctx.strokeStyle = 'rgba(203, 213, 225, 0.55)';
           ctx.lineWidth = 1;
           ctx.stroke();
         }
         ctx.font = lb.mustShow
           ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
           : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
-        ctx.fillStyle = lb.mustShow ? 'rgba(7, 10, 17, 0.92)' : 'rgba(7, 10, 17, 0.84)';
-        ctx.strokeStyle = lb.mustShow ? lb.color : 'rgba(255, 255, 255, 0.14)';
-        ctx.lineWidth = lb.mustShow ? 1.1 : 0.75;
+        ctx.fillStyle = lb.mustShow ? 'rgba(7, 10, 17, 0.94)' : 'rgba(7, 10, 17, 0.88)';
+        ctx.strokeStyle = lb.mustShow ? lb.color : 'rgba(255, 255, 255, 0.18)';
+        ctx.lineWidth = lb.mustShow ? 1.15 : 0.8;
         ctx.beginPath();
         traceRoundedRect(ctx, lb.x, lb.y, lb.w, lb.h, 3);
         ctx.fill();
@@ -2177,143 +2484,297 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const getClientCanvasPoint = (
     clientX: number,
     clientY: number
-  ): { px: number; py: number } | null => {
+  ): { px: number; py: number; rectW: number; rectH: number } | null => {
     const canvas = canvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
     return {
       px: clientX - rect.left,
       py: clientY - rect.top,
+      rectW: rect.width,
+      rectH: rect.height,
     };
   };
 
   const updateCursorReadout = (px: number, py: number, hitId: string | null) => {
     if (!cursorReadoutRef.current) return;
-    const activeUnits = useSkyStore.getState().units ?? unitsRef.current;
-    const nextText = formatCursorReadoutText(px, py, metricsRef.current, hitId, activeUnits, zoomRef.current);
+    const store = useSkyStore.getState();
+    const activeUnits = store.units ?? unitsRef.current;
+    const nextText = formatCursorReadoutText(
+      px,
+      py,
+      metricsRef.current,
+      hitId,
+      activeUnits,
+      zoomRef.current,
+      store.domeRotationDeg
+    );
     if (cursorReadoutRef.current.textContent !== nextText) {
       cursorReadoutRef.current.textContent = nextText;
     }
   };
 
-  const handleMouseMove = (e: MouseEvent<HTMLCanvasElement>) => {
+  const handleCompassToggle = (e: MouseEvent<HTMLButtonElement>) => {
+    e.stopPropagation();
+    if (domeCompassActive) {
+      setDomeCompassActive(false);
+      setCompassStatusMsg(null);
+      return;
+    }
+
+    if (typeof window === 'undefined' || !('DeviceOrientationEvent' in window)) {
+      setDomeCompassSupported(false);
+      setDomeCompassActive(false);
+      showCompassStatus('No device compass detected — drag dome to rotate');
+      return;
+    }
+
+    const DevOrientCtor = window.DeviceOrientationEvent as unknown as {
+      requestPermission?: () => Promise<'granted' | 'denied'>;
+    };
+    if (typeof DevOrientCtor?.requestPermission === 'function') {
+      void Promise.resolve(DevOrientCtor.requestPermission())
+        .then((permission) => {
+          if (permission === 'granted') {
+            setDomeCompassSupported(true);
+            setDomeCompassActive(true);
+            if (useSkyStore.getState().domeRotationLocked) {
+              showCompassStatus('Compass active — unlock rotation to follow');
+            } else {
+              setCompassStatusMsg(null);
+            }
+          } else {
+            setDomeCompassActive(false);
+            showCompassStatus('Compass permission denied — drag dome to rotate');
+          }
+        })
+        .catch(() => {
+          setDomeCompassActive(false);
+          showCompassStatus('Compass permission denied — drag dome to rotate');
+        });
+      return;
+    }
+
+    setDomeCompassActive(true);
+    if (useSkyStore.getState().domeRotationLocked) {
+      showCompassStatus('Compass active — unlock rotation to follow');
+    } else {
+      setCompassStatusMsg(null);
+    }
+  };
+
+  const handlePointerDown = (e: PointerEvent<HTMLCanvasElement>) => {
+    e.stopPropagation();
+    if (e.isPrimary === false) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+
     const pt = getClientCanvasPoint(e.clientX, e.clientY);
     if (!pt) return;
-
-    pointerInsideRef.current = true;
-    lastPointerRef.current = pt;
-    const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
-    updateCursorReadout(pt.px, pt.py, hitId);
 
     const canvas = canvasRef.current;
-    if (canvas) {
-      canvas.style.cursor = hitId ? 'pointer' : 'crosshair';
+    try {
+      canvas?.setPointerCapture?.(e.pointerId);
+    } catch {
+      // Ignore synthetic pointer capture failures
     }
 
-    const store = useSkyStore.getState();
-    if (store.hoveredId !== hitId) {
-      store.setHoveredId(hitId);
+    const metrics = metricsRef.current;
+    const cx = metrics.width > 0 ? metrics.cx : pt.rectW / 2;
+    const cy = metrics.height > 0 ? metrics.cy : pt.rectH / 2;
+    const rad = Math.hypot(pt.px - cx, pt.py - cy);
+    const hasValidAngle = rad >= DRAG_CENTER_DEADZONE_PX;
+    const lastAngleDeg = hasValidAngle
+      ? Math.atan2(pt.py - cy, pt.px - cx) * (180 / Math.PI)
+      : 0;
+
+    dragRef.current = {
+      pointerId: e.pointerId,
+      pointerType: e.pointerType,
+      startX: pt.px,
+      startY: pt.py,
+      lastAngleDeg,
+      hasValidAngle,
+      moved: false,
+    };
+    isDraggingRef.current = false;
+
+    if (e.pointerType === 'mouse') {
+      pointerInsideRef.current = true;
+      lastPointerRef.current = pt;
+    } else {
+      const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
+      updateCursorReadout(pt.px, pt.py, hitId);
     }
   };
 
-  const handleClick = (e: MouseEvent<HTMLCanvasElement>) => {
-    if (performance.now() - lastTouchEndMsRef.current < 450) {
-      return;
-    }
+  const handlePointerMove = (e: PointerEvent<HTMLCanvasElement>) => {
+    e.stopPropagation();
     const pt = getClientCanvasPoint(e.clientX, e.clientY);
     if (!pt) return;
 
-    const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
-    if (!hitId) return;
-
     const store = useSkyStore.getState();
-    if (store.audioEnabled) {
-      void tacticalAudio.unlock();
-    }
-    store.selectEntity(hitId, true);
-  };
+    const canvas = canvasRef.current;
+    const drag = dragRef.current;
 
-  const handleTouchStart = (e: TouchEvent<HTMLCanvasElement>) => {
-    if (e.touches.length !== 1) {
-      touchStartRef.current = null;
-      return;
-    }
-    const touch = e.touches[0];
-    touchStartRef.current = { x: touch.clientX, y: touch.clientY, moved: false };
-    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
-    if (pt) {
-      const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
-      updateCursorReadout(pt.px, pt.py, hitId);
-    }
-  };
+    if (drag && drag.pointerId === e.pointerId) {
+      const distFromStart = Math.hypot(pt.px - drag.startX, pt.py - drag.startY);
+      if (!drag.moved && distFromStart >= DRAG_THRESHOLD_PX) {
+        drag.moved = true;
+        isDraggingRef.current = true;
+      }
 
-  const handleTouchMove = (e: TouchEvent<HTMLCanvasElement>) => {
-    if (e.touches.length !== 1) {
-      touchStartRef.current = null;
-      return;
-    }
-    const touch = e.touches[0];
-    if (touchStartRef.current) {
-      const dist = Math.hypot(
-        touch.clientX - touchStartRef.current.x,
-        touch.clientY - touchStartRef.current.y
-      );
-      if (dist >= TOUCH_DRAG_THRESHOLD_PX) {
-        touchStartRef.current.moved = true;
+      if (drag.moved) {
+        if (store.domeRotationLocked) {
+          // Locked: ignore drag rotation completely
+          if (canvas) {
+            canvas.style.cursor = 'crosshair';
+          }
+          updateCursorReadout(pt.px, pt.py, null);
+          return;
+        }
+
+        if (store.domeCompassActive) {
+          store.setDomeCompassActive(false);
+        }
+
+        const metrics = metricsRef.current;
+        const cx = metrics.width > 0 ? metrics.cx : pt.rectW / 2;
+        const cy = metrics.height > 0 ? metrics.cy : pt.rectH / 2;
+        const rad = Math.hypot(pt.px - cx, pt.py - cy);
+        if (rad >= DRAG_CENTER_DEADZONE_PX) {
+          const currAngleDeg =
+            Math.atan2(pt.py - cy, pt.px - cx) * (180 / Math.PI);
+          if (drag.hasValidAngle) {
+            const deltaDeg = shortestAngleDeltaDeg(drag.lastAngleDeg, currAngleDeg);
+            if (Math.abs(deltaDeg) > 1e-6) {
+              setDomeRotationDeg(useSkyStore.getState().domeRotationDeg - deltaDeg);
+            }
+          }
+          drag.lastAngleDeg = currAngleDeg;
+          drag.hasValidAngle = true;
+        }
+
+        if (store.hoveredId !== null) {
+          store.setHoveredId(null);
+        }
+        if (canvas) {
+          canvas.style.cursor = 'grabbing';
+        }
+        updateCursorReadout(pt.px, pt.py, null);
+        return;
       }
     }
-    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
-    if (pt) {
-      const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
-      updateCursorReadout(pt.px, pt.py, hitId);
+
+    const hitRadius = e.pointerType === 'mouse' ? HIT_RADIUS_PX : TOUCH_HIT_RADIUS_PX;
+    const hitId = findNearestHit(pt.px, pt.py, hitRadius);
+    if (e.pointerType === 'mouse') {
+      pointerInsideRef.current = true;
+      lastPointerRef.current = pt;
+      if (store.hoveredId !== hitId) {
+        store.setHoveredId(hitId);
+      }
+    }
+    updateCursorReadout(pt.px, pt.py, hitId);
+
+    if (canvas) {
+      canvas.style.cursor = resolveCanvasCursor(hitId, store.domeRotationLocked, false);
     }
   };
 
-  const handleTouchEnd = (e: TouchEvent<HTMLCanvasElement>) => {
-    const start = touchStartRef.current;
-    touchStartRef.current = null;
-    if (!start || e.changedTouches.length === 0) return;
-
-    const touch = e.changedTouches[0];
-    const dragDist = Math.hypot(touch.clientX - start.x, touch.clientY - start.y);
-    if (start.moved || dragDist >= TOUCH_DRAG_THRESHOLD_PX) {
-      return;
+  const finishPointerGesture = (e: PointerEvent<HTMLCanvasElement>, cancelled: boolean) => {
+    e.stopPropagation();
+    const canvas = canvasRef.current;
+    try {
+      if (canvas?.hasPointerCapture?.(e.pointerId)) {
+        canvas.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore if pointer capture already released
     }
 
-    lastTouchEndMsRef.current = performance.now();
-    const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
-    if (!pt) return;
+    const drag = dragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
 
-    const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
-    updateCursorReadout(pt.px, pt.py, hitId);
-    if (!hitId) return;
+    const wasMoved = drag.moved;
+    const pointerType = drag.pointerType;
+    dragRef.current = null;
+    isDraggingRef.current = false;
+    lastPointerActionMsRef.current = performance.now();
 
     const store = useSkyStore.getState();
-    if (store.audioEnabled) {
-      void tacticalAudio.unlock();
+    const pt = getClientCanvasPoint(e.clientX, e.clientY);
+    const hitRadius = pointerType === 'mouse' ? HIT_RADIUS_PX : TOUCH_HIT_RADIUS_PX;
+    const hitId = pt ? findNearestHit(pt.px, pt.py, hitRadius) : null;
+
+    if (!cancelled && !wasMoved && pt) {
+      updateCursorReadout(pt.px, pt.py, hitId);
+      if (hitId) {
+        if (store.audioEnabled) {
+          void tacticalAudio.unlock();
+        }
+        store.selectEntity(hitId, true);
+      }
     }
-    store.selectEntity(hitId, true);
+
+    if (pointerType !== 'mouse') {
+      pointerInsideRef.current = false;
+      lastPointerRef.current = null;
+    }
+
+    if (canvas) {
+      canvas.style.cursor = resolveCanvasCursor(
+        pointerType === 'mouse' ? hitId : null,
+        store.domeRotationLocked,
+        false
+      );
+    }
   };
 
-  const handleTouchCancel = () => {
-    touchStartRef.current = null;
+  const handlePointerUp = (e: PointerEvent<HTMLCanvasElement>) => {
+    finishPointerGesture(e, false);
   };
 
-  const handleMouseLeave = () => {
+  const handlePointerCancel = (e: PointerEvent<HTMLCanvasElement>) => {
+    finishPointerGesture(e, true);
+  };
+
+  const handlePointerLeave = () => {
+    if (isDraggingRef.current) return;
     pointerInsideRef.current = false;
     lastPointerRef.current = null;
     if (cursorReadoutRef.current) {
       cursorReadoutRef.current.textContent = DEFAULT_CURSOR_READOUT;
     }
+    const store = useSkyStore.getState();
     const canvas = canvasRef.current;
     if (canvas) {
-      canvas.style.cursor = 'crosshair';
+      canvas.style.cursor = resolveCanvasCursor(null, store.domeRotationLocked, false);
     }
-    const store = useSkyStore.getState();
     if (store.hoveredId !== null) {
       store.setHoveredId(null);
     }
   };
+
+  const handleCanvasClick = (e: MouseEvent<HTMLCanvasElement>) => {
+    e.stopPropagation();
+    if (performance.now() - lastPointerActionMsRef.current < 450) {
+      return;
+    }
+    const pt = getClientCanvasPoint(e.clientX, e.clientY);
+    if (!pt) return;
+    const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
+    if (!hitId) return;
+    const store = useSkyStore.getState();
+    if (store.audioEnabled) {
+      void tacticalAudio.unlock();
+    }
+    store.selectEntity(hitId, true);
+  };
+
+  const displayHeadingInt = ((Math.round(domeRotationDeg) % 360) + 360) % 360;
+  const headingStr = String(displayHeadingInt).padStart(3, '0');
+  const showNorthReset =
+    Math.abs(shortestAngleDeltaDeg(0, domeRotationDeg)) >= 0.5 || domeCompassActive;
 
   const rootStyle: CSSProperties = {
     position: 'relative',
@@ -2322,7 +2783,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     width: '100%',
     height: '100%',
     overflow: 'hidden',
-    backgroundColor: '#06090F',
+    backgroundColor: 'transparent',
     userSelect: 'none',
     fontFamily: MONO_FONT,
   };
@@ -2341,30 +2802,40 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     flexDirection: 'column',
     gap: 2,
     padding: '5px 7px 4px',
-    backgroundColor: 'rgba(7, 10, 17, 0.9)',
-    borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
+    backgroundColor: 'rgba(7, 10, 17, 0.88)',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.1)',
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
     boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.08)',
     zIndex: 12,
   };
 
-  const pipActionBtnStyle: CSSProperties = {
+  const pipActionBtnStyle = (active = false, tone: 'cyan' | 'amber' = 'cyan'): CSSProperties => ({
     display: 'inline-flex',
     alignItems: 'center',
     justifyContent: 'center',
-    width: 20,
-    height: 20,
+    width: 21,
+    height: 21,
     padding: 0,
     borderRadius: 4,
-    border: '1px solid rgba(255, 255, 255, 0.12)',
-    backgroundColor: 'rgba(15, 23, 42, 0.72)',
-    color: '#CBD5E1',
+    border: active
+      ? tone === 'amber'
+        ? '1px solid rgba(245, 158, 11, 0.62)'
+        : '1px solid rgba(34, 211, 238, 0.62)'
+      : '1px solid rgba(255, 255, 255, 0.14)',
+    backgroundColor: active
+      ? tone === 'amber'
+        ? 'rgba(245, 158, 11, 0.18)'
+        : 'rgba(34, 211, 238, 0.18)'
+      : 'rgba(15, 23, 42, 0.72)',
+    color: active ? (tone === 'amber' ? '#FDE68A' : '#E0F2FE') : '#CBD5E1',
+    fontSize: 10.5,
+    lineHeight: 1,
     cursor: 'pointer',
     touchAction: 'manipulation',
     outline: 'none',
     flexShrink: 0,
-  };
+  });
 
   const cornerTitleStyle: CSSProperties = {
     position: 'absolute',
@@ -2377,9 +2848,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
-    border: '1px solid rgba(255, 255, 255, 0.08)',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
   };
 
   const readoutStyle: CSSProperties = {
@@ -2390,10 +2861,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
-    border: '1px solid rgba(255, 255, 255, 0.08)',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
-    color: '#94A3B8',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
+    color: '#CBD5E1',
     fontSize: isCompact ? 9.5 : 10.5,
     fontVariantNumeric: 'tabular-nums',
     letterSpacing: '0.04em',
@@ -2404,7 +2875,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     position: 'absolute',
     bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
     left: isCompact ? 'max(8px, env(safe-area-inset-left))' : 'max(12px, env(safe-area-inset-left))',
+    maxWidth: showFullLegend && !isCompact ? 'calc(100% - 230px)' : 'calc(100% - 96px)',
     display: 'flex',
+    flexWrap: 'wrap',
     alignItems: 'center',
     gap: 6,
     pointerEvents: 'auto',
@@ -2422,37 +2895,57 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
-    border: '1px solid rgba(255, 255, 255, 0.08)',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    backdropFilter: 'blur(12px)',
+    WebkitBackdropFilter: 'blur(12px)',
     fontSize: isCompact ? 8.5 : 9.5,
     color: '#94A3B8',
     fontVariantNumeric: 'tabular-nums',
   };
 
-  const bezelButtonStyle = (active: boolean): CSSProperties => ({
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 5,
-    minHeight: 30,
-    padding: isCompact ? '4px 9px' : '5px 10px',
-    borderRadius: 6,
-    border: active
-      ? '1px solid rgba(34, 211, 238, 0.48)'
-      : '1px solid rgba(255, 255, 255, 0.08)',
-    backgroundColor: active ? 'rgba(34, 211, 238, 0.14)' : 'rgba(7, 10, 17, 0.84)',
-    color: active ? '#E0F2FE' : '#94A3B8',
-    fontFamily: MONO_FONT,
-    fontSize: isCompact ? 9.5 : 10,
-    fontWeight: 600,
-    letterSpacing: '0.06em',
-    cursor: 'pointer',
-    touchAction: 'manipulation',
-    backdropFilter: 'blur(16px)',
-    WebkitBackdropFilter: 'blur(16px)',
-    outline: 'none',
-  });
+  const bezelButtonStyle = (
+    active: boolean,
+    tone: 'cyan' | 'amber' | 'emerald' = 'cyan'
+  ): CSSProperties => {
+    const activeBorder =
+      tone === 'amber'
+        ? '1px solid rgba(245, 158, 11, 0.56)'
+        : tone === 'emerald'
+        ? '1px solid rgba(52, 211, 153, 0.56)'
+        : '1px solid rgba(34, 211, 238, 0.52)';
+    const activeBg =
+      tone === 'amber'
+        ? 'rgba(245, 158, 11, 0.16)'
+        : tone === 'emerald'
+        ? 'rgba(52, 211, 153, 0.16)'
+        : 'rgba(34, 211, 238, 0.16)';
+    const activeColor =
+      tone === 'amber' ? '#FDE68A' : tone === 'emerald' ? '#D1FAE5' : '#E0F2FE';
+
+    return {
+      display: 'inline-flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 5,
+      minHeight: 32,
+      padding: isCompact ? '4px 8px' : '5px 10px',
+      borderRadius: 6,
+      border: active ? activeBorder : '1px solid rgba(255, 255, 255, 0.1)',
+      backgroundColor: active ? activeBg : 'rgba(7, 10, 17, 0.84)',
+      color: active ? activeColor : '#CBD5E1',
+      fontFamily: MONO_FONT,
+      fontSize: isCompact ? 9.5 : 10,
+      fontWeight: 600,
+      fontVariantNumeric: 'tabular-nums',
+      letterSpacing: '0.05em',
+      whiteSpace: 'nowrap',
+      cursor: 'pointer',
+      touchAction: 'manipulation',
+      backdropFilter: 'blur(12px)',
+      WebkitBackdropFilter: 'blur(12px)',
+      outline: 'none',
+    };
+  };
 
   const ledStyle = (active: boolean, color: string): CSSProperties => ({
     width: 6,
@@ -2463,6 +2956,67 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     flexShrink: 0,
   });
 
+  const compassStatusStyle: CSSProperties = isPip
+    ? {
+        position: 'absolute',
+        left: 6,
+        right: 6,
+        bottom: showNorthReset ? 30 : 6,
+        pointerEvents: 'none',
+        padding: '3px 6px',
+        borderRadius: 5,
+        backgroundColor: 'rgba(7, 10, 17, 0.92)',
+        border: '1px solid rgba(245, 158, 11, 0.45)',
+        color: '#FDE68A',
+        fontSize: 8.5,
+        lineHeight: 1.25,
+        textAlign: 'center',
+        zIndex: 14,
+      }
+    : {
+        position: 'absolute',
+        left: isCompact ? 8 : 12,
+        top: isCompact ? 42 : 58,
+        maxWidth: 'calc(100% - 24px)',
+        pointerEvents: 'none',
+        padding: '4px 9px',
+        borderRadius: 6,
+        backgroundColor: 'rgba(7, 10, 17, 0.92)',
+        border: '1px solid rgba(245, 158, 11, 0.45)',
+        color: '#FDE68A',
+        fontSize: isCompact ? 9 : 10,
+        letterSpacing: '0.03em',
+        backdropFilter: 'blur(12px)',
+        WebkitBackdropFilter: 'blur(12px)',
+        zIndex: 14,
+      };
+
+  const pipNorthResetStyle: CSSProperties = {
+    position: 'absolute',
+    left: 6,
+    bottom: 6,
+    zIndex: 12,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 4,
+    minHeight: 22,
+    padding: '2px 7px',
+    borderRadius: 5,
+    border: '1px solid rgba(34, 211, 238, 0.48)',
+    backgroundColor: 'rgba(7, 10, 17, 0.88)',
+    color: '#E0F2FE',
+    fontFamily: MONO_FONT,
+    fontSize: 9,
+    fontWeight: 700,
+    fontVariantNumeric: 'tabular-nums',
+    letterSpacing: '0.04em',
+    whiteSpace: 'nowrap',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    outline: 'none',
+  };
+
   return (
     <div
       className={className ? `skydome-root ${className}` : 'skydome-root'}
@@ -2470,13 +3024,17 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       data-pip={isPip ? 'true' : 'false'}
     >
       {isPip && (
-        <div className="skydome-pip-header" style={pipHeaderStyle}>
+        <div
+          className="skydome-pip-header"
+          style={pipHeaderStyle}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
           <div
             style={{
               display: 'flex',
               alignItems: 'center',
               justifyContent: 'space-between',
-              gap: 6,
+              gap: 4,
               minWidth: 0,
             }}
           >
@@ -2489,18 +3047,58 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                   letterSpacing: '0.08em',
                   color: '#E2E8F0',
                   whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
                 }}
               >
                 SKY-DOME PIP
               </span>
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 3, flexShrink: 0 }}>
+              <button
+                type="button"
+                data-testid="skydome-compass-toggle"
+                aria-pressed={domeCompassActive}
+                title={
+                  domeCompassActive
+                    ? 'Disable Device Compass'
+                    : domeCompassSupported === false
+                    ? 'No device compass detected — click to retry or drag dome'
+                    : 'Align Sky-Dome with Device Compass'
+                }
+                aria-label="Toggle Device Compass"
+                style={{
+                  ...pipActionBtnStyle(domeCompassActive, 'cyan'),
+                  opacity: !domeCompassActive && domeCompassSupported === false ? 0.65 : 1,
+                }}
+                onClick={handleCompassToggle}
+              >
+                🧭
+              </button>
+              <button
+                type="button"
+                data-testid="skydome-lock-toggle"
+                aria-pressed={domeRotationLocked}
+                title={
+                  domeRotationLocked
+                    ? 'Dome Rotation Locked — click to unlock'
+                    : 'Dome Rotation Unlocked — click to lock'
+                }
+                aria-label={domeRotationLocked ? 'Unlock Sky-Dome Rotation' : 'Lock Sky-Dome Rotation'}
+                style={pipActionBtnStyle(domeRotationLocked, 'amber')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleDomeRotationLock();
+                }}
+              >
+                {domeRotationLocked ? '🔒' : '🔓'}
+              </button>
               <button
                 type="button"
                 data-testid="skydome-pip-expand"
                 title="Expand to Split View"
                 aria-label="Expand to Split View"
-                style={pipActionBtnStyle}
+                style={pipActionBtnStyle()}
                 onClick={(e) => {
                   e.stopPropagation();
                   setLayout('split');
@@ -2525,7 +3123,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 data-testid="skydome-pip-close"
                 title="Hide Sky-Dome PIP"
                 aria-label="Hide Sky-Dome PIP"
-                style={pipActionBtnStyle}
+                style={pipActionBtnStyle()}
                 onClick={(e) => {
                   e.stopPropagation();
                   setSkyDomePip(false);
@@ -2569,15 +3167,41 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         <canvas
           ref={canvasRef}
           aria-label="Polar Sky-Dome Topocentric Hemisphere Radar"
-          onMouseMove={handleMouseMove}
-          onClick={handleClick}
-          onMouseLeave={handleMouseLeave}
-          onTouchStart={handleTouchStart}
-          onTouchMove={handleTouchMove}
-          onTouchEnd={handleTouchEnd}
-          onTouchCancel={handleTouchCancel}
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={handlePointerCancel}
+          onPointerLeave={handlePointerLeave}
+          onClick={handleCanvasClick}
           style={{ display: 'block', width: '100%', height: '100%', touchAction: 'none' }}
         />
+
+        {compassStatusMsg && (
+          <div
+            role="status"
+            aria-live="polite"
+            data-testid="skydome-compass-status"
+            style={compassStatusStyle}
+          >
+            {compassStatusMsg}
+          </div>
+        )}
+
+        {isPip && showNorthReset && (
+          <button
+            type="button"
+            data-testid="skydome-north-reset"
+            title="Reset Sky-Dome to North-Up (000°)"
+            style={pipNorthResetStyle}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              resetDomeNorth();
+            }}
+          >
+            {`HDG ${headingStr}° · N▲`}
+          </button>
+        )}
 
         {!isPip && (
           <>
@@ -2601,12 +3225,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 <div
                   style={{
                     fontSize: 9,
-                    color: '#64748B',
+                    color: '#94A3B8',
                     letterSpacing: '0.05em',
                     fontVariantNumeric: 'tabular-nums',
                   }}
                 >
-                  {skyDomeZoom === 'zenith' ? '90° ZEN · 30° LIMB · ' : '90° ZEN · 0° HRZ · '}{orbitalScope === 'cylinder' ? 'CYLINDER' : skyDomeZoom === 'zenith' ? 'ZENITH' : 'HEMISPHERE'}
+                  {skyDomeZoom === 'zenith'
+                    ? '90° TOP · 30° LIMB · OVERHEAD 2×'
+                    : '90° TOP · 0° HRZ · FULL SKY'}
+                  {orbitalScope === 'cylinder' ? ' · CYL' : ''}
                 </div>
               )}
             </div>
@@ -2616,8 +3243,12 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
               <span ref={cursorReadoutRef}>{DEFAULT_CURSOR_READOUT}</span>
             </div>
 
-            {/* Bottom-Left Bezel Micro-Controls */}
-            <div className="skydome-bezel-controls" style={bezelControlsStyle}>
+            {/* Bottom-Left Bezel Micro-Controls & Orientation Suite */}
+            <div
+              className="skydome-bezel-controls"
+              style={bezelControlsStyle}
+              onPointerDown={(e) => e.stopPropagation()}
+            >
               <button
                 type="button"
                 aria-pressed={sweepEnabled}
@@ -2646,14 +3277,80 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 type="button"
                 data-testid="skydome-zoom-toggle"
                 aria-pressed={skyDomeZoom === 'zenith'}
+                title={
+                  skyDomeZoom === 'zenith'
+                    ? 'Overhead 2× lens (30°–90°) — click for Full Sky'
+                    : 'Full Sky hemisphere (0°–90°) — click for Overhead 2×'
+                }
                 style={bezelButtonStyle(skyDomeZoom === 'zenith')}
                 onClick={(e) => {
                   e.stopPropagation();
                   toggleSkyDomeZoom();
                 }}
               >
-                <span>{skyDomeZoom === 'zenith' ? 'ZENITH 30°+' : 'HEMISPHERE 0°'}</span>
+                <span>{skyDomeZoom === 'zenith' ? 'OVERHEAD 2×' : 'FULL SKY'}</span>
               </button>
+              <button
+                type="button"
+                data-testid="skydome-compass-toggle"
+                aria-pressed={domeCompassActive}
+                title={
+                  domeCompassActive
+                    ? 'Disable live device compass'
+                    : domeCompassSupported === false
+                    ? 'No device compass detected — drag dome to rotate'
+                    : 'Align Sky-Dome with hardware device compass'
+                }
+                style={{
+                  ...bezelButtonStyle(
+                    domeCompassActive,
+                    domeCompassSupported === true ? 'emerald' : 'cyan'
+                  ),
+                  opacity: !domeCompassActive && domeCompassSupported === false ? 0.72 : 1,
+                }}
+                onClick={handleCompassToggle}
+              >
+                <span
+                  style={ledStyle(
+                    domeCompassActive,
+                    domeCompassSupported === true ? '#34D399' : '#22D3EE'
+                  )}
+                />
+                <span aria-hidden="true">🧭</span>
+                <span>COMPASS</span>
+              </button>
+              <button
+                type="button"
+                data-testid="skydome-lock-toggle"
+                aria-pressed={domeRotationLocked}
+                title={
+                  domeRotationLocked
+                    ? 'Rotation locked — click to unlock drag & compass rotation'
+                    : 'Rotation unlocked — drag dome to rotate, or click to lock'
+                }
+                style={bezelButtonStyle(domeRotationLocked, 'amber')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  toggleDomeRotationLock();
+                }}
+              >
+                <span aria-hidden="true">{domeRotationLocked ? '🔒' : '🔓'}</span>
+                <span>{domeRotationLocked ? 'LOCKED' : 'UNLOCKED'}</span>
+              </button>
+              {showNorthReset && (
+                <button
+                  type="button"
+                  data-testid="skydome-north-reset"
+                  title="Reset Sky-Dome to North-Up (000°)"
+                  style={bezelButtonStyle(true, 'cyan')}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    resetDomeNorth();
+                  }}
+                >
+                  <span>{`HDG ${headingStr}° · N▲`}</span>
+                </button>
+              )}
             </div>
 
             {/* Bottom-Right Horizon & Orbital Legend */}
@@ -2662,7 +3359,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
                 <span>{skyDomeZoom === 'zenith' ? '30° LIMB' : '0° HRZ'}</span>
               </span>
-              {!isCompact && (
+              {showFullLegend && !isCompact && (
                 <>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <span style={ledStyle(true, SATELLITE_SUNLIT_COLOR)} />
