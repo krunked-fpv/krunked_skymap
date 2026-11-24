@@ -187,3 +187,13 @@ export function formatRelativeAge(
   const mins = Math.floor((ageSec % 3600) / 60);
   return `${hours}h ${mins}m ago`;
 }
+
+/**
+ * Formats a countdown duration in seconds into compact `Xs`, `Xm`, or `Xh` form.
+ */
+export function formatCountdownShort(sec: number): string {
+  if (!Number.isFinite(sec) || sec <= 0) return '0s';
+  if (sec >= 3600) return `${Math.ceil(sec / 3600)}h`;
+  if (sec >= 120) return `${Math.ceil(sec / 60)}m`;
+  return `${Math.round(sec)}s`;
+}

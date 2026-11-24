@@ -9,27 +9,26 @@ import {
 } from 'react';
 import {
   AlertTriangle,
-  ChevronLeft,
+  ChevronUp,
   Crosshair,
-  Info,
-  Radar,
   RefreshCw,
   Search,
-  SlidersHorizontal,
-  Wind,
   X,
 } from 'lucide-react';
 import {
   AEROSPACE_PRESETS,
   CATEGORY_COLORS,
   CATEGORY_LABELS,
+  type BalloonSublayerState,
+  type DroneSublayerState,
   type FeedHealthStatus,
   type FeedKey,
+  type FeedTelemetryState,
   type SatelliteGroup,
   type SkyCategory,
 } from '../../types/sky-contracts';
 import { useSkyStore } from '../../store/useSkyStore';
-import { formatClockTime } from '../inspector/unitFormatters';
+import { formatCoords } from '../inspector/unitFormatters';
 
 export interface LocationSearchResult {
   lat: number;
@@ -47,17 +46,21 @@ export interface ControlDockProps {
   gpsError?: string | null;
 }
 
-interface LayerRowDescriptor {
+type ExpandableCategory = 'satellite' | 'balloon' | 'drone';
+
+interface CategoryChipSpec {
   category: SkyCategory;
+  shortLabel: string;
   feedKey: FeedKey;
+  expandable?: ExpandableCategory;
 }
 
-const LAYER_ROWS: LayerRowDescriptor[] = [
-  { category: 'flight', feedKey: 'flights' },
-  { category: 'military', feedKey: 'flights' },
-  { category: 'satellite', feedKey: 'satellites' },
-  { category: 'balloon', feedKey: 'balloons' },
-  { category: 'drone', feedKey: 'drones' },
+const CATEGORY_CHIPS: CategoryChipSpec[] = [
+  { category: 'flight', shortLabel: 'FLIGHTS', feedKey: 'flights' },
+  { category: 'military', shortLabel: 'MILITARY', feedKey: 'military' },
+  { category: 'satellite', shortLabel: 'ORBITAL', feedKey: 'satellites', expandable: 'satellite' },
+  { category: 'balloon', shortLabel: 'BALLOONS', feedKey: 'balloons', expandable: 'balloon' },
+  { category: 'drone', shortLabel: 'UAS', feedKey: 'drones', expandable: 'drone' },
 ];
 
 const SAT_GROUP_CHIPS: Array<{ group: SatelliteGroup; label: string }> = [
@@ -66,8 +69,17 @@ const SAT_GROUP_CHIPS: Array<{ group: SatelliteGroup; label: string }> = [
   { group: 'starlink', label: 'Starlink' },
 ];
 
-const RING_RADIUS = 8.5;
-const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
+const BALLOON_SUB_CHIPS: Array<{ key: keyof BalloonSublayerState; label: string }> = [
+  { key: 'windborne', label: 'WindBorne' },
+  { key: 'sondehub', label: 'SondeHub' },
+  { key: 'adsbLta', label: 'ADS-B LTA' },
+];
+
+const DRONE_SUB_CHIPS: Array<{ key: keyof DroneSublayerState; label: string }> = [
+  { key: 'liveUas', label: 'Live UAS' },
+  { key: 'airspace', label: 'Airspace' },
+  { key: 'simOdid', label: 'Sim' },
+];
 
 export const STATUS_LABEL: Record<FeedHealthStatus, string> = {
   idle: 'IDLE',
@@ -81,26 +93,83 @@ export const STATUS_LABEL: Record<FeedHealthStatus, string> = {
   error: 'ERROR',
 };
 
-function getDegradedFeedNotice(status: FeedHealthStatus): string | null {
+function computeRefreshProgressPct(feed: FeedTelemetryState): number {
+  if (feed.status === 'loading') return 100;
+  if (feed.intervalSec <= 0) return 100;
+  const ratio = (feed.intervalSec - feed.nextRefreshSec) / feed.intervalSec;
+  return Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+}
+
+function getDegradedFeedSummary(status: FeedHealthStatus, errorMsg?: string): string {
+  if (errorMsg) {
+    const first = errorMsg.split(' | ')[0]?.trim();
+    if (first) return `${STATUS_LABEL[status]} · ${first}`;
+  }
   switch (status) {
     case 'rate-limited':
-      return 'Upstream ADS-B rate limit reached. Live telemetry is degraded; no synthetic fallback aircraft are shown.';
-    case 'offline':
-      return 'Network offline. Live ADS-B telemetry is unavailable; no synthetic fallback aircraft are shown.';
+      return 'RATE-LIMITED · Upstream ADS-B cooldown active';
     case 'delayed':
-      return 'Live ADS-B refresh is delayed. Showing recent verified observations only; no synthetic fallback aircraft are shown.';
-    case 'error':
-      return 'Live ADS-B telemetry is currently unavailable. No synthetic fallback aircraft are shown.';
+      return 'DELAYED · Live ADS-B refresh delayed';
     default:
-      return null;
+      return 'ADS-B ERROR · Live flight feed unavailable';
   }
 }
 
-function formatCountdownShort(sec: number): string {
-  if (sec <= 0) return '0s';
-  if (sec >= 3600) return `${Math.ceil(sec / 3600)}h`;
-  if (sec >= 120) return `${Math.ceil(sec / 60)}m`;
-  return `${sec}s`;
+function CategoryGlyph({ category }: { category: SkyCategory }) {
+  switch (category) {
+    case 'flight':
+      return (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M12 2.5L14.2 9.2L21.5 13.5V15.5L14.2 13.4V18.3L17 20.5V22L12 20.6L7 22V20.5L9.8 18.3V13.4L2.5 15.5V13.5L9.8 9.2L12 2.5Z"
+            fill="currentColor"
+          />
+        </svg>
+      );
+    case 'military':
+      return (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M12 2L14.3 8.5L21 15L19.2 16.4L14 14.2L13.5 19L16 21.3L12 20.2L8 21.3L10.5 19L10 14.2L4.8 16.4L3 15L9.7 8.5L12 2Z"
+            fill="currentColor"
+          />
+        </svg>
+      );
+    case 'satellite':
+      return (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="9.5" y="9.5" width="5" height="5" rx="1" fill="currentColor" />
+          <path
+            d="M3.5 6.5L7.5 2.5L10.5 5.5L6.5 9.5L3.5 6.5ZM13.5 18.5L17.5 14.5L20.5 17.5L16.5 21.5L13.5 18.5Z"
+            fill="currentColor"
+            opacity="0.88"
+          />
+          <path d="M15.5 8.5L19.5 4.5M8.5 15.5L4.5 19.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        </svg>
+      );
+    case 'balloon':
+      return (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path
+            d="M12 2.5C8.1 2.5 5.5 5.3 5.5 9C5.5 12.6 9.3 15.6 11 17.3H13C14.7 15.6 18.5 12.6 18.5 9C18.5 5.3 15.9 2.5 12 2.5Z"
+            fill="currentColor"
+          />
+          <path d="M10.5 17.3L10.9 20H13.1L13.5 17.3" stroke="currentColor" strokeWidth="1.4" />
+          <rect x="10.2" y="20" width="3.6" height="2.2" rx="0.5" fill="currentColor" />
+        </svg>
+      );
+    case 'drone':
+      return (
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <circle cx="5.5" cy="5.5" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+          <circle cx="18.5" cy="5.5" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+          <circle cx="5.5" cy="18.5" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+          <circle cx="18.5" cy="18.5" r="2.6" stroke="currentColor" strokeWidth="1.6" />
+          <path d="M7.5 7.5L16.5 16.5M16.5 7.5L7.5 16.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+          <rect x="10" y="10" width="4" height="4" rx="1" fill="currentColor" />
+        </svg>
+      );
+  }
 }
 
 export function ControlDock({
@@ -114,47 +183,107 @@ export function ControlDock({
   const setObserver = useSkyStore((s) => s.setObserver);
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const setRadiusKm = useSkyStore((s) => s.setRadiusKm);
-  const units = useSkyStore((s) => s.units);
-  const orbitalScope = useSkyStore((s) => s.orbitalScope);
-  const setOrbitalScope = useSkyStore((s) => s.setOrbitalScope);
+  const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
   const layers = useSkyStore((s) => s.layers);
   const toggleLayer = useSkyStore((s) => s.toggleLayer);
   const satGroups = useSkyStore((s) => s.satGroups);
   const toggleSatGroup = useSkyStore((s) => s.toggleSatGroup);
+  const balloonSublayers = useSkyStore((s) => s.balloonSublayers);
+  const toggleBalloonSublayer = useSkyStore((s) => s.toggleBalloonSublayer);
+  const droneSublayers = useSkyStore((s) => s.droneSublayers);
+  const toggleDroneSublayer = useSkyStore((s) => s.toggleDroneSublayer);
   const fullConstellation = useSkyStore((s) => s.fullConstellation);
   const setFullConstellation = useSkyStore((s) => s.setFullConstellation);
   const feeds = useSkyStore((s) => s.feeds);
   const counts = useSkyStore((s) => s.counts);
   const airspace = useSkyStore((s) => s.airspace);
   const nearestSondeHint = useSkyStore((s) => s.nearestSondeHint);
+  const commandPaletteOpen = useSkyStore((s) => s.commandPaletteOpen);
+  const setCommandPaletteOpen = useSkyStore((s) => s.setCommandPaletteOpen);
 
-  const [collapsed, setCollapsed] = useState<boolean>(() =>
-    typeof window !== 'undefined' ? window.innerWidth <= 860 : false,
-  );
-
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.matchMedia) return;
-    const mq = window.matchMedia('(max-width: 860px)');
-    const handleMediaChange = (event: MediaQueryListEvent) => {
-      setCollapsed(event.matches);
-    };
-    mq.addEventListener('change', handleMediaChange);
-    return () => mq.removeEventListener('change', handleMediaChange);
-  }, []);
+  const [activeTrayCategory, setActiveTrayCategory] = useState<ExpandableCategory | null>(null);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<LocationSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
 
-  const searchBoxRef = useRef<HTMLDivElement | null>(null);
+  const dockWrapRef = useRef<HTMLDivElement | null>(null);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const debounceRef = useRef<number | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const requestSeqRef = useRef(0);
   const suppressNextSearchRef = useRef<string | null>(null);
+
+  // Global ⌘K / Ctrl+K / `/` Command Palette shortcut + Escape handler
+  useEffect(() => {
+    const handleGlobalKeyDown = (event: globalThis.KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isEditable =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        Boolean(target?.isContentEditable);
+
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setCommandPaletteOpen(!useSkyStore.getState().commandPaletteOpen);
+        return;
+      }
+
+      if (event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditable) {
+        event.preventDefault();
+        setCommandPaletteOpen(true);
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        if (useSkyStore.getState().commandPaletteOpen) {
+          setCommandPaletteOpen(false);
+        } else if (activeTrayCategory !== null) {
+          setActiveTrayCategory(null);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleGlobalKeyDown);
+    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
+  }, [activeTrayCategory, setCommandPaletteOpen]);
+
+  // Dismiss sub-filter tray on outside click
+  useEffect(() => {
+    if (activeTrayCategory === null) return;
+    const handleOutsideClick = (event: MouseEvent) => {
+      if (
+        dockWrapRef.current &&
+        event.target instanceof Node &&
+        !dockWrapRef.current.contains(event.target)
+      ) {
+        setActiveTrayCategory(null);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    return () => document.removeEventListener('mousedown', handleOutsideClick);
+  }, [activeTrayCategory]);
+
+  // Auto-focus search input when Command Palette opens
+  useEffect(() => {
+    if (commandPaletteOpen) {
+      const id = window.requestAnimationFrame(() => {
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select();
+      });
+      return () => window.cancelAnimationFrame(id);
+    }
+    abortRef.current?.abort();
+    abortRef.current = null;
+    return undefined;
+  }, [commandPaletteOpen]);
 
   const runSearch = useCallback(
     async (rawQuery: string) => {
       const trimmed = rawQuery.trim();
+      abortRef.current?.abort();
       if (!trimmed) {
         requestSeqRef.current += 1;
         setResults([]);
@@ -164,21 +293,24 @@ export function ControlDock({
         return;
       }
 
+      const controller = new AbortController();
+      abortRef.current = controller;
       const seq = ++requestSeqRef.current;
       setSearching(true);
+
       try {
         const nextResults = await onSearchLocation(trimmed);
-        if (seq !== requestSeqRef.current) return;
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
         setResults(nextResults);
         setDropdownOpen(nextResults.length > 0);
         setActiveIndex(nextResults.length > 0 ? 0 : -1);
       } catch {
-        if (seq !== requestSeqRef.current) return;
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
         setResults([]);
         setDropdownOpen(false);
         setActiveIndex(-1);
       } finally {
-        if (seq === requestSeqRef.current) {
+        if (!controller.signal.aborted && seq === requestSeqRef.current) {
           setSearching(false);
         }
       }
@@ -186,7 +318,7 @@ export function ControlDock({
     [onSearchLocation],
   );
 
-  // 300ms debounced location/coordinate search
+  // 250ms debounced location/coordinate search
   useEffect(() => {
     if (debounceRef.current !== null) {
       window.clearTimeout(debounceRef.current);
@@ -199,6 +331,7 @@ export function ControlDock({
       return;
     }
     if (!trimmed) {
+      abortRef.current?.abort();
       requestSeqRef.current += 1;
       setResults([]);
       setDropdownOpen(false);
@@ -209,7 +342,7 @@ export function ControlDock({
 
     debounceRef.current = window.setTimeout(() => {
       void runSearch(trimmed);
-    }, 300);
+    }, 250);
 
     return () => {
       if (debounceRef.current !== null) {
@@ -218,21 +351,6 @@ export function ControlDock({
       }
     };
   }, [query, runSearch]);
-
-  // Dismiss dropdown when clicking outside search box
-  useEffect(() => {
-    const handleOutsideMouseDown = (event: MouseEvent) => {
-      if (
-        searchBoxRef.current &&
-        event.target instanceof Node &&
-        !searchBoxRef.current.contains(event.target)
-      ) {
-        setDropdownOpen(false);
-      }
-    };
-    document.addEventListener('mousedown', handleOutsideMouseDown);
-    return () => document.removeEventListener('mousedown', handleOutsideMouseDown);
-  }, []);
 
   const selectSearchResult = (item: LocationSearchResult) => {
     suppressNextSearchRef.current = item.label.trim();
@@ -246,6 +364,7 @@ export function ControlDock({
     setQuery(item.label);
     setDropdownOpen(false);
     setActiveIndex(-1);
+    setCommandPaletteOpen(false);
   };
 
   const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -285,26 +404,22 @@ export function ControlDock({
     }
 
     if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
       setDropdownOpen(false);
       setActiveIndex(-1);
+      setCommandPaletteOpen(false);
     }
   };
 
   const matchedPresetId = useMemo(() => {
     const match = AEROSPACE_PRESETS.find(
-      (p) =>
-        Math.abs(p.lat - observer.lat) < 0.002 &&
-        Math.abs(p.lon - observer.lon) < 0.002,
+      (p) => Math.abs(p.lat - observer.lat) < 0.002 && Math.abs(p.lon - observer.lon) < 0.002,
     );
     return match?.id ?? '';
   }, [observer.lat, observer.lon]);
 
-  const activePreset = useMemo(
-    () => AEROSPACE_PRESETS.find((p) => p.id === matchedPresetId) ?? null,
-    [matchedPresetId],
-  );
-
-  const handlePresetChange = (presetId: string) => {
+  const handlePresetSelect = (presetId: string) => {
     const preset = AEROSPACE_PRESETS.find((p) => p.id === presetId);
     if (!preset) return;
     setObserver({
@@ -315,470 +430,381 @@ export function ControlDock({
       source: 'preset',
     });
     setRadiusKm(preset.defaultRadiusKm);
+    setCommandPaletteOpen(false);
   };
 
-  const radiusSecondaryText =
-    units === 'aviation'
-      ? `${Math.round(radiusKm * 0.5399568)} NM`
-      : `${Math.round(observer.altM)} m MSL`;
-
-  if (collapsed) {
-    return (
-      <div className="control-dock-wrap">
-        <button
-          type="button"
-          className="control-dock-collapsed-pill"
-          onClick={() => setCollapsed(false)}
-          aria-expanded={false}
-          aria-label="Open command dock"
-          data-testid="control-dock-toggle"
-        >
-          <SlidersHorizontal size={14} color="#22D3EE" aria-hidden="true" />
-          <span>COMMAND DOCK</span>
-        </button>
-      </div>
-    );
-  }
+  const flightsFeed = feeds.flights;
+  const canRetryLiveFeed =
+    flightsFeed.status === 'error' ||
+    flightsFeed.status === 'rate-limited' ||
+    flightsFeed.status === 'delayed';
 
   return (
-    <div className="control-dock-wrap">
-      <aside className="control-dock" aria-label="Mission control dock">
-        <div className="control-dock__header">
-          <div className="control-dock__title-group">
-            <SlidersHorizontal size={13} color="#22D3EE" aria-hidden="true" />
-            <span>COMMAND DOCK</span>
-          </div>
+    <div className="control-dock-wrap" ref={dockWrapRef}>
+      {/* A) Floating Bottom-Center Tactical Layer Pill Dock + Contextual Trays */}
+      {canRetryLiveFeed && (
+        <div
+          className={`dock-retry-banner${flightsFeed.status === 'error' ? ' is-critical' : ''}`}
+          role="status"
+          data-testid="dock-feed-diagnostics"
+        >
+          <AlertTriangle size={13} style={{ flexShrink: 0 }} aria-hidden="true" />
+          <span className="dock-retry-banner__msg tabular">
+            {getDegradedFeedSummary(flightsFeed.status, flightsFeed.errorMsg)}
+          </span>
           <button
             type="button"
-            className="control-dock__collapse-btn"
-            onClick={() => setCollapsed(true)}
-            aria-expanded={true}
-            aria-label="Collapse command dock"
-            data-testid="control-dock-toggle"
+            className="dock-feed-diag__retry-btn"
+            data-testid="dock-feed-retry"
+            onClick={onManualSweep}
+            title="Reset feed circuit breakers and retry live ADS-B sweep"
           >
-            <ChevronLeft size={13} aria-hidden="true" />
-            <span>HIDE</span>
+            <RefreshCw size={11} aria-hidden="true" />
+            <span>Retry</span>
           </button>
         </div>
+      )}
 
-        <div className="control-dock__body cockpit-scroll">
-          {/* Observer Search & GPS */}
-          <section className="dock-section" aria-label="Observer location">
-            <div className="dock-section-label">
-              <span>OBSERVER ORIGIN</span>
-              <span className="tabular">
-                {observer.lat.toFixed(3)}°, {observer.lon.toFixed(3)}°
-              </span>
-            </div>
+      {activeTrayCategory === 'satellite' && (
+        <div
+          className="dock-subtray"
+          style={{ '--tray-accent': CATEGORY_COLORS.satellite } as CSSProperties}
+          role="group"
+          aria-label="Orbital sub-filters"
+        >
+          <span className="dock-subtray__label">ORBITAL</span>
+          {SAT_GROUP_CHIPS.map(({ group, label }) => {
+            const active = satGroups[group];
+            return (
+              <button
+                key={group}
+                type="button"
+                className={`dock-subtray__chip${active ? ' is-active' : ''}`}
+                aria-pressed={active}
+                onClick={() => toggleSatGroup(group)}
+              >
+                <span className="dock-subtray__chip-dot" aria-hidden="true" />
+                <span>{label}</span>
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            className={`dock-subtray__chip${fullConstellation ? ' is-active' : ''}`}
+            aria-pressed={fullConstellation}
+            onClick={() => setFullConstellation(!fullConstellation)}
+            title="Load full Starlink constellation instead of sampled shell"
+          >
+            <span className="dock-subtray__chip-dot" aria-hidden="true" />
+            <span>Full Const.</span>
+          </button>
+        </div>
+      )}
 
-            <div className="dock-search-box" ref={searchBoxRef}>
-              <div className="dock-search-row">
-                <div className="dock-search-input-wrap">
-                  <Search size={13} className="dock-search-icon" aria-hidden="true" />
-                  <input
-                    type="text"
-                    className="dock-input"
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                    onFocus={() => {
-                      if (results.length > 0) setDropdownOpen(true);
-                    }}
-                    onKeyDown={handleSearchKeyDown}
-                    placeholder="City, airport, or lat, lon..."
-                    aria-label="Search observer city or coordinates"
-                    aria-expanded={dropdownOpen}
-                    aria-autocomplete="list"
-                    role="combobox"
-                  />
-                  {query && (
-                    <button
-                      type="button"
-                      className="dock-clear-btn"
-                      onClick={() => {
-                        setQuery('');
-                        setResults([]);
-                        setDropdownOpen(false);
-                        setActiveIndex(-1);
-                      }}
-                      aria-label="Clear location search"
-                    >
-                      <X size={12} aria-hidden="true" />
-                    </button>
-                  )}
-                </div>
+      {activeTrayCategory === 'balloon' && (
+        <div
+          className="dock-subtray"
+          style={{ '--tray-accent': CATEGORY_COLORS.balloon } as CSSProperties}
+          role="group"
+          aria-label="Balloon constellation sub-filters"
+        >
+          <span className="dock-subtray__label">BALLOONS</span>
+          {BALLOON_SUB_CHIPS.map(({ key, label }) => {
+            const active = balloonSublayers[key];
+            return (
+              <button
+                key={key}
+                type="button"
+                className={`dock-subtray__chip${active ? ' is-active' : ''}`}
+                aria-pressed={active}
+                onClick={() => toggleBalloonSublayer(key)}
+              >
+                <span className="dock-subtray__chip-dot" aria-hidden="true" />
+                <span>{label}</span>
+              </button>
+            );
+          })}
+          {nearestSondeHint && (
+            <span className="dock-subtray__hint tabular">{nearestSondeHint}</span>
+          )}
+        </div>
+      )}
 
+      {activeTrayCategory === 'drone' && (
+        <div
+          className="dock-subtray"
+          style={{ '--tray-accent': CATEGORY_COLORS.drone } as CSSProperties}
+          role="group"
+          aria-label="UAS and airspace sub-filters"
+        >
+          <span className="dock-subtray__label">UAS</span>
+          {DRONE_SUB_CHIPS.map(({ key, label }) => {
+            const active = droneSublayers[key];
+            return (
+              <button
+                key={key}
+                type="button"
+                className={`dock-subtray__chip${active ? ' is-active' : ''}`}
+                aria-pressed={active}
+                onClick={() => toggleDroneSublayer(key)}
+              >
+                <span className="dock-subtray__chip-dot" aria-hidden="true" />
+                <span>{label}</span>
+              </button>
+            );
+          })}
+          {!airspace.usCoverage && (
+            <span className="dock-subtray__hint">US FAA ONLY</span>
+          )}
+        </div>
+      )}
+
+      <nav className="dock-pill" aria-label="Tactical layer dock and local scan radius">
+        <div className="dock-cat-chips">
+          {CATEGORY_CHIPS.map(({ category, shortLabel, feedKey, expandable }) => {
+            const active = layers[category];
+            const feed = feeds[feedKey];
+            const accent = CATEGORY_COLORS[category];
+            const progressPct = computeRefreshProgressPct(feed);
+            const isTrayOpen = expandable !== undefined && activeTrayCategory === expandable;
+
+            return (
+              <div
+                key={category}
+                className={`dock-cat-chip${active ? ' is-active' : ' is-off'}`}
+                style={{ '--chip-accent': accent } as CSSProperties}
+              >
                 <button
                   type="button"
-                  className="dock-gps-btn"
-                  onClick={onLocateGps}
-                  disabled={gpsBusy}
-                  title="Use browser GPS location"
+                  className="dock-cat-chip__main"
+                  aria-pressed={active}
+                  title={`Toggle ${CATEGORY_LABELS[category]} (${counts[category]} tracked · ${STATUS_LABEL[feed.status]})`}
+                  onClick={() => toggleLayer(category)}
                 >
-                  <Crosshair size={12} aria-hidden="true" />
-                  <span>{gpsBusy ? 'Locating...' : 'Locate Me'}</span>
+                  <span className="dock-cat-chip__head">
+                    <span className="dock-cat-chip__icon">
+                      <CategoryGlyph category={category} />
+                    </span>
+                    <span className="dock-cat-chip__count tabular">{counts[category]}</span>
+                  </span>
+                  <span className="dock-cat-chip__label">{shortLabel}</span>
                 </button>
+
+                {expandable && (
+                  <button
+                    type="button"
+                    className={`dock-cat-chip__chevron${isTrayOpen ? ' is-open' : ''}`}
+                    aria-expanded={isTrayOpen}
+                    aria-label={`${isTrayOpen ? 'Close' : 'Open'} ${shortLabel} sub-filters`}
+                    title={`${shortLabel} sub-filters`}
+                    onClick={() =>
+                      setActiveTrayCategory((prev) => (prev === expandable ? null : expandable))
+                    }
+                  >
+                    <ChevronUp
+                      size={12}
+                      style={{
+                        transform: isTrayOpen ? 'rotate(180deg)' : 'rotate(0deg)',
+                        transition: 'transform 140ms ease',
+                      }}
+                      aria-hidden="true"
+                    />
+                  </button>
+                )}
+
+                <span className="dock-cat-chip__progress" aria-hidden="true">
+                  <span
+                    className="dock-cat-chip__progress-bar"
+                    style={{ width: `${progressPct}%` }}
+                  />
+                </span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div
+          className={`dock-radius-scrubber${atmosphericScope === 'global' ? ' is-dimmed' : ''}`}
+          title={
+            atmosphericScope === 'global'
+              ? `Local ADS-B & airspace cylinder radius (${radiusKm} km) — Global scope active`
+              : `Local scan radius: ${radiusKm} km`
+          }
+        >
+          <span className="dock-radius-scrubber__label tabular">LOCAL {radiusKm}KM</span>
+          <input
+            type="range"
+            className="dock-range"
+            min={10}
+            max={250}
+            step={5}
+            value={radiusKm}
+            onChange={(e) => setRadiusKm(Number(e.target.value))}
+            aria-label="Local scan radius in kilometers"
+          />
+        </div>
+      </nav>
+
+      {/* B) Centered Glass ⌘K Location Command Palette Modal */}
+      {commandPaletteOpen && (
+        <div
+          className="cockpit-modal-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) {
+              setCommandPaletteOpen(false);
+            }
+          }}
+        >
+          <div
+            className="command-palette"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Observer Location Command Palette"
+          >
+            <div className="command-palette__search-header">
+              <div className="command-palette__input-wrap">
+                <Search size={14} className="command-palette__search-icon" aria-hidden="true" />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  className="command-palette__input"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onFocus={() => {
+                    if (results.length > 0) setDropdownOpen(true);
+                  }}
+                  onKeyDown={handleSearchKeyDown}
+                  placeholder="City, airport, ICAO, or coordinates (lat, lon)..."
+                  aria-label="Search observer city, airport, ICAO, or coordinates"
+                  aria-expanded={dropdownOpen}
+                  aria-autocomplete="list"
+                  role="combobox"
+                />
+                {query && (
+                  <button
+                    type="button"
+                    className="dock-clear-btn"
+                    onClick={() => {
+                      setQuery('');
+                      setResults([]);
+                      setDropdownOpen(false);
+                      setActiveIndex(-1);
+                      searchInputRef.current?.focus();
+                    }}
+                    aria-label="Clear location search"
+                  >
+                    <X size={13} aria-hidden="true" />
+                  </button>
+                )}
               </div>
 
+              <button
+                type="button"
+                className="dock-gps-btn"
+                onClick={onLocateGps}
+                disabled={gpsBusy}
+                title="Acquire live browser GPS coordinates"
+              >
+                <Crosshair size={13} aria-hidden="true" />
+                <span>{gpsBusy ? 'LOCATING...' : 'GPS LOCATE'}</span>
+              </button>
+
+              <button
+                type="button"
+                className="inspector-close-btn"
+                onClick={() => setCommandPaletteOpen(false)}
+                aria-label="Close location command palette"
+              >
+                <X size={14} aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="command-palette__body cockpit-scroll">
+              {gpsError && (
+                <div className="dock-notice dock-notice--error" role="alert">
+                  <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
+                  <span>{gpsError}</span>
+                </div>
+              )}
+
               {searching && (
-                <div className="dock-inline-meta" style={{ marginTop: 4 }}>
-                  <span>Resolving coordinates...</span>
+                <div className="command-palette__section-head">
+                  <span>Resolving geodetic coordinates...</span>
                 </div>
               )}
 
               {dropdownOpen && results.length > 0 && (
-                <ul className="dock-search-dropdown cockpit-scroll" role="listbox">
-                  {results.map((item, idx) => (
-                    <li
-                      key={`${item.lat}-${item.lon}-${item.label}-${idx}`}
-                      role="option"
-                      aria-selected={idx === activeIndex}
-                      className={`dock-search-option${idx === activeIndex ? ' is-active' : ''}`}
-                      onMouseDown={(e) => {
-                        e.preventDefault();
-                        selectSearchResult(item);
-                      }}
-                      onMouseEnter={() => setActiveIndex(idx)}
-                    >
-                      <div className="dock-search-option__top">
-                        <span className="dock-search-option__label">{item.label}</span>
-                        <span className="dock-search-option__coords tabular">
-                          {item.lat.toFixed(2)}, {item.lon.toFixed(2)}
-                        </span>
-                      </div>
-                      <span className="dock-search-option__sub">{item.subtitle}</span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-
-            {gpsError && (
-              <div className="dock-notice dock-notice--error" role="alert">
-                <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
-                <span>{gpsError}</span>
-              </div>
-            )}
-
-            <select
-              className="dock-select"
-              value={matchedPresetId}
-              onChange={(e) => handlePresetChange(e.target.value)}
-              aria-label="Aerospace hotspot preset"
-            >
-              {matchedPresetId === '' && (
-                <option value="" disabled>
-                  Custom ({observer.label})
-                </option>
-              )}
-              {AEROSPACE_PRESETS.map((preset) => (
-                <option key={preset.id} value={preset.id}>
-                  {preset.name}
-                </option>
-              ))}
-            </select>
-
-            <div className="dock-inline-meta">
-              <span>{activePreset ? activePreset.subtitle : `Source: ${observer.source.toUpperCase()}`}</span>
-            </div>
-          </section>
-
-          {/* Scan Radius & Orbital Scope */}
-          <section className="dock-section" aria-label="Scan geometry and orbital scope">
-            <div className="dock-section-label">
-              <span>SCAN RADIUS</span>
-              <span className="dock-readout-pill tabular">
-                {radiusKm} km · {radiusSecondaryText}
-              </span>
-            </div>
-
-            <div className="dock-slider-row">
-              <span className="tabular" style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                10
-              </span>
-              <input
-                type="range"
-                className="dock-range"
-                min={10}
-                max={250}
-                step={5}
-                value={radiusKm}
-                onChange={(e) => setRadiusKm(Number(e.target.value))}
-                aria-label="Scan radius in kilometers"
-              />
-              <span className="tabular" style={{ fontSize: 10, color: 'var(--text-muted)' }}>
-                250
-              </span>
-            </div>
-
-            <div className="dock-section-label" style={{ marginTop: 3 }}>
-              <span>ORBITAL SCOPE</span>
-            </div>
-            <div className="dock-scope-grid" role="group" aria-label="Orbital propagation scope">
-              <button
-                type="button"
-                className={`dock-scope-btn${orbitalScope === 'cylinder' ? ' is-active' : ''}`}
-                aria-pressed={orbitalScope === 'cylinder'}
-                onClick={() => setOrbitalScope('cylinder')}
-              >
-                Scan Cylinder
-              </button>
-              <button
-                type="button"
-                className={`dock-scope-btn${orbitalScope === 'hemisphere' ? ' is-active' : ''}`}
-                aria-pressed={orbitalScope === 'hemisphere'}
-                onClick={() => setOrbitalScope('hemisphere')}
-              >
-                Full Sky EL&gt;0°
-              </button>
-            </div>
-          </section>
-
-          {/* 5 Layer Toggles with Countdown Rings & Feed Health */}
-          <section className="dock-section" aria-label="Telemetry layers">
-            <div className="dock-section-label">
-              <span>AEROSPACE LAYERS</span>
-              <span className="tabular">{counts.total} TRACKED</span>
-            </div>
-
-            <div className="layer-list">
-              {LAYER_ROWS.map(({ category, feedKey }) => {
-                const active = layers[category];
-                const feed = feeds[feedKey];
-                const color = CATEGORY_COLORS[category];
-                const ratio =
-                  feed.intervalSec > 0
-                    ? Math.max(0, Math.min(1, feed.nextRefreshSec / feed.intervalSec))
-                    : 0;
-                const dashOffset = RING_CIRCUMFERENCE * (1 - ratio);
-                const statusClass = `feed-pill feed-pill--${feed.status}`;
-                const ringTitle = `${feed.provider} · Next sync ${formatCountdownShort(
-                  feed.nextRefreshSec,
-                )}${feed.errorMsg ? ` · ${feed.errorMsg}` : ''}`;
-
-                return (
-                  <button
-                    key={category}
-                    type="button"
-                    className={`layer-row${active ? '' : ' is-off'}`}
-                    style={{ '--layer-color': color } as CSSProperties}
-                    onClick={() => toggleLayer(category)}
-                    aria-pressed={active}
-                    title={ringTitle}
-                  >
-                    <span className="layer-row__left">
-                      <span className="layer-row__dot" aria-hidden="true" />
-                      <span className="layer-row__name">{CATEGORY_LABELS[category]}</span>
-                    </span>
-
-                    <span className="layer-row__right">
-                      <span className="layer-row__count tabular">{counts[category]}</span>
-                      <span className={statusClass}>{STATUS_LABEL[feed.status]}</span>
-                      <span
-                        className="countdown-ring-wrap"
-                        title={ringTitle}
-                        aria-hidden="true"
+                <div>
+                  <div className="command-palette__section-head" style={{ marginBottom: 6 }}>
+                    <span>Search Matches</span>
+                    <span className="tabular">{results.length}</span>
+                  </div>
+                  <ul className="command-palette__results" role="listbox">
+                    {results.map((item, idx) => (
+                      <li
+                        key={`${item.lat}-${item.lon}-${item.label}-${idx}`}
+                        role="option"
+                        aria-selected={idx === activeIndex}
+                        className={`dock-search-option${idx === activeIndex ? ' is-active' : ''}`}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          selectSearchResult(item);
+                        }}
+                        onMouseEnter={() => setActiveIndex(idx)}
                       >
-                        <svg
-                          viewBox="0 0 24 24"
-                          className={`countdown-ring-svg${
-                            feed.status === 'loading' ? ' is-spinning' : ''
-                          }`}
-                        >
-                          <circle
-                            cx="12"
-                            cy="12"
-                            r={RING_RADIUS}
-                            className="countdown-ring-bg"
-                          />
-                          <circle
-                            cx="12"
-                            cy="12"
-                            r={RING_RADIUS}
-                            className="countdown-ring-fg"
-                            stroke={color}
-                            strokeDasharray={RING_CIRCUMFERENCE}
-                            strokeDashoffset={dashOffset}
-                          />
-                        </svg>
-                      </span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-
-            {(() => {
-              const flightsFeed = feeds.flights;
-              const liveAircraftCount = counts.flight + counts.military;
-              const lastUpdatedText = formatClockTime(flightsFeed.lastUpdatedMs, 'Never');
-              const degradedNotice = getDegradedFeedNotice(flightsFeed.status);
-              const isCritical =
-                flightsFeed.status === 'offline' || flightsFeed.status === 'error';
-              const errorItems = flightsFeed.errorMsg
-                ? flightsFeed.errorMsg
-                    .split(' | ')
-                    .map((item) => item.trim())
-                    .filter((item) => item.length > 0)
-                : [];
-              const canRetryLiveFeed =
-                flightsFeed.status === 'error' ||
-                flightsFeed.status === 'rate-limited' ||
-                flightsFeed.status === 'delayed';
-
-              return (
-                <div className="dock-feed-diag" data-testid="dock-feed-diagnostics">
-                  <div className="dock-feed-diag__header">
-                    <span className="dock-feed-diag__title">LIVE FEED DIAGNOSTICS</span>
-                    <span className={`feed-pill feed-pill--${flightsFeed.status}`}>
-                      {STATUS_LABEL[flightsFeed.status]}
-                    </span>
-                  </div>
-
-                  <div className="dock-feed-diag__meta">
-                    <span className="dock-feed-diag__key">ADS-B Targets</span>
-                    <span className="dock-feed-diag__val tabular">
-                      {liveAircraftCount} verified live
-                    </span>
-
-                    <span className="dock-feed-diag__key">Last Updated</span>
-                    <span className="dock-feed-diag__val tabular">{lastUpdatedText}</span>
-
-                    <span className="dock-feed-diag__key">Provider</span>
-                    <span
-                      className="dock-feed-diag__val tabular"
-                      title={flightsFeed.provider || 'adsb-cascade'}
-                    >
-                      {flightsFeed.provider || 'adsb-cascade'}
-                    </span>
-                  </div>
-
-                  {degradedNotice && (
-                    <div
-                      className={`dock-feed-diag__notice${isCritical ? ' is-critical' : ''}`}
-                      role="status"
-                    >
-                      <AlertTriangle
-                        size={12}
-                        style={{ flexShrink: 0, marginTop: 1 }}
-                        aria-hidden="true"
-                      />
-                      <div className="dock-feed-diag__notice-body">
-                        <span>{degradedNotice}</span>
-                        {errorItems.length > 0 && (
-                          <div className="dock-feed-diag__error-detail">
-                            <ul
-                              className="dock-feed-diag__error-list"
-                              aria-label="Provider diagnostics"
-                            >
-                              {errorItems.map((errLine, idx) => (
-                                <li
-                                  key={`${idx}-${errLine}`}
-                                  className="dock-feed-diag__error-item"
-                                >
-                                  {errLine}
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )}
-
-                  {canRetryLiveFeed && (
-                    <button
-                      type="button"
-                      className="dock-feed-diag__retry-btn"
-                      data-testid="dock-feed-retry"
-                      onClick={onManualSweep}
-                      title="Reset feed circuit breakers and retry live ADS-B sweep"
-                    >
-                      <RefreshCw size={12} aria-hidden="true" />
-                      <span>Retry Live Feed</span>
-                    </button>
-                  )}
-                </div>
-              );
-            })()}
-          </section>
-
-          {/* Satellite Subfilters */}
-          <section className="dock-section" aria-label="Satellite constellation filters">
-            <div className="dock-section-label">
-              <span>ORBITAL SUBFILTERS</span>
-              <span className="tabular" style={{ color: 'var(--cat-satellite)' }}>
-                SGP4
-              </span>
-            </div>
-
-            <div className="chip-row" role="group" aria-label="Satellite groups">
-              {SAT_GROUP_CHIPS.map(({ group, label }) => {
-                const active = satGroups[group];
-                return (
-                  <button
-                    key={group}
-                    type="button"
-                    className={`sat-chip${active ? ' is-active' : ''}`}
-                    aria-pressed={active}
-                    onClick={() => toggleSatGroup(group)}
-                  >
-                    {label}
-                  </button>
-                );
-              })}
-              <button
-                type="button"
-                className={`sat-chip${fullConstellation ? ' is-active' : ''}`}
-                aria-pressed={fullConstellation}
-                onClick={() => setFullConstellation(!fullConstellation)}
-                title="Load all Starlink shells instead of sampled constellation"
-              >
-                Full Const.
-              </button>
-            </div>
-          </section>
-
-          {/* Contextual Sonde & FAA Coverage Notices */}
-          {(nearestSondeHint || !airspace.usCoverage) && (
-            <section className="dock-section" aria-label="Regional feed notices">
-              {nearestSondeHint && (
-                <div className="dock-notice dock-notice--sonde">
-                  <Wind size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
-                  <span>{nearestSondeHint}</span>
+                        <div className="dock-search-option__top">
+                          <span className="dock-search-option__label">{item.label}</span>
+                          <span className="dock-search-option__coords tabular">
+                            {formatCoords(item.lat, item.lon, 2)}
+                          </span>
+                        </div>
+                        <span className="dock-search-option__sub">{item.subtitle}</span>
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
 
-              {!airspace.usCoverage && (
-                <div className="dock-notice dock-notice--airspace">
-                  <Info size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
-                  <span>
-                    FAA UASFM / SUA airspace overlays apply to US &amp; territories only.
+              <div>
+                <div className="command-palette__section-head" style={{ marginBottom: 7 }}>
+                  <span>Aerospace Hotspot Presets</span>
+                  <span className="tabular">
+                    ACTIVE: {observer.label} ({formatCoords(observer.lat, observer.lon, 2)})
                   </span>
                 </div>
-              )}
-            </section>
-          )}
-
-          {/* Manual Sweep Action */}
-          <section className="dock-section" aria-label="Radar sweep trigger">
-            <div className="dock-inline-meta">
-              <span>FAA Airspace Feed</span>
-              <span className={`feed-pill feed-pill--${feeds.airspace.status}`}>
-                {STATUS_LABEL[feeds.airspace.status]}
-              </span>
+                <div className="command-palette__presets">
+                  {AEROSPACE_PRESETS.map((preset) => {
+                    const isActive = matchedPresetId === preset.id;
+                    return (
+                      <button
+                        key={preset.id}
+                        type="button"
+                        className={`palette-preset-card${isActive ? ' is-active' : ''}`}
+                        onClick={() => handlePresetSelect(preset.id)}
+                      >
+                        <div className="palette-preset-card__top">
+                          <span className="palette-preset-card__name">{preset.name}</span>
+                          <span className="palette-preset-card__coords tabular">
+                            {preset.lat.toFixed(2)}, {preset.lon.toFixed(2)}
+                          </span>
+                        </div>
+                        <span className="palette-preset-card__sub">{preset.subtitle}</span>
+                        {isActive && <span className="palette-preset-card__badge">ACTIVE STATION</span>}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
-            <button
-              type="button"
-              className="dock-sweep-btn"
-              onClick={onManualSweep}
-              title="Trigger immediate radar sweep pulse and refresh active feeds"
-            >
-              <Radar size={14} aria-hidden="true" />
-              <span>Sweep Now</span>
-            </button>
-          </section>
+
+            <div className="command-palette__footer tabular">
+              <span>↑↓ Navigate · ↵ Select Station</span>
+              <span>ESC Close</span>
+            </div>
+          </div>
         </div>
-      </aside>
+      )}
     </div>
   );
 }

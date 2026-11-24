@@ -26,6 +26,7 @@ export function OpenDroneIdModal() {
   const odidModalOpen = useSkyStore((s) => s.odidModalOpen);
   const setOdidModalOpen = useSkyStore((s) => s.setOdidModalOpen);
   const odidConfig = useSkyStore((s) => s.odidConfig);
+  const droneSublayers = useSkyStore((s) => s.droneSublayers);
   const updateOdidConfig = useSkyStore((s) => s.updateOdidConfig);
   const droneFeed = useSkyStore((s) => s.feeds.drones);
 
@@ -64,6 +65,8 @@ export function OpenDroneIdModal() {
   if (!odidModalOpen) {
     return null;
   }
+
+  const simEnabled = odidConfig.simulatorEnabled || droneSublayers.simOdid;
 
   const handleConnect = (event: FormEvent) => {
     event.preventDefault();
@@ -136,7 +139,7 @@ export function OpenDroneIdModal() {
       ? odidConfig.connected
         ? `CONNECTED (${odidConfig.transport.toUpperCase()})`
         : `CONNECTING (${odidConfig.transport.toUpperCase()})`
-      : odidConfig.simulatorEnabled
+      : simEnabled
         ? 'SIM-ODID ACTIVE (4 LOCAL UAS)'
         : 'OFFLINE';
 
@@ -177,7 +180,7 @@ export function OpenDroneIdModal() {
           <div className="modal-card">
             <div className="modal-switch-row">
               <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-                {odidConfig.connected || odidConfig.simulatorEnabled ? (
+                {odidConfig.connected || simEnabled ? (
                   <Wifi size={14} color="#A3E635" aria-hidden="true" />
                 ) : (
                   <WifiOff size={14} color="#94A3B8" aria-hidden="true" />
@@ -214,13 +217,11 @@ export function OpenDroneIdModal() {
 
               <button
                 type="button"
-                className={`modal-switch-btn${odidConfig.simulatorEnabled ? ' is-on' : ''}`}
-                aria-pressed={odidConfig.simulatorEnabled}
-                onClick={() =>
-                  updateOdidConfig({ simulatorEnabled: !odidConfig.simulatorEnabled })
-                }
+                className={`modal-switch-btn${simEnabled ? ' is-on' : ''}`}
+                aria-pressed={simEnabled}
+                onClick={() => updateOdidConfig({ simulatorEnabled: !simEnabled })}
               >
-                {odidConfig.simulatorEnabled ? 'SIM ON' : 'SIM OFF'}
+                {simEnabled ? 'SIM ON' : 'SIM OFF'}
               </button>
             </div>
           </div>
@@ -235,7 +236,6 @@ export function OpenDroneIdModal() {
               <input
                 type="text"
                 className="dock-input"
-                style={{ paddingLeft: 10 }}
                 value={urlInput}
                 onChange={(e) => setUrlInput(e.target.value)}
                 placeholder="ws://127.0.0.1:8765/odid or https://..."
@@ -264,7 +264,7 @@ export function OpenDroneIdModal() {
               </span>
               <button
                 type="button"
-                className="control-dock__collapse-btn"
+                className="modal-copy-btn"
                 onClick={() => void handleCopySchema()}
               >
                 {schemaCopied ? (

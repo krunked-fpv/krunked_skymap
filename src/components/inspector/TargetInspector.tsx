@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Check,
-  Compass,
   Copy,
   Navigation,
   Radio,
@@ -12,7 +11,6 @@ import {
 import {
   BREACH_COLOR,
   CATEGORY_COLORS,
-  CATEGORY_LABELS,
   EMERGENCY_COLOR,
   SATELLITE_ECLIPSED_COLOR,
   SATELLITE_SUNLIT_COLOR,
@@ -59,6 +57,35 @@ function getSquawkMeaning(squawk?: string): string | null {
   return null;
 }
 
+function resolveProvenanceBadge(entity: SkyEntity): string {
+  switch (entity.category) {
+    case 'balloon':
+      if (entity.subSource === 'windborne') {
+        return entity.isCachedSeed ? 'WINDBORNE · CACHED' : 'WINDBORNE ATLAS';
+      }
+      if (entity.subSource === 'adsb-lta') {
+        return 'ADS-B LTA';
+      }
+      return 'SONDEHUB V2';
+    case 'drone':
+      if (entity.subSource === 'adsb-uas') {
+        return entity.isMilitary ? 'LIVE ATC UAS · MILITARY' : 'LIVE ATC UAS';
+      }
+      if (entity.subSource === 'odid-sim' || entity.isSimulated) {
+        return 'SIM-ODID';
+      }
+      return 'OPENDRONEID LIVE';
+    case 'flight':
+    case 'military':
+      if (entity.isLadd) return 'MIL / LADD';
+      if (entity.isPia) return 'MIL / PIA';
+      if (entity.isMilitary || entity.category === 'military') return 'MILITARY';
+      return 'ADS-B LIVE';
+    case 'satellite':
+      return 'CELESTRAK SGP4';
+  }
+}
+
 export function TargetInspector() {
   const inspectorOpen = useSkyStore((s) => s.inspectorOpen);
   const entity = useSkyStore((s) => s.selectedEntitySnapshot);
@@ -70,6 +97,8 @@ export function TargetInspector() {
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const layout = useSkyStore((s) => s.layout);
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
+  const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
+  const skyDomePip = useSkyStore((s) => s.skyDomePip);
 
   const [copied, setCopied] = useState(false);
   const [, setClockTick] = useState(0);
@@ -98,8 +127,20 @@ export function TargetInspector() {
     const timer = window.setInterval(() => {
       setClockTick((t) => (t + 1) % 1_000_000);
     }, 1000);
-    return () => window.clearInterval(timer);
-  }, [isOpen]);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      const st = useSkyStore.getState();
+      if (st.commandPaletteOpen || st.odidModalOpen || st.diagnosticsOpen || st.settingsOpen) {
+        return;
+      }
+      selectEntity(null, false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [isOpen, selectEntity]);
 
   const handleCopyPermalink = async () => {
     if (!entity || typeof window === 'undefined') return;
@@ -112,6 +153,8 @@ export function TargetInspector() {
     params.set('units', units);
     params.set('layout', layout);
     params.set('scope', orbitalScope);
+    params.set('atm', atmosphericScope);
+    params.set('pip', skyDomePip ? '1' : '0');
     params.set('selected', entity.id);
     const permalink = new URL(`#${params.toString()}`, window.location.href).toString();
 
@@ -164,6 +207,7 @@ export function TargetInspector() {
   }
 
   const accent = getCategoryAccent(entity);
+  const provenanceLabel = resolveProvenanceBadge(entity);
   const vert = formatVerticalRate(entity.vertRateMs, units);
   const observationClock = formatClockTime(entity.timestampMs, '--:--:--');
   const observationAge = formatRelativeAge(entity.timestampMs, Date.now());
@@ -194,6 +238,11 @@ export function TargetInspector() {
     (entity.category === 'drone' && (entity.ceilingBreach || entity.tfrBreach)) ||
     Boolean(entity.isSimulated);
 
+  const hasOdidOperator =
+    entity.category === 'drone' &&
+    entity.subSource !== 'adsb-uas' &&
+    entity.hasOperatorLocation !== false;
+
   return (
     <aside
       className={`target-inspector${isOpen ? ' is-open' : ''}`}
@@ -207,7 +256,7 @@ export function TargetInspector() {
           <h2 className="inspector-callsign tabular">{entity.callsign || entity.id}</h2>
           <p className="inspector-subtitle">{entity.subtitle || entity.id}</p>
           <span className="inspector-cat-badge" style={{ color: accent }}>
-            {CATEGORY_LABELS[entity.category]}
+            {provenanceLabel}
           </span>
         </div>
 
@@ -216,7 +265,7 @@ export function TargetInspector() {
           className="inspector-close-btn"
           onClick={() => selectEntity(null, false)}
           aria-label="Close target inspector"
-          title="Close inspector"
+          title="Close inspector (Esc)"
         >
           <X size={15} aria-hidden="true" />
         </button>
@@ -265,10 +314,34 @@ export function TargetInspector() {
           </div>
         )}
 
-        {/* Primary Telemetry Grid */}
-        <section aria-label="Kinematics telemetry">
-          <div className="inspector-section-title">KINEMATICS TELEMETRY</div>
+        {/* 2x3 Primary Telemetry Matrix */}
+        <section aria-label="Primary telemetry matrix">
+          <div className="inspector-section-head">
+            <span className="inspector-section-title">PRIMARY TELEMETRY</span>
+            <span
+              className={`horizon-pill ${
+                belowHorizon ? 'horizon-pill--below' : 'horizon-pill--above'
+              }`}
+            >
+              {belowHorizon ? 'BELOW HORIZON' : 'LINE OF SIGHT'}
+            </span>
+          </div>
+
           <div className="telemetry-grid">
+            <div className="telemetry-cell">
+              <div className="telemetry-cell__label">ALTITUDE</div>
+              <div className="telemetry-cell__value tabular">
+                {entity.altBaroM !== undefined
+                  ? formatAltitude(entity.altBaroM, units)
+                  : formatAltitude(entity.altM, units)}
+              </div>
+              <div className="telemetry-cell__sub tabular">
+                {entity.altBaroM !== undefined
+                  ? `BARO · GEOM ${formatAltitude(entity.altM, units)}`
+                  : 'GEOM WGS-84'}
+              </div>
+            </div>
+
             <div className="telemetry-cell">
               <div className="telemetry-cell__label">GROUND SPEED</div>
               <div className="telemetry-cell__value tabular">
@@ -277,19 +350,17 @@ export function TargetInspector() {
             </div>
 
             <div className="telemetry-cell">
-              <div className="telemetry-cell__label">
-                {entity.altBaroM !== undefined ? 'BARO / GEOM ALT' : 'GEOM ALTITUDE'}
+              <div className="telemetry-cell__label">HEADING / TRACK</div>
+              <div
+                className="telemetry-cell__value tabular"
+                style={
+                  entity.headingValid === false
+                    ? { color: 'var(--text-secondary)' }
+                    : undefined
+                }
+              >
+                {formatHeading(entity.headingDeg, entity.headingValid)}
               </div>
-              <div className="telemetry-cell__value tabular">
-                {entity.altBaroM !== undefined
-                  ? formatAltitude(entity.altBaroM, units)
-                  : formatAltitude(entity.altM, units)}
-              </div>
-              {entity.altBaroM !== undefined && (
-                <div className="telemetry-cell__sub tabular">
-                  Geom: {formatAltitude(entity.altM, units)}
-                </div>
-              )}
             </div>
 
             <div className="telemetry-cell">
@@ -310,91 +381,28 @@ export function TargetInspector() {
             </div>
 
             <div className="telemetry-cell">
-              <div className="telemetry-cell__label">HEADING / TRACK</div>
-              <div
-                className="telemetry-cell__value tabular"
-                style={
-                  entity.headingValid === false
-                    ? { color: 'var(--text-secondary)' }
-                    : undefined
-                }
-              >
-                {formatHeading(entity.headingDeg, entity.headingValid)}
-              </div>
-            </div>
-
-            <div className="telemetry-cell">
-              <div className="telemetry-cell__label">COORDINATES</div>
-              <div className="telemetry-cell__value tabular">
-                {formatCoords(entity.lat, entity.lon)}
-              </div>
-            </div>
-
-            <div className="telemetry-cell">
-              <div className="telemetry-cell__label">ORIGIN / COUNTRY</div>
-              <div className="telemetry-cell__value">{entity.country || 'Unknown'}</div>
-            </div>
-
-            <div className="telemetry-cell telemetry-cell--wide">
-              <div className="telemetry-cell__label">LAST UPDATED</div>
-              <div className="telemetry-cell__value tabular">{observationLabel}</div>
-            </div>
-          </div>
-        </section>
-
-        {/* Live Topocentric Radar Card */}
-        <section className="radar-card" aria-label="Topocentric radar look angles">
-          <div className="radar-card__header">
-            <span
-              className="inspector-section-title"
-              style={{ marginBottom: 0, display: 'inline-flex', alignItems: 'center', gap: 5 }}
-            >
-              <Compass size={12} color="#22D3EE" aria-hidden="true" />
-              <span>TOPOCENTRIC RADAR</span>
-            </span>
-
-            <span
-              className={`horizon-pill ${
-                belowHorizon ? 'horizon-pill--below' : 'horizon-pill--above'
-              }`}
-            >
-              {belowHorizon ? 'BELOW HORIZON' : 'LINE OF SIGHT'}
-            </span>
-          </div>
-
-          <div className="telemetry-grid">
-            <div className="telemetry-cell">
-              <div className="telemetry-cell__label">AZIMUTH</div>
-              <div className="telemetry-cell__value tabular">{azText}</div>
-            </div>
-
-            <div className="telemetry-cell">
-              <div className="telemetry-cell__label">ELEVATION</div>
-              <div
-                className="telemetry-cell__value tabular"
-                style={{ color: belowHorizon ? '#FCD34D' : '#6EE7B7' }}
-              >
-                {elText}
-              </div>
-            </div>
-
-            <div className="telemetry-cell">
               <div className="telemetry-cell__label">SLANT RANGE</div>
               <div className="telemetry-cell__value tabular">
                 {formatDistance(entity.topocentric.slantRangeKm, units)}
               </div>
+              <div className="telemetry-cell__sub tabular">
+                GND {formatDistance(entity.topocentric.groundDistKm, units)}
+              </div>
             </div>
 
             <div className="telemetry-cell">
-              <div className="telemetry-cell__label">GROUND DIST</div>
-              <div className="telemetry-cell__value tabular">
-                {formatDistance(entity.topocentric.groundDistKm, units)}
+              <div className="telemetry-cell__label">AZ / EL</div>
+              <div
+                className="telemetry-cell__value tabular"
+                style={{ color: belowHorizon ? '#FCD34D' : '#6EE7B7' }}
+              >
+                {azText} · {elText}
               </div>
             </div>
           </div>
         </section>
 
-        {/* Category-Specific Deep Blocks */}
+        {/* Category Deep-Telemetry Section */}
         {(entity.category === 'flight' || entity.category === 'military') && (
           <section aria-label="Flight transponder details">
             <div className="inspector-section-title">TRANSPONDER &amp; AIRFRAME</div>
@@ -422,17 +430,295 @@ export function TargetInspector() {
                 </div>
               </div>
               <div className="telemetry-cell telemetry-cell--wide">
-                <div className="telemetry-cell__label">STATUS FLAGS</div>
+                <div className="telemetry-cell__label">FLAGS</div>
                 <div className="telemetry-cell__value tabular">
                   {[
                     entity.onGround ? 'ON GROUND' : 'AIRBORNE',
                     entity.isMilitary ? 'MILITARY' : 'CIVIL',
                     entity.isLadd ? 'LADD' : null,
                     entity.isPia ? 'PIA' : null,
+                    entity.sourceFeed ? entity.sourceFeed.toUpperCase() : null,
                   ]
                     .filter(Boolean)
                     .join(' · ')}
                 </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">COUNTRY / OPERATOR</div>
+                <div className="telemetry-cell__value">{entity.country || 'Unknown'}</div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">COORDINATES</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatCoords(entity.lat, entity.lon)}
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {entity.category === 'balloon' && entity.subSource === 'windborne' && (
+          <section aria-label="WindBorne stratospheric telemetry">
+            <div className="inspector-section-title">WINDBORNE CONSTELLATION</div>
+            <div className="telemetry-grid">
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">CONSTELLATION ID</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.constellationId || entity.serial}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">TELEMETRY CACHE</div>
+                <div
+                  className="telemetry-cell__value tabular"
+                  style={{ color: entity.isCachedSeed ? '#FCD34D' : '#6EE7B7' }}
+                >
+                  {entity.isCachedSeed ? 'CACHED SEED' : 'LIVE'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">FLIGHT PHASE</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.burstState.toUpperCase()}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">HISTORICAL TRACK</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.trail.length} PTS
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">COORDINATES</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatCoords(entity.lat, entity.lon)}
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {entity.category === 'balloon' && entity.subSource === 'adsb-lta' && (
+          <section aria-label="ADS-B Lighter-Than-Air telemetry">
+            <div className="inspector-section-title">ADS-B LTA BALLOON</div>
+            <div className="telemetry-grid">
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">ICAO24 HEX</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.icaoHex ? entity.icaoHex.toUpperCase() : '—'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">REGISTRATION</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.registration || '—'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">SQUAWK</div>
+                <div className="telemetry-cell__value tabular">{entity.squawk || '—'}</div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">AIRCRAFT TYPE</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.sondeType || 'ADS-B LTA'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">FLIGHT PHASE</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.burstState.toUpperCase()}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">COORDINATES</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatCoords(entity.lat, entity.lon)}
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {entity.category === 'balloon' &&
+          entity.subSource !== 'windborne' &&
+          entity.subSource !== 'adsb-lta' && (
+            <section aria-label="Radiosonde meteorological telemetry">
+              <div className="inspector-section-title">RADIOSONDE TELEMETRY</div>
+              <div className="telemetry-grid">
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">SERIAL / MODEL</div>
+                  <div className="telemetry-cell__value tabular">{entity.serial}</div>
+                  <div className="telemetry-cell__sub">{entity.sondeType}</div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">FLIGHT PHASE</div>
+                  <div className="telemetry-cell__value tabular">
+                    {entity.burstState.toUpperCase()}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">FREQUENCY</div>
+                  <div className="telemetry-cell__value tabular">
+                    {entity.freqMHz !== undefined ? `${entity.freqMHz.toFixed(3)} MHz` : '—'}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">TEMP / HUMIDITY</div>
+                  <div className="telemetry-cell__value tabular">
+                    {entity.tempC !== undefined ? `${entity.tempC.toFixed(1)} °C` : '—'}
+                    {' · '}
+                    {entity.humidityPct !== undefined ? `${Math.round(entity.humidityPct)}%` : '—'}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">PRESSURE</div>
+                  <div className="telemetry-cell__value tabular">
+                    {entity.pressureHPa !== undefined
+                      ? `${entity.pressureHPa.toFixed(1)} hPa`
+                      : '—'}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">RX UPLOADER</div>
+                  <div className="telemetry-cell__value">
+                    {entity.uploaderCallsign || 'SondeHub'}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">COORDINATES</div>
+                  <div className="telemetry-cell__value tabular">
+                    {formatCoords(entity.lat, entity.lon)}
+                  </div>
+                </div>
+                <div className="telemetry-cell">
+                  <div className="telemetry-cell__label">LAST UPDATED</div>
+                  <div className="telemetry-cell__value tabular">{observationLabel}</div>
+                </div>
+              </div>
+            </section>
+          )}
+
+        {entity.category === 'drone' && entity.subSource === 'adsb-uas' && (
+          <section aria-label="Live ATC unmanned aircraft telemetry">
+            <div className="inspector-section-title">ATC UNMANNED AIRCRAFT</div>
+            <div className="telemetry-grid">
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">ICAO24 HEX</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.icaoHex ? entity.icaoHex.toUpperCase() : '—'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">TYPE / CLASS</div>
+                <div className="telemetry-cell__value tabular">
+                  {[
+                    entity.aircraftType,
+                    entity.adsbCategory,
+                    entity.uaType.toUpperCase(),
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">SQUAWK</div>
+                <div className="telemetry-cell__value tabular">{entity.squawk || '—'}</div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">COORDINATES</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatCoords(entity.lat, entity.lon)}
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">FLAGS</div>
+                <div className="telemetry-cell__value tabular">
+                  {[
+                    'LIVE ATC UAS',
+                    entity.isMilitary ? 'MILITARY' : null,
+                    entity.isLadd ? 'LADD' : null,
+                    entity.isPia ? 'PIA' : null,
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </div>
+              </div>
+              <div className="telemetry-cell telemetry-cell--wide">
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {entity.category === 'drone' && entity.subSource !== 'adsb-uas' && (
+          <section aria-label="ASTM F3411 OpenDroneID telemetry">
+            <div className="inspector-section-title">OPEN DRONE ID · ASTM F3411</div>
+            <div className="telemetry-grid">
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">UAS ID</div>
+                <div className="telemetry-cell__value tabular">{entity.uasId}</div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">AIRFRAME / AGL</div>
+                <div className="telemetry-cell__value tabular">
+                  {entity.uaType.toUpperCase()} · {formatAltitude(entity.altAglM, units, true)} AGL
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">FAA UASFM CEILING</div>
+                <div
+                  className="telemetry-cell__value tabular"
+                  style={{ color: entity.ceilingBreach ? BREACH_COLOR : 'var(--text-bright)' }}
+                >
+                  {entity.faaCeilingFt !== null ? `${entity.faaCeilingFt} ft AGL` : 'Uncontrolled'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">OPERATOR RANGE</div>
+                <div className="telemetry-cell__value tabular">
+                  {hasOdidOperator
+                    ? formatShortRangeM(entity.operatorDistM, units)
+                    : 'UNAVAILABLE'}
+                </div>
+              </div>
+              {hasOdidOperator && (
+                <div className="telemetry-cell telemetry-cell--wide">
+                  <div className="telemetry-cell__label">OPERATOR POSITION</div>
+                  <div className="telemetry-cell__value tabular">
+                    {formatCoords(entity.operatorLat, entity.operatorLon)}
+                  </div>
+                  <div className="telemetry-cell__sub">{entity.missionDesc}</div>
+                </div>
+              )}
+              {!hasOdidOperator && (
+                <div className="telemetry-cell telemetry-cell--wide">
+                  <div className="telemetry-cell__label">MISSION</div>
+                  <div className="telemetry-cell__value">{entity.missionDesc || '—'}</div>
+                </div>
+              )}
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">COORDINATES</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatCoords(entity.lat, entity.lon)}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
               </div>
             </div>
           </section>
@@ -485,92 +771,15 @@ export function TargetInspector() {
                   {entity.radialVelocityKmS.toFixed(2)} km/s
                 </div>
               </div>
-            </div>
-          </section>
-        )}
-
-        {entity.category === 'balloon' && (
-          <section aria-label="Radiosonde meteorological telemetry">
-            <div className="inspector-section-title">RADIOSONDE TELEMETRY</div>
-            <div className="telemetry-grid">
               <div className="telemetry-cell">
-                <div className="telemetry-cell__label">SERIAL / MODEL</div>
-                <div className="telemetry-cell__value tabular">{entity.serial}</div>
-                <div className="telemetry-cell__sub">{entity.sondeType}</div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">FLIGHT PHASE</div>
+                <div className="telemetry-cell__label">SUB-SATELLITE</div>
                 <div className="telemetry-cell__value tabular">
-                  {entity.burstState.toUpperCase()}
+                  {formatCoords(entity.lat, entity.lon)}
                 </div>
               </div>
               <div className="telemetry-cell">
-                <div className="telemetry-cell__label">FREQUENCY</div>
-                <div className="telemetry-cell__value tabular">
-                  {entity.freqMHz !== undefined ? `${entity.freqMHz.toFixed(3)} MHz` : '—'}
-                </div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">TEMP / HUMIDITY</div>
-                <div className="telemetry-cell__value tabular">
-                  {entity.tempC !== undefined ? `${entity.tempC.toFixed(1)} °C` : '—'}
-                  {' · '}
-                  {entity.humidityPct !== undefined ? `${Math.round(entity.humidityPct)}%` : '—'}
-                </div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">PRESSURE</div>
-                <div className="telemetry-cell__value tabular">
-                  {entity.pressureHPa !== undefined
-                    ? `${entity.pressureHPa.toFixed(1)} hPa`
-                    : '—'}
-                </div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">RX UPLOADER</div>
-                <div className="telemetry-cell__value">
-                  {entity.uploaderCallsign || 'SondeHub'}
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
-
-        {entity.category === 'drone' && (
-          <section aria-label="ASTM F3411 OpenDroneID telemetry">
-            <div className="inspector-section-title">OPEN DRONE ID · ASTM F3411</div>
-            <div className="telemetry-grid">
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">UAS ID</div>
-                <div className="telemetry-cell__value tabular">{entity.uasId}</div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">AIRFRAME / AGL</div>
-                <div className="telemetry-cell__value tabular">
-                  {entity.uaType.toUpperCase()} · {formatAltitude(entity.altAglM, units, true)} AGL
-                </div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">FAA UASFM CEILING</div>
-                <div
-                  className="telemetry-cell__value tabular"
-                  style={{ color: entity.ceilingBreach ? BREACH_COLOR : 'var(--text-bright)' }}
-                >
-                  {entity.faaCeilingFt !== null ? `${entity.faaCeilingFt} ft AGL` : 'Uncontrolled'}
-                </div>
-              </div>
-              <div className="telemetry-cell">
-                <div className="telemetry-cell__label">OPERATOR RANGE</div>
-                <div className="telemetry-cell__value tabular">
-                  {formatShortRangeM(entity.operatorDistM, units)}
-                </div>
-              </div>
-              <div className="telemetry-cell telemetry-cell--wide">
-                <div className="telemetry-cell__label">OPERATOR POSITION</div>
-                <div className="telemetry-cell__value tabular">
-                  {formatCoords(entity.operatorLat, entity.operatorLon)}
-                </div>
-                <div className="telemetry-cell__sub">{entity.missionDesc}</div>
+                <div className="telemetry-cell__label">LAST UPDATED</div>
+                <div className="telemetry-cell__value tabular">{observationLabel}</div>
               </div>
             </div>
           </section>
@@ -585,7 +794,7 @@ export function TargetInspector() {
           onClick={() => setFollowSelected(!followSelected)}
         >
           <Navigation size={13} aria-hidden="true" />
-          <span>{followSelected ? 'Following' : 'Follow Target'}</span>
+          <span>{followSelected ? 'FOLLOWING' : 'FOLLOW'}</span>
         </button>
 
         <button
@@ -594,7 +803,7 @@ export function TargetInspector() {
           onClick={() => void handleCopyPermalink()}
         >
           {copied ? <Check size={13} aria-hidden="true" /> : <Copy size={13} aria-hidden="true" />}
-          <span>{copied ? 'Copied!' : 'Copy Permalink'}</span>
+          <span>{copied ? 'COPIED!' : 'SHARE LINK'}</span>
         </button>
       </div>
     </aside>
