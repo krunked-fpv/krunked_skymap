@@ -101,7 +101,7 @@ Krunked Sky-Map supports standalone installation on desktop and mobile devices (
 
 - **Web App Manifest (`public/manifest.json`):** Configured with `start_url: "./"`, `scope: "./"`, `display: "standalone"`, and `#06090F` obsidian theme/background colors.
 - **Raster PNG Icons (`scripts/generate-pwa-icons.mjs`):** Zero-dependency Node script generating valid `192x192`, `512x512`, and `180x180` (`apple-touch-icon.png`) binary PNG radar icons inside the maskable safe zone (`public/icons/`).
-- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v3`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
+- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v4`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`, `krunked-skymap-v3`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
 
 ---
 
