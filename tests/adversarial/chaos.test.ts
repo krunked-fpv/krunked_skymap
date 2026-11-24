@@ -6,6 +6,7 @@ import starlinkTleRaw from '../../public/data/tle/starlink.tle?raw';
 import appSourceRaw from '../../src/App.tsx?raw';
 import balloonsSourceRaw from '../../src/services/balloonsService.ts?raw';
 import controlDockSourceRaw from '../../src/components/hud/ControlDock.tsx?raw';
+import topTelemetryBarSourceRaw from '../../src/components/hud/TopTelemetryBar.tsx?raw';
 import polarDomeSourceRaw from '../../src/components/skydome/PolarSkyDome.tsx?raw';
 import tacticalMapSourceRaw from '../../src/components/map/TacticalMap.tsx?raw';
 import {
@@ -1368,7 +1369,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
 
-    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v4'");
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v5'");
     expect(swSource).toContain("addEventListener('install'");
     expect(swSource).toContain("addEventListener('activate'");
     expect(swSource).toContain("addEventListener('fetch'");
@@ -1414,7 +1415,13 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
         };
       },
       async keys() {
-        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3', 'krunked-skymap-v4'];
+        return [
+          'krunked-skymap-v1',
+          'krunked-skymap-v2',
+          'krunked-skymap-v3',
+          'krunked-skymap-v4',
+          'krunked-skymap-v5',
+        ];
       },
       async delete(key: string) {
         deletedCaches.push(key);
@@ -1435,7 +1442,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       Promise,
     });
 
-    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v4)
+    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v5)
     const activateTasks: Array<Promise<unknown>> = [];
     listeners.get('activate')?.({
       waitUntil(p: Promise<unknown>) {
@@ -1443,8 +1450,13 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       },
     });
     await Promise.all(activateTasks);
-    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3']);
-    expect(deletedCaches).not.toContain('krunked-skymap-v4');
+    expect(deletedCaches).toEqual([
+      'krunked-skymap-v1',
+      'krunked-skymap-v2',
+      'krunked-skymap-v3',
+      'krunked-skymap-v4',
+    ]);
+    expect(deletedCaches).not.toContain('krunked-skymap-v5');
 
     // Telemetry, CORS relays (r.jina.ai), and /api-proxy/ URLs MUST bypass respondWith()
     const fetchListener = listeners.get('fetch')!;
@@ -2786,12 +2798,13 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
     ).toBe(true);
   });
 
-  it('verifies sw.js krunked-skymap-v4 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
+  it('verifies sw.js krunked-skymap-v5 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
     const fs = await loadNodeFs();
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
     const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8').replace(/\r\n/g, '\n');
 
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v5'");
     expect(viteConfig).toContain("'/api-proxy/windborne': createAdsbProxyEntry('/api-proxy/windborne', 'https://a.windbornesystems.com')");
 
     const listeners = new Map<string, (ev: unknown) => void>();
@@ -2825,7 +2838,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
         };
       },
       async keys() {
-        return ['krunked-skymap-v4'];
+        return ['krunked-skymap-v5'];
       },
       async delete() {
         return true;
@@ -3280,4 +3293,1056 @@ describe('Challenge 9 — Sprint 04 3D Sky-Dome, Celestial/TCA, Zero-GC & Hotkey
       await appMount.cleanup();
     }
   }, 20_000);
+});
+
+// ---------------------------------------------------------------------------
+// Challenge 10 — Sprint 05 Translucent Dome, Compass/Touch-Lock, Portal Modal,
+//                Right +33% PIP & Overhead Lock Audit
+// ---------------------------------------------------------------------------
+import {
+  shortestAngleDeltaDeg as c10ShortestDelta,
+  smoothCompassHeadingDeg as c10SmoothCompass,
+  computeScreenCompensatedHeadingDeg as c10ScreenHeading,
+  deriveCompassHeadingDeg as c10DeriveCompass,
+  normalizeAzimuthDeg as c10NormAz,
+} from '../../src/math/geodesy';
+import {
+  PolarSkyDome as C10PolarSkyDome,
+  extractCompassHeadingDeg as c10ExtractCompass,
+} from '../../src/components/skydome/PolarSkyDome';
+import { computeLayoutCameraPadding as c10ComputePadding } from '../../src/components/map/TacticalMap';
+
+function makeMockCanvas2dContext(): Record<string, unknown> {
+  const mkGrad = () => ({ addColorStop: () => {} });
+  return {
+    save: () => {},
+    restore: () => {},
+    setTransform: () => {},
+    clearRect: () => {},
+    fillRect: () => {},
+    beginPath: () => {},
+    closePath: () => {},
+    moveTo: () => {},
+    lineTo: () => {},
+    arc: () => {},
+    arcTo: () => {},
+    ellipse: () => {},
+    bezierCurveTo: () => {},
+    roundRect: () => {},
+    fill: () => {},
+    stroke: () => {},
+    clip: () => {},
+    translate: () => {},
+    rotate: () => {},
+    scale: () => {},
+    setLineDash: () => {},
+    fillText: () => {},
+    measureText: (txt: string) => ({ width: txt.length * 6 }),
+    createRadialGradient: mkGrad,
+    createLinearGradient: mkGrad,
+    createConicGradient: mkGrad,
+    globalAlpha: 1,
+    fillStyle: '',
+    strokeStyle: '',
+    lineWidth: 1,
+    lineCap: 'butt',
+    lineJoin: 'miter',
+    font: '',
+    textAlign: 'left',
+    textBaseline: 'alphabetic',
+  };
+}
+
+function makeOverheadTestFlight(id: string, callsign: string, elevationDeg: number): FlightEntity {
+  return {
+    id,
+    category: 'flight',
+    callsign,
+    subtitle: 'B738 · TEST',
+    country: 'United States',
+    lat: 38.86,
+    lon: -77.04,
+    altM: 9500,
+    speedMs: 220,
+    headingDeg: 90,
+    headingValid: true,
+    vertRateMs: 0,
+    timestampMs: Date.now(),
+    topocentric: {
+      azimuthDeg: 45,
+      elevationDeg,
+      slantRangeKm: Math.max(10, 90 - elevationDeg),
+      groundDistKm: Math.max(5, 85 - elevationDeg),
+      belowHorizon: elevationDeg < 0,
+    },
+    trail: [],
+    icaoHex: id.replace(/[^a-f0-9]/gi, '').slice(0, 6).padEnd(6, '0'),
+    onGround: false,
+    isMilitary: false,
+    airframeClass: 'jet',
+  };
+}
+
+describe('Challenge 10 — Sprint 05 Translucent Dome, Compass/Touch-Lock, Portal Modal, Right +33% PIP & Overhead Lock Audit', () => {
+  const DCA: ObserverLocation = {
+    lat: 38.8512,
+    lon: -77.0402,
+    altM: 12,
+    label: 'DC / Potomac Corridor',
+    source: 'preset',
+  };
+
+  beforeEach(() => {
+    liveKinematicsRegistry.entities.clear();
+    liveKinematicsRegistry.orbitOverlay = null;
+    useSkyStore.getState().selectEntity(null, false);
+    useSkyStore.setState({
+      observer: { ...DCA },
+      locationStatus: 'ready',
+      locationError: null,
+      radiusKm: 120,
+      layout: 'split',
+      skyDomePip: true,
+      skyDomeZoom: 'hemisphere',
+      domeRotationDeg: 0,
+      domeRotationLocked: false,
+      domeCompassActive: false,
+      domeCompassSupported: null,
+      layers: {
+        flight: true,
+        military: true,
+        satellite: true,
+        balloon: true,
+        drone: true,
+      },
+      satGroups: { stations: true, visual: true, starlink: true },
+      balloonSublayers: { windborne: true, sondehub: true, adsbLta: true },
+      droneSublayers: { liveUas: true, airspace: true, simOdid: false },
+      commandPaletteOpen: false,
+      odidModalOpen: false,
+      diagnosticsOpen: false,
+      settingsOpen: false,
+      inspectorOpen: false,
+      selectedId: null,
+      hoveredId: null,
+      selectedEntitySnapshot: null,
+      counts: {
+        flight: 0,
+        military: 0,
+        satellite: 0,
+        balloon: 0,
+        drone: 0,
+        overhead: 0,
+        overheadConeDeg: 45,
+        total: 0,
+      },
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    liveKinematicsRegistry.entities.clear();
+  });
+
+  it('10.1a compass North-crossing jitter, landscape screen compensation, iOS webkitCompassHeading priority & rotated dome round-trip < 0.05 deg', () => {
+    // 1. 359.9° <-> 0.1° magnetometer jitter: shortest arc (< 0.5°/step), never spins backwards 359°
+    let heading = 359.9;
+    for (let i = 0; i < 40; i += 1) {
+      const target = i % 2 === 0 ? 0.1 : 359.9;
+      const next = c10SmoothCompass(heading, target, 0.18);
+      const step = Math.abs(c10ShortestDelta(heading, next));
+      expect(step, `jitter step ${i}: ${heading} -> ${next}`).toBeLessThan(0.5);
+      expect(Math.abs(c10ShortestDelta(0, next)), `jitter stays near North at step ${i}`).toBeLessThan(0.2);
+      heading = next;
+    }
+
+    // Converges cleanly across North seam in both directions
+    let cw = 359.9;
+    for (let i = 0; i < 40; i += 1) {
+      const next = c10SmoothCompass(cw, 0.1, 0.18);
+      expect(Math.abs(c10ShortestDelta(cw, next))).toBeLessThan(0.5);
+      expect(c10ShortestDelta(cw, next)).toBeGreaterThanOrEqual(0);
+      cw = next;
+    }
+    expect(Math.abs(c10ShortestDelta(cw, 0.1))).toBeLessThan(0.01);
+
+    let ccw = 0.1;
+    for (let i = 0; i < 40; i += 1) {
+      const next = c10SmoothCompass(ccw, 359.9, 0.18);
+      expect(Math.abs(c10ShortestDelta(ccw, next))).toBeLessThan(0.5);
+      expect(c10ShortestDelta(ccw, next)).toBeLessThanOrEqual(0);
+      ccw = next;
+    }
+    expect(Math.abs(c10ShortestDelta(ccw, 359.9))).toBeLessThan(0.01);
+
+    // 2. Landscape 90° / 270° / 180° screen orientation compensation & iOS webkitCompassHeading precedence
+    const orientCases: Array<{ alpha: number; screen: number; expected: number }> = [
+      { alpha: 45, screen: 0, expected: 315 },
+      { alpha: 45, screen: 90, expected: 45 },
+      { alpha: 45, screen: 180, expected: 135 },
+      { alpha: 45, screen: 270, expected: 225 },
+      { alpha: 45, screen: -90, expected: 225 },
+      { alpha: 0, screen: 90, expected: 90 },
+      { alpha: 0, screen: 270, expected: 270 },
+      { alpha: 350, screen: 180, expected: 190 },
+    ];
+    for (const c of orientCases) {
+      expect(c10ScreenHeading(c.alpha, c.screen)).toBeCloseTo(c.expected, 6);
+      expect(
+        c10DeriveCompass({ alpha: c.alpha, absolute: true, screenAngle: c.screen })
+      ).toBeCloseTo(c.expected, 6);
+      expect(
+        c10ExtractCompass({ alpha: c.alpha, absolute: true, type: 'deviceorientationabsolute' }, c.screen)
+      ).toBeCloseTo(c.expected, 6);
+    }
+
+    // iOS webkitCompassHeading takes strict priority over alpha + screen orientation
+    expect(
+      c10DeriveCompass({ webkitCompassHeading: 212.5, alpha: 30, absolute: true, screenAngle: 90 })
+    ).toBeCloseTo(212.5, 6);
+    expect(
+      c10ExtractCompass({ webkitCompassHeading: 212.5, alpha: 30, absolute: true }, 90)
+    ).toBeCloseTo(212.5, 6);
+
+    // Relative-only (absolute: false) readings without webkitCompassHeading must return null
+    expect(c10DeriveCompass({ alpha: 120, absolute: false, screenAngle: 90 })).toBeNull();
+    expect(c10ExtractCompass({ alpha: 120, absolute: false, type: 'deviceorientation' }, 90)).toBeNull();
+
+    // 3. Rotated unprojectFromSkyDome + projectEnuToSkyDome + computeSkyDomeTrajectoryTangent (< 0.05°)
+    const rotations = [0, 45, 90, 143.7, 180, 270, 359.9];
+    const cx = 200;
+    const cy = 200;
+    const radius = 170;
+    const obs = { lat: 38.8512, lon: -77.0402, altM: 12 };
+
+    for (const zoom of ['hemisphere', 'zenith'] as const) {
+      const minEl = zoom === 'zenith' ? 30 : 0;
+      for (const rot of rotations) {
+        // Heading `rot` sits at 12 o'clock (x ≈ cx, y < cy)
+        const topPt = c9Project(rot, 45, cx, cy, radius, zoom, rot);
+        expect(topPt.visible).toBe(true);
+        expect(Math.abs(topPt.x - cx)).toBeLessThan(1e-6);
+        expect(topPt.y).toBeLessThan(cy);
+
+        for (let az = 0; az < 360; az += 30) {
+          for (let el = minEl + 2; el <= 88; el += 18) {
+            const p = c9Project(az, el, cx, cy, radius, zoom, rot);
+            expect(p.visible).toBe(true);
+
+            // ENU direct projection must match projectToSkyDome identically under rotation
+            const elRad = (el * Math.PI) / 180;
+            const azRad = (az * Math.PI) / 180;
+            const e = Math.cos(elRad) * Math.sin(azRad) * 10_000;
+            const n = Math.cos(elRad) * Math.cos(azRad) * 10_000;
+            const u = Math.sin(elRad) * 10_000;
+            const pEnu = c9ProjectEnu(e, n, u, cx, cy, radius, zoom, false, rot);
+            expect(Math.hypot(p.x - pEnu.x, p.y - pEnu.y)).toBeLessThan(1e-6);
+
+            // Unproject recovers exact true topocentric (az, el) < 0.05°
+            const inv = c9Unproject(p.x, p.y, cx, cy, radius, zoom, rot);
+            expect(inv.inBounds).toBe(true);
+            expect(Math.abs(c10ShortestDelta(az, inv.azimuthDeg)), `az rot=${rot} zoom=${zoom}`).toBeLessThan(0.05);
+            expect(Math.abs(inv.elevationDeg - el), `el rot=${rot} zoom=${zoom}`).toBeLessThan(0.05);
+          }
+        }
+
+        // Trajectory tangent rotates coherently by -rot degrees relative to rot=0
+        const tgt = {
+          lat: 38.92,
+          lon: -76.98,
+          altM: 10_000,
+          speedMs: 240,
+          headingDeg: 65,
+          headingValid: true,
+          vertRateMs: 0,
+        };
+        const tan0 = c9Tangent(obs, tgt, cx, cy, radius, zoom, 0);
+        const tanRot = c9Tangent(obs, tgt, cx, cy, radius, zoom, rot);
+        expect(Number.isFinite(tanRot)).toBe(true);
+        const expectedTanDeg = c10NormAz((tan0 * 180) / Math.PI - rot);
+        const actualTanDeg = c10NormAz((tanRot * 180) / Math.PI);
+        expect(
+          Math.abs(c10ShortestDelta(expectedTanDeg, actualTanDeg)),
+          `tangent rotation delta rot=${rot} zoom=${zoom}`
+        ).toBeLessThan(0.05);
+      }
+    }
+
+    // Smooth zenith overflight at arbitrary rotation (143.7°)
+    let prevTan: number | null = null;
+    for (let i = 0; i < 41; i += 1) {
+      const target = {
+        lat: obs.lat - 0.02 + i * 0.001,
+        lon: obs.lon,
+        altM: 4000,
+        speedMs: 200,
+        headingDeg: 0,
+        headingValid: true,
+        vertRateMs: 0,
+      };
+      const ang = c9Tangent(obs, target, cx, cy, radius, 'hemisphere', 143.7);
+      expect(Number.isFinite(ang)).toBe(true);
+      if (prevTan !== null) {
+        let diff = Math.abs(ang - prevTan) % (2 * Math.PI);
+        if (diff > Math.PI) diff = 2 * Math.PI - diff;
+        expect((diff * 180) / Math.PI).toBeLessThan(2);
+      }
+      prevTan = ang;
+    }
+  });
+
+  it('10.1b PolarSkyDome JSDOM torture: iOS requestPermission rejection, desktop missing-sensor fallback, drag parking + stopPropagation, <6px tap & LOCK + N▲ reset', async () => {
+    const jsdomMod = (await import('jsdom')) as {
+      JSDOM: new (
+        html: string,
+        opts?: Record<string, unknown>
+      ) => { window: Window & typeof globalThis };
+    };
+    const dom = new jsdomMod.JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
+      url: 'https://krunked-fpv.github.io/krunked_skymap/',
+    });
+    Object.defineProperty(dom.window.document, 'hidden', { value: false, configurable: true });
+    Object.defineProperty(dom.window.document, 'visibilityState', {
+      value: 'visible',
+      configurable: true,
+    });
+
+    const w = dom.window as unknown as Record<string, unknown>;
+    const rafCallbacks: Array<(ts: number) => void> = [];
+    let rafSeq = 1;
+    const scheduleRaf = (cb: (ts: number) => void): number => {
+      rafCallbacks.push(cb);
+      return rafSeq++;
+    };
+    const flushOneRaf = (ts: number) => {
+      const batch = rafCallbacks.splice(0, rafCallbacks.length);
+      for (const cb of batch) cb(ts);
+    };
+
+    // Build JSDOM-safe pointer events without WebIDL subclassing quirks
+    const makePointerEvent = (
+      type: string,
+      init: {
+        clientX: number;
+        clientY: number;
+        button?: number;
+        buttons?: number;
+        pointerId?: number;
+        pointerType?: string;
+        isPrimary?: boolean;
+      }
+    ): Event => {
+      const ev = new dom.window.MouseEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        view: dom.window,
+        clientX: init.clientX,
+        clientY: init.clientY,
+        button: init.button ?? 0,
+        buttons: init.buttons ?? 0,
+      });
+      Object.defineProperties(ev, {
+        pointerId: { value: init.pointerId ?? 1, configurable: true },
+        pointerType: { value: init.pointerType ?? 'touch', configurable: true },
+        isPrimary: { value: init.isPrimary ?? true, configurable: true },
+      });
+      return ev;
+    };
+    w.PointerEvent = dom.window.MouseEvent;
+    w.requestAnimationFrame = scheduleRaf;
+    w.cancelAnimationFrame = () => {};
+    w.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+
+    const mockCtx = makeMockCanvas2dContext();
+    vi.spyOn(dom.window.HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      (() => mockCtx) as unknown as typeof dom.window.HTMLCanvasElement.prototype.getContext
+    );
+    const fixedRect: DOMRect = {
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 400,
+      right: 400,
+      bottom: 400,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    };
+    vi.spyOn(dom.window.Element.prototype, 'getBoundingClientRect').mockReturnValue(fixedRect);
+
+    vi.stubGlobal('window', dom.window);
+    vi.stubGlobal('document', dom.window.document);
+    vi.stubGlobal('navigator', dom.window.navigator);
+    vi.stubGlobal('HTMLElement', dom.window.HTMLElement);
+    vi.stubGlobal('HTMLCanvasElement', dom.window.HTMLCanvasElement);
+    vi.stubGlobal('Node', dom.window.Node);
+    vi.stubGlobal('Element', dom.window.Element);
+    vi.stubGlobal('Event', dom.window.Event);
+    vi.stubGlobal('MouseEvent', dom.window.MouseEvent);
+    vi.stubGlobal('PointerEvent', dom.window.MouseEvent);
+    vi.stubGlobal('requestAnimationFrame', scheduleRaf);
+    vi.stubGlobal('cancelAnimationFrame', () => {});
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+
+    const React = await import('react');
+    const { act } = React;
+    const { createRoot } = await import('react-dom/client');
+
+    const parentDownSpy = vi.fn();
+    const parentMoveSpy = vi.fn();
+    const parentUpSpy = vi.fn();
+
+    const container = dom.window.document.getElementById('root')!;
+    let root: ReturnType<typeof createRoot> | null = null;
+
+    try {
+      await act(async () => {
+        root = createRoot(container);
+        root.render(
+          React.createElement(
+            'div',
+            {
+              onPointerDown: parentDownSpy,
+              onPointerMove: parentMoveSpy,
+              onPointerUp: parentUpSpy,
+            },
+            React.createElement(C10PolarSkyDome)
+          )
+        );
+      });
+
+      const canvas = container.querySelector('canvas') as HTMLCanvasElement | null;
+      expect(canvas).not.toBeNull();
+      const capturedPointers = new Set<number>();
+      (canvas as unknown as Record<string, unknown>).setPointerCapture = (id: number) =>
+        capturedPointers.add(id);
+      (canvas as unknown as Record<string, unknown>).hasPointerCapture = (id: number) =>
+        capturedPointers.has(id);
+      (canvas as unknown as Record<string, unknown>).releasePointerCapture = (id: number) =>
+        capturedPointers.delete(id);
+
+      // Step an initial render frame with a Zenith target at (200, 200) so tap hit-testing works
+      const zenithFlight = makeOverheadTestFlight('flight:zenith1', 'ZEN01', 90);
+      liveKinematicsRegistry.entities.set(zenithFlight.id, zenithFlight);
+      await act(async () => {
+        flushOneRaf(100);
+      });
+
+      // A. iOS DeviceOrientationEvent.requestPermission() rejection / NotAllowedError
+      const requestPermissionMock = vi.fn(() =>
+        Promise.reject(new DOMException('Permission denied', 'NotAllowedError'))
+      );
+      w.DeviceOrientationEvent = { requestPermission: requestPermissionMock };
+      const compassBtn = container.querySelector(
+        '[data-testid="skydome-compass-toggle"]'
+      ) as HTMLButtonElement | null;
+      expect(compassBtn).not.toBeNull();
+
+      await act(async () => {
+        compassBtn!.click();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(requestPermissionMock).toHaveBeenCalledTimes(1);
+      expect(useSkyStore.getState().domeCompassActive).toBe(false);
+      const deniedStatus = container.querySelector('[data-testid="skydome-compass-status"]');
+      expect(deniedStatus?.textContent).toMatch(/permission denied/i);
+
+      // B1. Desktop missing-sensor graceful fallback (DeviceOrientationEvent absent)
+      delete w.DeviceOrientationEvent;
+      await act(async () => {
+        compassBtn!.click();
+      });
+      expect(useSkyStore.getState().domeCompassActive).toBe(false);
+      expect(useSkyStore.getState().domeCompassSupported).toBe(false);
+      expect(
+        container.querySelector('[data-testid="skydome-compass-status"]')?.textContent
+      ).toMatch(/No device compass detected/i);
+
+      // B2. Desktop Chromium present DeviceOrientationEvent with 1.5s silent timeout fallback
+      vi.useFakeTimers();
+      w.DeviceOrientationEvent = function FakeDevOrient() {};
+      await act(async () => {
+        useSkyStore.setState({ domeCompassSupported: null, domeCompassActive: false });
+      });
+      await act(async () => {
+        compassBtn!.click();
+      });
+      expect(useSkyStore.getState().domeCompassActive).toBe(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1600);
+      });
+      expect(useSkyStore.getState().domeCompassActive).toBe(false);
+      expect(useSkyStore.getState().domeCompassSupported).toBe(false);
+      expect(
+        container.querySelector('[data-testid="skydome-compass-status"]')?.textContent
+      ).toMatch(/No device compass detected/i);
+      vi.useRealTimers();
+
+      // C. < 6px micro-movement acts as a tap/click (selects target) and does NOT alter domeRotationDeg
+      await act(async () => {
+        useSkyStore.setState({
+          domeRotationDeg: 0,
+          domeRotationLocked: false,
+          domeCompassActive: false,
+          selectedId: null,
+          inspectorOpen: false,
+        });
+      });
+      await act(async () => {
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerdown', {
+            clientX: 200,
+            clientY: 200,
+            button: 0,
+            buttons: 1,
+            pointerId: 7,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointermove', {
+            clientX: 203,
+            clientY: 202,
+            button: 0,
+            buttons: 1,
+            pointerId: 7,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerup', {
+            clientX: 203,
+            clientY: 202,
+            button: 0,
+            buttons: 0,
+            pointerId: 7,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+      });
+      expect(useSkyStore.getState().domeRotationDeg).toBe(0);
+      expect(useSkyStore.getState().selectedId).toBe(zenithFlight.id);
+      expect(parentDownSpy).not.toHaveBeenCalled();
+      expect(parentMoveSpy).not.toHaveBeenCalled();
+      expect(parentUpSpy).not.toHaveBeenCalled();
+
+      // D. Drag-and-release parking: CCW drag to ~143.7°, disengages active compass, stays parked, stopPropagation()
+      await act(async () => {
+        useSkyStore.getState().selectEntity(null, false);
+        useSkyStore.setState({
+          domeRotationDeg: 0,
+          domeRotationLocked: false,
+          domeCompassActive: true,
+        });
+      });
+
+      const r = 100;
+      const ptAtDeg = (deg: number) => ({
+        x: 200 + r * Math.cos((deg * Math.PI) / 180),
+        y: 200 + r * Math.sin((deg * Math.PI) / 180),
+      });
+      const p0 = ptAtDeg(-90); // 12 o'clock
+      const p1 = ptAtDeg(-161.85); // -71.85° CCW
+      const p2 = ptAtDeg(126.3); // another -71.85° CCW -> total +143.7° dome heading
+
+      await act(async () => {
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerdown', {
+            clientX: p0.x,
+            clientY: p0.y,
+            button: 0,
+            buttons: 1,
+            pointerId: 11,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointermove', {
+            clientX: p1.x,
+            clientY: p1.y,
+            button: 0,
+            buttons: 1,
+            pointerId: 11,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointermove', {
+            clientX: p2.x,
+            clientY: p2.y,
+            button: 0,
+            buttons: 1,
+            pointerId: 11,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerup', {
+            clientX: p2.x,
+            clientY: p2.y,
+            button: 0,
+            buttons: 0,
+            pointerId: 11,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+      });
+
+      const parkedDeg = useSkyStore.getState().domeRotationDeg;
+      expect(parkedDeg).toBeCloseTo(143.7, 1);
+      expect(useSkyStore.getState().domeCompassActive).toBe(false);
+      expect(parentDownSpy).not.toHaveBeenCalled();
+      expect(parentMoveSpy).not.toHaveBeenCalled();
+      expect(parentUpSpy).not.toHaveBeenCalled();
+
+      // Step multiple animation frames post-release -> ZERO snap-back
+      await act(async () => {
+        flushOneRaf(200);
+        flushOneRaf(216);
+        flushOneRaf(232);
+      });
+      expect(useSkyStore.getState().domeRotationDeg).toBeCloseTo(parkedDeg, 6);
+
+      // E. LOCK state strictly blocks pointer drag, setDomeRotationDeg, and compass updates, while N▲ still resets to 000°
+      const lockBtn = container.querySelector(
+        '[data-testid="skydome-lock-toggle"]'
+      ) as HTMLButtonElement | null;
+      expect(lockBtn).not.toBeNull();
+      await act(async () => {
+        lockBtn!.click();
+      });
+      expect(useSkyStore.getState().domeRotationLocked).toBe(true);
+
+      // Direct store mutation without force is blocked
+      useSkyStore.getState().setDomeRotationDeg(275);
+      expect(useSkyStore.getState().domeRotationDeg).toBeCloseTo(parkedDeg, 6);
+
+      // Pointer drag while locked is blocked
+      await act(async () => {
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerdown', {
+            clientX: p0.x,
+            clientY: p0.y,
+            button: 0,
+            buttons: 1,
+            pointerId: 12,
+            pointerType: 'mouse',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointermove', {
+            clientX: 300,
+            clientY: 200,
+            button: 0,
+            buttons: 1,
+            pointerId: 12,
+            pointerType: 'mouse',
+            isPrimary: true,
+          })
+        );
+        canvas!.dispatchEvent(
+          makePointerEvent('pointerup', {
+            clientX: 300,
+            clientY: 200,
+            button: 0,
+            buttons: 0,
+            pointerId: 12,
+            pointerType: 'mouse',
+            isPrimary: true,
+          })
+        );
+      });
+      expect(useSkyStore.getState().domeRotationDeg).toBeCloseTo(parkedDeg, 6);
+
+      // Compass sensor updates while locked are strictly blocked
+      await act(async () => {
+        useSkyStore.getState().setDomeCompassActive(true);
+      });
+      const absEvent = new dom.window.Event('deviceorientationabsolute');
+      Object.defineProperty(absEvent, 'alpha', { value: 90 });
+      Object.defineProperty(absEvent, 'absolute', { value: true });
+      await act(async () => {
+        dom.window.dispatchEvent(absEvent);
+        flushOneRaf(300);
+        flushOneRaf(316);
+      });
+      expect(useSkyStore.getState().domeRotationDeg).toBeCloseTo(parkedDeg, 6);
+
+      // Explicit N▲ reset button still resets cleanly to 000° North even while LOCKED
+      const northResetBtn = container.querySelector(
+        '[data-testid="skydome-north-reset"]'
+      ) as HTMLButtonElement | null;
+      expect(northResetBtn).not.toBeNull();
+      expect(northResetBtn!.textContent).toContain('N▲');
+      await act(async () => {
+        northResetBtn!.click();
+      });
+      expect(useSkyStore.getState().domeRotationDeg).toBe(0);
+      expect(useSkyStore.getState().domeCompassActive).toBe(false);
+
+      // F. Live unlocked hardware compass smoothly follows deviceorientationabsolute across North seam (359.9° -> 0.1°)
+      await act(async () => {
+        useSkyStore.setState({
+          domeRotationDeg: 359.9,
+          domeRotationLocked: false,
+          domeCompassActive: true,
+        });
+      });
+      const northCrossEv = new dom.window.Event('deviceorientationabsolute');
+      Object.defineProperty(northCrossEv, 'alpha', { value: 359.9 }); // 360 - 359.9 = 0.1°
+      Object.defineProperty(northCrossEv, 'absolute', { value: true });
+      await act(async () => {
+        dom.window.dispatchEvent(northCrossEv);
+        for (let f = 0; f < 10; f += 1) {
+          flushOneRaf(400 + f * 16);
+        }
+      });
+      const smoothedHeading = useSkyStore.getState().domeRotationDeg;
+      expect(Math.abs(c10ShortestDelta(smoothedHeading, 0.1))).toBeLessThan(0.05);
+    } finally {
+      await act(async () => {
+        root?.unmount();
+      });
+      dom.window.close();
+    }
+  }, 15_000);
+
+  it('10.2 Location Command Palette mounts via document.body Portal with pointer-events/z-index stacking, coordinate submit, preset jump, X & backdrop close', async () => {
+    const fs = await loadNodeFs();
+    const cockpitCssRaw = fs.readFileSync(repoFileUrl('src/styles/cockpit.css'), 'utf8');
+
+    // Audit cockpit.css modal pointer-events & top-layer z-index rules
+    const backdropCssMatch = cockpitCssRaw.match(/\.cockpit-modal-backdrop\s*\{([\s\S]*?)\}/);
+    expect(backdropCssMatch).not.toBeNull();
+    expect(backdropCssMatch![1]).toMatch(/pointer-events:\s*auto/);
+    const backdropZMatch = backdropCssMatch![1].match(/z-index:\s*(\d+)/);
+    expect(backdropZMatch).not.toBeNull();
+    expect(Number(backdropZMatch![1])).toBeGreaterThanOrEqual(100);
+
+    const paletteCssMatch = cockpitCssRaw.match(/\.command-palette\s*\{([\s\S]*?)\}/);
+    expect(paletteCssMatch).not.toBeNull();
+    expect(paletteCssMatch![1]).toMatch(/pointer-events:\s*auto/);
+
+    expect(controlDockSourceRaw).toContain('createPortal(');
+
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      await act(async () => {
+        useSkyStore.setState({ observer: { ...DCA }, locationStatus: 'ready' });
+      });
+
+      const omniboxBtn = appMount.container.querySelector(
+        '[data-testid="omnibox-trigger"]'
+      ) as HTMLButtonElement | null;
+      expect(omniboxBtn).not.toBeNull();
+
+      // 1. Click omnibox trigger -> opens Command Palette portaled directly under document.body
+      await act(async () => {
+        omniboxBtn!.click();
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(true);
+
+      const backdrop = appMount.document.body.querySelector(
+        '[data-testid="command-palette-backdrop"]'
+      ) as HTMLElement | null;
+      expect(backdrop).not.toBeNull();
+      expect(backdrop!.className).toContain('cockpit-modal-backdrop');
+      expect(backdrop!.parentElement).toBe(appMount.document.body);
+
+      const dockWrap = appMount.container.querySelector('.control-dock-wrap');
+      expect(dockWrap).not.toBeNull();
+      expect(dockWrap!.contains(backdrop)).toBe(false);
+
+      // 2. Clicking INSIDE .command-palette dialog card must NOT close modal
+      const dialog = appMount.document.body.querySelector(
+        '[data-testid="command-palette-dialog"]'
+      ) as HTMLElement | null;
+      expect(dialog).not.toBeNull();
+      await act(async () => {
+        dialog!.dispatchEvent(new appMount.window.MouseEvent('mousedown', { bubbles: true }));
+        dialog!.dispatchEvent(new appMount.window.MouseEvent('click', { bubbles: true }));
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(true);
+
+      // 3. Typing coordinates (33.9416, -118.4085) and clicking GO submits, moves observer & closes modal
+      const input = appMount.document.body.querySelector(
+        '[data-testid="command-palette-input"]'
+      ) as HTMLInputElement | null;
+      const submitBtn = appMount.document.body.querySelector(
+        '[data-testid="command-palette-submit"]'
+      ) as HTMLButtonElement | null;
+      expect(input).not.toBeNull();
+      expect(submitBtn).not.toBeNull();
+
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        appMount.window.HTMLInputElement.prototype,
+        'value'
+      )?.set;
+      await act(async () => {
+        valueSetter?.call(input, '33.9416, -118.4085');
+        input!.dispatchEvent(new appMount.window.Event('input', { bubbles: true }));
+      });
+      expect(submitBtn!.disabled).toBe(false);
+
+      await act(async () => {
+        submitBtn!.click();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(useSkyStore.getState().observer.lat).toBeCloseTo(33.9416, 4);
+      expect(useSkyStore.getState().observer.lon).toBeCloseTo(-118.4085, 4);
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+
+      // 4. Reopen modal -> clicking Hotspot Preset jumps observer and closes modal
+      await act(async () => {
+        omniboxBtn!.click();
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(true);
+
+      const hanedaBtn = appMount.document.body.querySelector(
+        '[data-testid="preset-tokyo-haneda"]'
+      ) as HTMLButtonElement | null;
+      expect(hanedaBtn).not.toBeNull();
+      await act(async () => {
+        hanedaBtn!.click();
+      });
+      expect(useSkyStore.getState().observer.lat).toBeCloseTo(35.5494, 4);
+      expect(useSkyStore.getState().observer.lon).toBeCloseTo(139.7798, 4);
+      expect(useSkyStore.getState().observer.source).toBe('preset');
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+
+      // 5. Reopen modal -> clicking X close button closes cleanly
+      await act(async () => {
+        omniboxBtn!.click();
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(true);
+      const closeBtn = appMount.document.body.querySelector(
+        '[data-testid="command-palette-close"]'
+      ) as HTMLButtonElement | null;
+      expect(closeBtn).not.toBeNull();
+      await act(async () => {
+        closeBtn!.click();
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+
+      // 6. Reopen modal -> clicking outer backdrop closes cleanly
+      await act(async () => {
+        omniboxBtn!.click();
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(true);
+      const reopenedBackdrop = appMount.document.body.querySelector(
+        '[data-testid="command-palette-backdrop"]'
+      ) as HTMLElement | null;
+      expect(reopenedBackdrop).not.toBeNull();
+      await act(async () => {
+        reopenedBackdrop!.dispatchEvent(
+          new appMount.window.MouseEvent('click', { bubbles: true })
+        );
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+    } finally {
+      await appMount.cleanup();
+    }
+  }, 15_000);
+
+  it('10.3 PIP + Inspector geometry, translucent canvas, continuous dome-mode map & OVERHEAD quick-lock cycling integrity', async () => {
+    const fs = await loadNodeFs();
+    const cockpitCssRaw = fs.readFileSync(repoFileUrl('src/styles/cockpit.css'), 'utf8');
+
+    // 1. Continuous map pane in dome mode & dynamic split padding
+    const mapPaneCssMatch = cockpitCssRaw.match(/\.stage-map-pane,\s*\[data-pane='map'\]\s*\{([\s\S]*?)\}/);
+    expect(mapPaneCssMatch).not.toBeNull();
+    expect(mapPaneCssMatch![1]).toMatch(/display:\s*block\s*!important/);
+    expect(cockpitCssRaw).not.toMatch(/\[data-layout='dome'\][^\{]*stage-map-pane[^\{]*\{[^\}]*display:\s*none/);
+
+    const mapFrameLoopHead = tacticalMapSourceRaw.slice(
+      tacticalMapSourceRaw.indexOf('const frameLoop = (nowMs: number) => {'),
+      tacticalMapSourceRaw.indexOf('const layoutChanged = state.layout !== lastLayout;')
+    );
+    expect(mapFrameLoopHead).not.toMatch(/if\s*\(\s*state\.layout\s*===\s*'dome'\s*\)\s*\{[^}]*\breturn;/);
+    expect(tacticalMapSourceRaw).toContain('targetMap.setPadding(next)');
+    expect(tacticalMapSourceRaw).toContain('computeLayoutCameraPadding');
+
+    // Verify dynamic camera padding values across split/map/dome and desktop/mobile
+    expect(c10ComputePadding('split', 1440, 900)).toEqual({ top: 0, bottom: 0, left: 0, right: 605 });
+    expect(c10ComputePadding('split', 390, 844)).toEqual({ top: 0, bottom: 405, left: 0, right: 0 });
+    expect(c10ComputePadding('map', 1440, 900)).toEqual({ top: 0, bottom: 0, left: 0, right: 0 });
+    expect(c10ComputePadding('dome', 1440, 900)).toEqual({ top: 0, bottom: 0, left: 0, right: 0 });
+
+    // 2. Translucent Sky-Dome container (alpha 0.24..0.40, blur <= 4px, no blur(16px+)) + transparent root + clearRect w/o full-canvas fillRect
+    const domePaneCssMatch = cockpitCssRaw.match(/\.stage-dome-pane,\s*\[data-pane='dome'\]\s*\{([\s\S]*?)\}/);
+    expect(domePaneCssMatch).not.toBeNull();
+    const domeBgAlpha = domePaneCssMatch![1].match(/rgba\([^,]+,[^,]+,[^,]+,\s*([0-9.]+)\)/);
+    expect(domeBgAlpha).not.toBeNull();
+    expect(Number(domeBgAlpha![1])).toBeGreaterThanOrEqual(0.24);
+    expect(Number(domeBgAlpha![1])).toBeLessThanOrEqual(0.40);
+    const domeBlurMatch = domePaneCssMatch![1].match(/backdrop-filter:\s*blur\((\d+(?:\.\d+)?)px\)/);
+    expect(domeBlurMatch).not.toBeNull();
+    expect(Number(domeBlurMatch![1])).toBeLessThanOrEqual(4);
+    expect(domePaneCssMatch![1]).not.toMatch(/blur\((?:1[6-9]|[2-9]\d)px\)|var\(--glass-blur\)/);
+
+    expect(polarDomeSourceRaw).toContain("backgroundColor: 'transparent'");
+    expect(polarDomeSourceRaw).toContain('ctx.clearRect(0, 0, canvas.width, canvas.height)');
+    expect(polarDomeSourceRaw).not.toMatch(/ctx\.fillRect\(\s*0\s*,\s*0\s*,\s*(?:width|canvas\.width|m\.width)/);
+
+    // 3. Desktop right-side +33% PIP (320x320, right-anchored, left: auto) & Inspector left-shift (zero 1440px overlap) + mobile clamp
+    expect(cockpitCssRaw).toMatch(/--inspector-width:\s*340px;/);
+    const pipDesktopMatch = cockpitCssRaw.match(
+      /\.skymap-stage\[data-layout='map'\]\[data-pip='true'\]\s*\.stage-dome-pane,\s*\.skymap-stage--map\[data-pip='true'\]\s*\.stage-dome-pane\s*\{([\s\S]*?)\}/
+    );
+    expect(pipDesktopMatch).not.toBeNull();
+    expect(pipDesktopMatch![1]).toMatch(/width:\s*320px/);
+    expect(pipDesktopMatch![1]).toMatch(/height:\s*320px/);
+    expect(pipDesktopMatch![1]).toMatch(/right:/);
+    expect(pipDesktopMatch![1]).toMatch(/left:\s*auto/);
+
+    const pipShiftMatch = cockpitCssRaw.match(
+      /@media\s*\(min-width:\s*768px\)\s*\{[\s\S]*?:has\(\.target-inspector\.is-open\)\s*\.stage-dome-pane\s*\{([\s\S]*?)\}/
+    );
+    expect(pipShiftMatch).not.toBeNull();
+    expect(pipShiftMatch![1]).toMatch(
+      /transform:\s*translateX\(calc\(-1\s*\*\s*\(var\(--inspector-width\)\s*\+\s*12px\)\)\)/
+    );
+
+    // Explicit 1440px desktop non-overlap verification: PIP [756, 1076] vs Inspector [1088, 1428]
+    const viewportW = 1440;
+    const inspectorW = 340;
+    const edgeGap = 12;
+    const pipW = 320;
+    const shiftPx = inspectorW + edgeGap; // 352px
+    const inspectorLeft = viewportW - edgeGap - inspectorW; // 1088
+    const inspectorRight = viewportW - edgeGap; // 1428
+    const pipShiftedRight = viewportW - edgeGap - shiftPx; // 1076
+    const pipShiftedLeft = pipShiftedRight - pipW; // 756
+    expect(shiftPx).toBeGreaterThanOrEqual(352);
+    expect([pipShiftedLeft, pipShiftedRight]).toEqual([756, 1076]);
+    expect([inspectorLeft, inspectorRight]).toEqual([1088, 1428]);
+    expect(pipShiftedRight).toBeLessThan(inspectorLeft);
+
+    // Mobile PIP (<= 767px) clamped within calc(100vw - 24px) -> zero 390x844 overflow
+    const mobileSection = cockpitCssRaw.slice(cockpitCssRaw.indexOf('@media (max-width: 767px)'));
+    const mobilePipMatch = mobileSection.match(
+      /\.skymap-stage\[data-layout='map'\]\[data-pip='true'\]\s*\.stage-dome-pane,\s*\.skymap-stage--map\[data-pip='true'\]\s*\.stage-dome-pane\s*\{([\s\S]*?)\}/
+    );
+    expect(mobilePipMatch).not.toBeNull();
+    expect(mobilePipMatch![1]).toMatch(/width:\s*min\(208px,\s*calc\(100vw\s*-\s*24px\)\)/);
+    expect(mobilePipMatch![1]).toMatch(/height:\s*min\(208px,\s*calc\(100vw\s*-\s*24px\)\)/);
+    expect(Math.min(208, 390 - 24)).toBeLessThanOrEqual(366);
+
+    // 4. Zero passive ZENITH UI labels remain in TopTelemetryBar.tsx and PolarSkyDome.tsx
+    expect(topTelemetryBarSourceRaw).not.toMatch(/ZENITH/);
+    expect(topTelemetryBarSourceRaw).toContain('OVERHEAD');
+    expect(topTelemetryBarSourceRaw).toContain('OVERHEAD 2×');
+    expect(topTelemetryBarSourceRaw).toContain('FULL SKY');
+
+    expect(polarDomeSourceRaw).not.toMatch(/ZENITH/);
+    expect(polarDomeSourceRaw).toContain('OVERHEAD 2×');
+    expect(polarDomeSourceRaw).toContain('FULL SKY');
+
+    // 5. JSDOM behavioral test of [data-testid="topbar-overhead-lock"] cycling + TargetInspector opening
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      await act(async () => {
+        useSkyStore.setState({ observer: { ...DCA }, locationStatus: 'ready' });
+      });
+
+      const overheadBtn = appMount.container.querySelector(
+        '[data-testid="topbar-overhead-lock"]'
+      ) as HTMLButtonElement | null;
+      expect(overheadBtn).not.toBeNull();
+      expect(overheadBtn!.textContent).toContain('OVERHEAD');
+
+      // 0 targets: clicking never throws and keeps TargetInspector closed
+      liveKinematicsRegistry.entities.clear();
+      await act(async () => {
+        expect(() => overheadBtn!.click()).not.toThrow();
+      });
+      expect(useSkyStore.getState().selectedId).toBeNull();
+      expect(useSkyStore.getState().inspectorOpen).toBe(false);
+
+      // Fallback cone (25°, 35° — none >= 45°): locks 35° first, cycles to 25°, wraps to 35°
+      const f25 = makeOverheadTestFlight('flight:el25', 'EL25', 25);
+      const f35 = makeOverheadTestFlight('flight:el35', 'EL35', 35);
+      liveKinematicsRegistry.entities.set(f25.id, f25);
+      liveKinematicsRegistry.entities.set(f35.id, f35);
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el35');
+      expect(useSkyStore.getState().inspectorOpen).toBe(true);
+      const inspectorEl = appMount.container.querySelector('[data-testid="target-inspector"]');
+      expect(inspectorEl?.getAttribute('data-open')).toBe('true');
+      expect(inspectorEl?.className).toContain('is-open');
+      expect(inspectorEl?.textContent).toContain('EL35');
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el25');
+      expect(inspectorEl?.textContent).toContain('EL25');
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el35');
+
+      // Primary cone (50°, 72°, plus 30°): locks 72° first, cycles to 50°, wraps back to 72° (never 30°)
+      liveKinematicsRegistry.entities.clear();
+      const f30 = makeOverheadTestFlight('flight:el30', 'EL30', 30);
+      const f50 = makeOverheadTestFlight('flight:el50', 'EL50', 50);
+      const f72 = makeOverheadTestFlight('flight:el72', 'EL72', 72);
+      liveKinematicsRegistry.entities.set(f30.id, f30);
+      liveKinematicsRegistry.entities.set(f50.id, f50);
+      liveKinematicsRegistry.entities.set(f72.id, f72);
+
+      await act(async () => {
+        useSkyStore.getState().selectEntity(null, false);
+      });
+      expect(useSkyStore.getState().inspectorOpen).toBe(false);
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el72');
+      expect(useSkyStore.getState().inspectorOpen).toBe(true);
+      expect(appMount.container.querySelector('[data-testid="target-inspector"]')?.textContent).toContain(
+        'EL72'
+      );
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el50');
+      expect(appMount.container.querySelector('[data-testid="target-inspector"]')?.textContent).toContain(
+        'EL50'
+      );
+
+      await act(async () => {
+        overheadBtn!.click();
+      });
+      expect(useSkyStore.getState().selectedId).toBe('flight:el72');
+    } finally {
+      await appMount.cleanup();
+    }
+  }, 15_000);
 });
