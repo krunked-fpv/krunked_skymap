@@ -17,9 +17,11 @@ import {
   type SkyEntity,
 } from '../../types/sky-contracts';
 import { useSkyStore } from '../../store/useSkyStore';
+import { computeClosestApproach } from '../../math/geodesy';
 import {
   formatAltitude,
   formatAzEl,
+  formatTcaCountdown,
   formatClockTime,
   formatCoords,
   formatDistance,
@@ -99,6 +101,7 @@ export function TargetInspector() {
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
   const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
   const skyDomePip = useSkyStore((s) => s.skyDomePip);
+  const skyDomeZoom = useSkyStore((s) => s.skyDomeZoom);
 
   const [copied, setCopied] = useState(false);
   const [, setClockTick] = useState(0);
@@ -145,6 +148,7 @@ export function TargetInspector() {
     params.set('scope', orbitalScope);
     params.set('atm', atmosphericScope);
     params.set('pip', skyDomePip ? '1' : '0');
+    if (skyDomeZoom === 'zenith') params.set('dz', 'zenith');
     params.set('selected', entity.id);
     const permalink = new URL(`#${params.toString()}`, window.location.href).toString();
 
@@ -199,6 +203,7 @@ export function TargetInspector() {
   const accent = getCategoryAccent(entity);
   const provenanceLabel = resolveProvenanceBadge(entity);
   const vert = formatVerticalRate(entity.vertRateMs, units);
+  const tca = computeClosestApproach(observer, entity, 600);
   const observationClock = formatClockTime(entity.timestampMs, '--:--:--');
   const observationAge = formatRelativeAge(entity.timestampMs, Date.now());
   const observationLabel =
@@ -391,6 +396,44 @@ export function TargetInspector() {
             </div>
           </div>
         </section>
+
+        {tca.isApproaching && (
+          <section
+            className="inspector-tca-card"
+            data-testid="inspector-tca-card"
+            aria-label="Approaching pass prediction"
+          >
+            <div className="inspector-section-title">APPROACHING PASS · 3D ENU TCA</div>
+            <div className="inspector-tca-grid">
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">TCA</div>
+                <div className="telemetry-cell__value tabular">{formatTcaCountdown(tca.tcaSeconds)}</div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">PEAK EL</div>
+                <div className="telemetry-cell__value tabular">
+                  {Number.isFinite(tca.peakElevationDeg)
+                    ? `${tca.peakElevationDeg >= 0 ? '+' : ''}${tca.peakElevationDeg.toFixed(1)}°`
+                    : '—'}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">MIN SLANT</div>
+                <div className="telemetry-cell__value tabular">
+                  {formatDistance(tca.minSlantRangeKm, units)}
+                </div>
+              </div>
+              <div className="telemetry-cell">
+                <div className="telemetry-cell__label">PEAK AZ</div>
+                <div className="telemetry-cell__value tabular">
+                  {Number.isFinite(tca.peakAzimuthDeg)
+                    ? `${String(Math.round(((tca.peakAzimuthDeg % 360) + 360) % 360) % 360).padStart(3, '0')}°`
+                    : '—'}
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
 
         {/* Category Deep-Telemetry Section */}
         {(entity.category === 'flight' || entity.category === 'military') && (
