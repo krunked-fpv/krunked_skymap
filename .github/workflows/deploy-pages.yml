@@ -35,7 +35,7 @@ jobs:
       - name: Generate PWA icons
         run: node scripts/generate-pwa-icons.mjs
 
-      - name: Refresh static CelesTrak ephemeris and FAA airspace snapshots
+      - name: Refresh static CelesTrak ephemeris, FAA airspace, and WindBorne constellation snapshots
         run: node scripts/refresh-ephemeris.mjs || true
 
       - name: Run TypeScript typecheck

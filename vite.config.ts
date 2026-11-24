@@ -28,6 +28,7 @@ const adsbApiProxy: Record<string, string | ProxyOptions> = {
     '/api-proxy/airplanes-live',
     'https://api.airplanes.live'
   ),
+  '/api-proxy/windborne': createAdsbProxyEntry('/api-proxy/windborne', 'https://a.windbornesystems.com'),
 };
 
 export default defineConfig({
