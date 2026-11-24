@@ -138,6 +138,7 @@ export function TargetInspector() {
   const handleCopyPermalink = async () => {
     if (!entity || typeof window === 'undefined') return;
     const params = new URLSearchParams();
+    params.set('pin', '1');
     params.set('lat', observer.lat.toFixed(4));
     params.set('lon', observer.lon.toFixed(4));
     params.set('alt', String(Math.round(observer.altM)));

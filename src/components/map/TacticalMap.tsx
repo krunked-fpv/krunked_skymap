@@ -1324,6 +1324,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
     lat: observer.lat,
     lon: observer.lon,
   });
+  const prevObserverSourceRef = useRef(observer.source);
   const prevRadiusRef = useRef<number>(radiusKm);
   const prevRecenterNonceRef = useRef<number>(recenterNonce);
   const prevScopeRef = useRef(atmosphericScope);
@@ -1341,11 +1342,13 @@ export function TacticalMap({ className }: TacticalMapProps) {
     let cancelled = false;
     let map: maplibregl.Map;
     const initialState = useSkyStore.getState();
+    const mountPending = initialState.observer.source === 'pending';
     const mountObserver = { lat: initialState.observer.lat, lon: initialState.observer.lon };
     const mountRadiusKm = initialState.radiusKm;
     const mountRecenterNonce = initialState.recenterNonce;
 
     prevObserverRef.current = mountObserver;
+    prevObserverSourceRef.current = initialState.observer.source;
     prevRadiusRef.current = mountRadiusKm;
     prevRecenterNonceRef.current = mountRecenterNonce;
 
@@ -1353,8 +1356,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
       map = new maplibregl.Map({
         container,
         style: TACTICAL_STYLE,
-        center: [normalizeLonDeg(initialState.observer.lon), initialState.observer.lat],
-        zoom: zoomForRadiusKm(initialState.radiusKm, initialState.observer.lat),
+        center: mountPending
+          ? [0, 20]
+          : [normalizeLonDeg(initialState.observer.lon), initialState.observer.lat],
+        zoom: mountPending ? 1.8 : zoomForRadiusKm(initialState.radiusKm, initialState.observer.lat),
         minZoom: 1.5,
         maxZoom: 18,
         pitch: 0,
@@ -1782,6 +1787,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       contextLostListenerAttached = true;
 
       const st = useSkyStore.getState();
+      const isPending = st.observer.source === 'pending';
       const shiftFromMountKm = haversineDistanceKm(
         mountObserver.lat,
         mountObserver.lon,
@@ -1789,9 +1795,11 @@ export function TacticalMap({ className }: TacticalMapProps) {
         st.observer.lon
       );
       if (
-        shiftFromMountKm > 0.01 ||
-        st.radiusKm !== mountRadiusKm ||
-        st.recenterNonce !== mountRecenterNonce
+        !isPending &&
+        (mountPending ||
+          shiftFromMountKm > 0.01 ||
+          st.radiusKm !== mountRadiusKm ||
+          st.recenterNonce !== mountRecenterNonce)
       ) {
         map.jumpTo({
           center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
@@ -1799,6 +1807,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         });
       }
       prevObserverRef.current = { lat: st.observer.lat, lon: st.observer.lon };
+      prevObserverSourceRef.current = st.observer.source;
       prevRadiusRef.current = st.radiusKm;
       prevRecenterNonceRef.current = st.recenterNonce;
       prevScopeRef.current = st.atmosphericScope;
@@ -1810,10 +1819,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
         st.airspace.sua ?? EMPTY_FC
       );
       (map.getSource(SOURCE_IDS.scanRing) as maplibregl.GeoJSONSource | undefined)?.setData(
-        buildScanRingFc(st.observer.lat, st.observer.lon, st.radiusKm)
+        isPending ? EMPTY_FC : buildScanRingFc(st.observer.lat, st.observer.lon, st.radiusKm)
       );
       (map.getSource(SOURCE_IDS.observer) as maplibregl.GeoJSONSource | undefined)?.setData(
-        buildObserverFc(st.observer.lat, st.observer.lon, st.observer.label)
+        isPending ? EMPTY_FC : buildObserverFc(st.observer.lat, st.observer.lon, st.observer.label)
       );
 
       const { entitiesFc, operatorsFc } = buildEntitiesAndOperatorsFc(
@@ -2068,6 +2077,20 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const map = mapRef.current;
     if (!map || !mapLoadedRef.current) return;
 
+    if (observer.source === 'pending') {
+      (map.getSource(SOURCE_IDS.scanRing) as maplibregl.GeoJSONSource | undefined)?.setData(
+        EMPTY_FC
+      );
+      (map.getSource(SOURCE_IDS.observer) as maplibregl.GeoJSONSource | undefined)?.setData(
+        EMPTY_FC
+      );
+      prevObserverRef.current = { lat: observer.lat, lon: observer.lon };
+      prevObserverSourceRef.current = observer.source;
+      prevRadiusRef.current = radiusKm;
+      prevRecenterNonceRef.current = recenterNonce;
+      return;
+    }
+
     (map.getSource(SOURCE_IDS.scanRing) as maplibregl.GeoJSONSource | undefined)?.setData(
       buildScanRingFc(observer.lat, observer.lon, radiusKm)
     );
@@ -2075,6 +2098,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       buildObserverFc(observer.lat, observer.lon, observer.label)
     );
 
+    const wasPending = prevObserverSourceRef.current === 'pending';
     const shiftKm = haversineDistanceKm(
       prevObserverRef.current.lat,
       prevObserverRef.current.lon,
@@ -2087,8 +2111,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
       Math.abs(observer.lat - prevObserverRef.current.lat) > 1e-6 ||
       Math.abs(normalizeLonDeg(observer.lon - prevObserverRef.current.lon)) > 1e-6;
 
-    if (nonceChanged || radiusChanged || observerShifted) {
-      if (shiftKm > 250) {
+    if (wasPending || nonceChanged || radiusChanged || observerShifted) {
+      if (wasPending || shiftKm > 250) {
         map.jumpTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
@@ -2104,9 +2128,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
     }
 
     prevObserverRef.current = { lat: observer.lat, lon: observer.lon };
+    prevObserverSourceRef.current = observer.source;
     prevRadiusRef.current = radiusKm;
     prevRecenterNonceRef.current = recenterNonce;
-  }, [observer.lat, observer.lon, observer.label, radiusKm, recenterNonce]);
+  }, [observer.lat, observer.lon, observer.label, observer.source, radiusKm, recenterNonce]);
 
   // Redraw overlay labels immediately when label toggle or unit formatting changes
   useEffect(() => {
@@ -2166,6 +2191,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         });
       }
     } else if (atmosphericScope === 'local' && prevScope === 'global') {
+      if (st.observer.source === 'pending') return;
       if (!st.followSelected) {
         map.flyTo({
           center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
@@ -2360,8 +2386,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
               color: '#CBD5E1',
             }}
           >
-            OBS: {observer.label} ({observer.lat.toFixed(3)}°, {observer.lon.toFixed(3)}°) · R=
-            {radiusKm} km · TARGETS={counts.total}
+            {observer.source === 'pending'
+              ? `OBS: ${observer.label} · R=${radiusKm} km · TARGETS=${counts.total}`
+              : `OBS: ${observer.label} (${observer.lat.toFixed(3)}°, ${observer.lon.toFixed(3)}°) · R=${radiusKm} km · TARGETS=${counts.total}`}
           </div>
         </div>
       )}

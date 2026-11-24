@@ -54,8 +54,9 @@ Every data stream runs without user-supplied API keys, guarded by `AbortControll
 4. **FAA Drone Airspace, TFRs & OpenDroneID (`src/services/airspaceService.ts`, `src/services/openDroneIdService.ts`)**
    - Queries **FAA ArcGIS FeatureServers** for UAS Facility Map LAANC grid ceilings (`FAA_UAS_FacilityMap_Data`), `Special_Use_Airspace`, and `Boundary_Airspace` (with automatic non-US coverage detection and `./data/fallback-airspace.geojson` fallback).
    - Merges live **ATC `B6` UAS** with a configurable **OpenDroneID WebSocket / HTTP JSON webhook drawer** and opt-in **4-drone ASTM F3411 local simulator (`SIM-ODID`, off by default)** with real-time **UASFM ceiling / TFR incursion detection** (`altM <= 500` for low-altitude LAANC checks).
-5. **Location & Geocoding (`src/services/geocodingService.ts`)**
-   - Instant client-side coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), non-blocking browser geolocation, aerospace hotspot presets, and **Open-Meteo Geocoding** with **Nominatim** fallback.
+5. **Live Geographic Location & Geocoding (`src/services/locationService.ts`, `src/services/geocodingService.ts`)**
+   - Automatically acquires your current geographic location on every page load via direct browser Geolocation (`navigator.geolocation`) with coarse-accuracy retry, zero-key HTTPS CORS IP geolocation fallback (`get.geojs.io` â†’ `ipwho.is` â†’ `api.ip.sb` â†’ `ipinfo.io`), and non-blocking client-side reverse geocoding â€” never falling back to a hardcoded default city.
+   - Instant client-side coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), optional aerospace hotspot presets in `âŒ˜K`, and **Open-Meteo Geocoding** with **Nominatim** fallback.
 
 ---
 
@@ -101,7 +102,7 @@ Krunked Sky-Map supports standalone installation on desktop and mobile devices (
 
 - **Web App Manifest (`public/manifest.json`):** Configured with `start_url: "./"`, `scope: "./"`, `display: "standalone"`, and `#06090F` obsidian theme/background colors.
 - **Raster PNG Icons (`scripts/generate-pwa-icons.mjs`):** Zero-dependency Node script generating valid `192x192`, `512x512`, and `180x180` (`apple-touch-icon.png`) binary PNG radar icons inside the maskable safe zone (`public/icons/`).
-- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v4`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
+- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v4`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`, `krunked-skymap-v3`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
 
 ---
 
@@ -127,13 +128,14 @@ npm run preview                        # Preview built bundle locally
 1. Push this repository to GitHub (`main` branch).
 2. In your GitHub repository, open **Settings -> Pages** and set **Source** to **GitHub Actions**.
 3. Trigger or await the **Deploy Krunked Sky-Map to GitHub Pages** workflow. Because `vite.config.ts` compiles with `base: './'`, the app runs cleanly at both root custom domains and `/<repo-name>/` project URLs.
+
 ---
 
-## Sprint 04 — 3D Hemispherical Sky-Dome, Celestial Reference & Pass Intelligence
+## Sprint 04 â€” 3D Hemispherical Sky-Dome, Celestial Reference & Pass Intelligence
 
-- **3D Hemispherical Vault Projection (src/math/geodesy.ts):** `projectToSkyDome` / exact inverse `unprojectFromSkyDome` use a spherical/stereographic blend (`r = R·(0.55·cos(el) + 0.45·(90°-el)/90°)`) so the zenith opens up while `0°–20°` compresses along the glass limb. Targets below the horizon are culled (no rim clamping); a hard circular clip, optical limb fade, elevation depth scaling (`0.55×`?`1.35×`), wall foreshortening, curved great-circle wakes and forward arcs, and Zenith-safe 3D ENU trajectory tangents render the dome. A `HEMISPHERE 0°` ? `ZENITH 30°+` pill magnifies the overhead vault.
-- **Collision-solved labels:** deterministic AABB priority solver (=12 labels in DOME, =7 in SPLIT, none in PIP or below 8° elevation) with hairline leader ticks.
-- **Sun & Moon reference:** zero-key `computeSolarLunarTopocentric` plots ?/? markers and a twilight horizon glow.
-- **3D ENU Closest Approach:** `computeClosestApproach` yields `TCA`, `MAX EL` and minimum slant range; the Sky-Dome shows a `? MAX EL` apex tick and the Target Inspector a live `TCA / PEAK EL` card for approaching targets.
-- **Keyboard shortcuts** (when no input is focused): `M` Map · `S` Split · `D` Dome · `P` toggle PIP · `L` Dome labels · `?K` / `/` Command Palette · `Esc` close popovers / clear target lock.
-- **MapLibre:** FAA UASFM grid opacity and borders are zoom-progressive (whisper-subtle regionally, crisp at `z = 10`).
+- **3D Hemispherical Vault Projection (`src/math/geodesy.ts`):** `projectToSkyDome` / exact inverse `unprojectFromSkyDome` use a spherical/stereographic blend (`r = RÂ·(0.55Â·cos(el) + 0.45Â·(90Â°âˆ’el)/90Â°)`) so the zenith opens up while `0Â°â€“20Â°` compresses along the glass limb. Targets below the horizon are culled (no rim clamping); a hard circular clip, optical limb fade, elevation depth scaling (`0.55Ã—` â†’ `1.35Ã—`), wall foreshortening, curved great-circle wakes and forward arcs, and Zenith-safe 3D ENU trajectory tangents render the dome. A `HEMISPHERE 0Â°` â‡„ `ZENITH 30Â°+` pill magnifies the overhead vault.
+- **Collision-solved labels:** deterministic AABB priority solver (â‰¤12 labels in DOME, â‰¤7 in SPLIT, none in PIP or below 8Â° elevation) with hairline leader ticks.
+- **Sun & Moon reference:** zero-key `computeSolarLunarTopocentric` plots â˜€ / â˜¾ markers and a twilight horizon glow.
+- **3D ENU Closest Approach:** `computeClosestApproach` yields `TCA`, `MAX EL` and minimum slant range; the Sky-Dome shows a `â—† MAX EL` apex tick and the Target Inspector a live `TCA / PEAK EL` card for approaching targets.
+- **Keyboard shortcuts** (when no input is focused): `M` Map Â· `S` Split Â· `D` Dome Â· `P` toggle PIP Â· `L` Dome labels Â· `âŒ˜K` / `/` Command Palette Â· `Esc` close popovers / clear target lock.
+- **MapLibre:** FAA UASFM grid opacity and borders are zoom-progressive (whisper-subtle regionally, crisp at `z â‰¥ 10`).

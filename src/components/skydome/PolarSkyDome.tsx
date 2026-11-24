@@ -1610,7 +1610,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       if (celestial.key !== obsKey || frameNowMs - celestial.ts >= CELESTIAL_REFRESH_MS) {
         celestial.key = obsKey;
         celestial.ts = frameNowMs;
-        celestial.pos = computeSolarLunarTopocentric(observer, frameEpochMs);
+        celestial.pos =
+          observer.source === 'pending' ? null : computeSolarLunarTopocentric(observer, frameEpochMs);
       }
       const cel = celestial.pos;
       let twilightK = 0;
