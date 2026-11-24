@@ -11,8 +11,13 @@ import {
   type UnitSystem,
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
-import { registerTacticalSprites, resolveSpriteForEntity } from '../../assets/sprites/tacticalSprites';
 import {
+  registerTacticalSprites,
+  resolveSpriteForEntity,
+  type TacticalSpriteId,
+} from '../../assets/sprites/tacticalSprites';
+import {
+  clampLatDeg,
   geodesicCirclePolygon,
   greatCircleDestination,
   haversineDistanceKm,
@@ -50,15 +55,48 @@ interface LabelBox {
   h: number;
 }
 
-function boxesOverlap(a: LabelBox, b: LabelBox): boolean {
-  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+function boxesOverlap(a: LabelBox, b: LabelBox, padding = 0): boolean {
+  return (
+    a.x - padding < b.x + b.w &&
+    a.x + a.w + padding > b.x &&
+    a.y - padding < b.y + b.h &&
+    a.y + a.h + padding > b.y
+  );
 }
 
-function overlapsAny(box: LabelBox, existing: LabelBox[]): boolean {
+function overlapsAny(box: LabelBox, existing: LabelBox[], padding = 0): boolean {
   for (let i = 0; i < existing.length; i += 1) {
-    if (boxesOverlap(box, existing[i])) return true;
+    if (boxesOverlap(box, existing[i], padding)) return true;
   }
   return false;
+}
+
+function findAvailableLabelSlot(
+  slotCandidates: readonly [LabelBox, LabelBox, LabelBox, LabelBox],
+  width: number,
+  height: number,
+  spriteBoxes: LabelBox[],
+  placedLabelBoxes: LabelBox[],
+  checkSprites: boolean
+): LabelBox | null {
+  for (let s = 0; s < 4; s += 1) {
+    const candidateBox = slotCandidates[s];
+    if (
+      candidateBox.x < 6 ||
+      candidateBox.x + candidateBox.w > width - 6 ||
+      candidateBox.y < 6 ||
+      candidateBox.y + candidateBox.h > height - 6
+    ) {
+      continue;
+    }
+    if (checkSprites && overlapsAny(candidateBox, spriteBoxes)) {
+      continue;
+    }
+    if (!overlapsAny(candidateBox, placedLabelBoxes, 4)) {
+      return candidateBox;
+    }
+  }
+  return null;
 }
 
 function traceRoundedRect(
@@ -483,19 +521,279 @@ function buildOrbitOverlayFc(satelliteLayerVisible: boolean): GeoJSON.FeatureCol
   return { type: 'FeatureCollection', features };
 }
 
+const MAX_TRAIL_POINTS = 40;
+
+type EntityFeatureProperties = {
+  id: string;
+  category: SkyEntity['category'];
+  callsign: string;
+  sprite: TacticalSpriteId;
+  headingDeg: number;
+  color: string;
+  isSelected: boolean;
+  isHovered: boolean;
+  isAlert: boolean;
+  belowHorizon: boolean;
+  iconScale: number;
+  sortKey: number;
+  pulseRadius: number;
+  pulseOpacity: number;
+  alertRadius: number;
+  alertOpacity: number;
+};
+
+type OperatorFeatureProperties = {
+  droneId: string;
+  callsign: string;
+};
+
+type TrailFeatureProperties = {
+  kind: 'trail' | 'vector' | 'tether';
+  color: string;
+};
+
+type PooledEntityFeature = GeoJSON.Feature<GeoJSON.Point, EntityFeatureProperties>;
+type PooledOperatorFeature = GeoJSON.Feature<GeoJSON.Point, OperatorFeatureProperties>;
+type PooledTrailFeature = GeoJSON.Feature<GeoJSON.MultiLineString, TrailFeatureProperties>;
+
+interface PooledTrailSlot {
+  feature: PooledTrailFeature;
+  fastCoords: [Array<[number, number]>];
+  fastLine: Array<[number, number]>;
+  coordPool: Array<[number, number]>;
+}
+
+const entityFeaturePool: PooledEntityFeature[] = [];
+const operatorFeaturePool: PooledOperatorFeature[] = [];
+const trailSlotPool: PooledTrailSlot[] = [];
+
+const entitiesFc: GeoJSON.FeatureCollection<GeoJSON.Point, EntityFeatureProperties> = {
+  type: 'FeatureCollection',
+  features: [],
+};
+const operatorsFc: GeoJSON.FeatureCollection<GeoJSON.Point, OperatorFeatureProperties> = {
+  type: 'FeatureCollection',
+  features: [],
+};
+const trailsFc: GeoJSON.FeatureCollection<GeoJSON.MultiLineString, TrailFeatureProperties> = {
+  type: 'FeatureCollection',
+  features: [],
+};
+
+const entitiesAndOperatorsResult = { entitiesFc, operatorsFc };
+const seenIds = new Set<string>();
+const antimeridianPairScratch: [[number, number], [number, number]] = [
+  [0, 0],
+  [0, 0],
+];
+
+function acquireEntityFeature(idx: number): PooledEntityFeature {
+  let feat = entityFeaturePool[idx];
+  if (!feat) {
+    feat = {
+      type: 'Feature',
+      properties: {
+        id: '',
+        category: 'flight',
+        callsign: '',
+        sprite: 'sprite-jet-civil',
+        headingDeg: 0,
+        color: '#22D3EE',
+        isSelected: false,
+        isHovered: false,
+        isAlert: false,
+        belowHorizon: false,
+        iconScale: 0.84,
+        sortKey: 0,
+        pulseRadius: 15,
+        pulseOpacity: 0.72,
+        alertRadius: 17,
+        alertOpacity: 0.85,
+      },
+      geometry: {
+        type: 'Point',
+        coordinates: [0, 0],
+      },
+    };
+    entityFeaturePool[idx] = feat;
+  }
+  return feat;
+}
+
+function acquireOperatorFeature(idx: number): PooledOperatorFeature {
+  let feat = operatorFeaturePool[idx];
+  if (!feat) {
+    feat = {
+      type: 'Feature',
+      properties: {
+        droneId: '',
+        callsign: '',
+      },
+      geometry: {
+        type: 'Point',
+        coordinates: [0, 0],
+      },
+    };
+    operatorFeaturePool[idx] = feat;
+  }
+  return feat;
+}
+
+function acquireTrailSlot(idx: number): PooledTrailSlot {
+  let slot = trailSlotPool[idx];
+  if (!slot) {
+    const fastLine: Array<[number, number]> = [];
+    const fastCoords: [Array<[number, number]>] = [fastLine];
+    slot = {
+      feature: {
+        type: 'Feature',
+        properties: { kind: 'trail', color: '#22D3EE' },
+        geometry: {
+          type: 'MultiLineString',
+          coordinates: fastCoords,
+        },
+      },
+      fastCoords,
+      fastLine,
+      coordPool: [],
+    };
+    trailSlotPool[idx] = slot;
+  }
+  return slot;
+}
+
+function acquireSlotCoord(slot: PooledTrailSlot, idx: number): [number, number] {
+  let pt = slot.coordPool[idx];
+  if (!pt) {
+    pt = [0, 0];
+    slot.coordPool[idx] = pt;
+  }
+  return pt;
+}
+
+function populatePairTrailSlot(
+  slot: PooledTrailSlot,
+  kind: TrailFeatureProperties['kind'],
+  color: string,
+  lonA: number,
+  latA: number,
+  lonB: number,
+  latB: number
+): boolean {
+  if (
+    !Number.isFinite(lonA) ||
+    !Number.isFinite(latA) ||
+    !Number.isFinite(lonB) ||
+    !Number.isFinite(latB)
+  ) {
+    return false;
+  }
+
+  const nLonA = normalizeLonDeg(lonA);
+  const cLatA = clampLatDeg(latA);
+  const nLonB = normalizeLonDeg(lonB);
+  const cLatB = clampLatDeg(latB);
+
+  slot.feature.properties.kind = kind;
+  slot.feature.properties.color = color;
+
+  if (Math.abs(nLonB - nLonA) > 180) {
+    antimeridianPairScratch[0][0] = nLonA;
+    antimeridianPairScratch[0][1] = cLatA;
+    antimeridianPairScratch[1][0] = nLonB;
+    antimeridianPairScratch[1][1] = cLatB;
+    const segs = splitAntimeridianLine(antimeridianPairScratch);
+    if (segs.length === 0) return false;
+    slot.feature.geometry.coordinates = segs;
+    return true;
+  }
+
+  const p0 = acquireSlotCoord(slot, 0);
+  p0[0] = nLonA;
+  p0[1] = cLatA;
+  const p1 = acquireSlotCoord(slot, 1);
+  p1[0] = nLonB;
+  p1[1] = cLatB;
+  slot.fastLine[0] = p0;
+  slot.fastLine[1] = p1;
+  slot.fastLine.length = 2;
+  slot.fastCoords[0] = slot.fastLine;
+  slot.feature.geometry.coordinates = slot.fastCoords;
+  return true;
+}
+
+function populateEntityTrailSlot(
+  slot: PooledTrailSlot,
+  entity: SkyEntity,
+  color: string
+): boolean {
+  const trailLen = entity.trail.length;
+  if (trailLen < 1) return false;
+
+  const startIdx = Math.max(0, trailLen - MAX_TRAIL_POINTS);
+  let validCount = 0;
+  let prevLon = 0;
+  let crossesAntimeridian = false;
+
+  for (let i = startIdx; i < trailLen; i += 1) {
+    const tp = entity.trail[i];
+    if (!Number.isFinite(tp.lon) || !Number.isFinite(tp.lat)) continue;
+    const lon = normalizeLonDeg(tp.lon);
+    const lat = clampLatDeg(tp.lat);
+    if (validCount > 0 && Math.abs(lon - prevLon) > 180) {
+      crossesAntimeridian = true;
+    }
+    const coord = acquireSlotCoord(slot, validCount);
+    coord[0] = lon;
+    coord[1] = lat;
+    slot.fastLine[validCount] = coord;
+    prevLon = lon;
+    validCount += 1;
+  }
+
+  const lastTrailPt = entity.trail[trailLen - 1];
+  if (!lastTrailPt || lastTrailPt.lon !== entity.lon || lastTrailPt.lat !== entity.lat) {
+    const lon = normalizeLonDeg(entity.lon);
+    const lat = clampLatDeg(entity.lat);
+    if (validCount > 0 && Math.abs(lon - prevLon) > 180) {
+      crossesAntimeridian = true;
+    }
+    const coord = acquireSlotCoord(slot, validCount);
+    coord[0] = lon;
+    coord[1] = lat;
+    slot.fastLine[validCount] = coord;
+    validCount += 1;
+  }
+
+  if (validCount === 0) return false;
+  slot.fastLine.length = validCount;
+  slot.feature.properties.kind = 'trail';
+  slot.feature.properties.color = color;
+
+  if (crossesAntimeridian) {
+    const splitTrail = splitAntimeridianLine(slot.fastLine);
+    if (splitTrail.length === 0) return false;
+    slot.feature.geometry.coordinates = splitTrail;
+  } else {
+    slot.fastCoords[0] = slot.fastLine;
+    slot.feature.geometry.coordinates = slot.fastCoords;
+  }
+  return true;
+}
+
 function buildEntitiesAndOperatorsFc(
   layers: Record<SkyEntity['category'], boolean>,
   selectedId: string | null,
   hoveredId: string | null,
   nowMs: number
 ): {
-  entitiesFc: GeoJSON.FeatureCollection;
-  operatorsFc: GeoJSON.FeatureCollection;
+  entitiesFc: GeoJSON.FeatureCollection<GeoJSON.Point, EntityFeatureProperties>;
+  operatorsFc: GeoJSON.FeatureCollection<GeoJSON.Point, OperatorFeatureProperties>;
 } {
   const phase = (Math.sin(nowMs * 0.0065) + 1) * 0.5;
-  const entityFeatures: GeoJSON.Feature<GeoJSON.Point>[] = [];
-  const operatorFeatures: GeoJSON.Feature<GeoJSON.Point>[] = [];
-  const seenIds = new Set<string>();
+  let entityIdx = 0;
+  let operatorIdx = 0;
+  seenIds.clear();
 
   for (const entity of liveKinematicsRegistry.entities.values()) {
     if (!layers[entity.category]) continue;
@@ -525,31 +823,28 @@ function buildEntitiesAndOperatorsFc(
 
     const sortKey = getEntitySortKey(entity, isSelected, isHovered, isAlert);
 
-    entityFeatures.push({
-      type: 'Feature',
-      properties: {
-        id: entity.id,
-        category: entity.category,
-        callsign: entity.callsign,
-        sprite: resolveSpriteForEntity(entity),
-        headingDeg,
-        color,
-        isSelected,
-        isHovered,
-        isAlert,
-        belowHorizon: entity.topocentric.belowHorizon,
-        iconScale,
-        sortKey,
-        pulseRadius: isSelected ? 18 + phase * 6 : 15 + phase * 3,
-        pulseOpacity: isSelected ? 0.95 - phase * 0.35 : 0.72 - phase * 0.25,
-        alertRadius: 17 + phase * 6,
-        alertOpacity: 0.85 - phase * 0.45,
-      },
-      geometry: {
-        type: 'Point',
-        coordinates: [normalizeLonDeg(entity.lon), entity.lat],
-      },
-    });
+    const feat = acquireEntityFeature(entityIdx);
+    const props = feat.properties;
+    props.id = entity.id;
+    props.category = entity.category;
+    props.callsign = entity.callsign;
+    props.sprite = resolveSpriteForEntity(entity);
+    props.headingDeg = headingDeg;
+    props.color = color;
+    props.isSelected = isSelected;
+    props.isHovered = isHovered;
+    props.isAlert = isAlert;
+    props.belowHorizon = entity.topocentric.belowHorizon;
+    props.iconScale = iconScale;
+    props.sortKey = sortKey;
+    props.pulseRadius = isSelected ? 18 + phase * 6 : 15 + phase * 3;
+    props.pulseOpacity = isSelected ? 0.95 - phase * 0.35 : 0.72 - phase * 0.25;
+    props.alertRadius = 17 + phase * 6;
+    props.alertOpacity = 0.85 - phase * 0.45;
+    feat.geometry.coordinates[0] = normalizeLonDeg(entity.lon);
+    feat.geometry.coordinates[1] = entity.lat;
+    entitiesFc.features[entityIdx] = feat;
+    entityIdx += 1;
 
     if (
       entity.category === 'drone' &&
@@ -558,31 +853,26 @@ function buildEntitiesAndOperatorsFc(
       Number.isFinite(entity.operatorLat) &&
       Number.isFinite(entity.operatorLon)
     ) {
-      operatorFeatures.push({
-        type: 'Feature',
-        properties: {
-          droneId: entity.id,
-          callsign: entity.callsign,
-        },
-        geometry: {
-          type: 'Point',
-          coordinates: [normalizeLonDeg(entity.operatorLon), entity.operatorLat],
-        },
-      });
+      const opFeat = acquireOperatorFeature(operatorIdx);
+      opFeat.properties.droneId = entity.id;
+      opFeat.properties.callsign = entity.callsign;
+      opFeat.geometry.coordinates[0] = normalizeLonDeg(entity.operatorLon);
+      opFeat.geometry.coordinates[1] = entity.operatorLat;
+      operatorsFc.features[operatorIdx] = opFeat;
+      operatorIdx += 1;
     }
   }
 
-  return {
-    entitiesFc: { type: 'FeatureCollection', features: entityFeatures },
-    operatorsFc: { type: 'FeatureCollection', features: operatorFeatures },
-  };
+  entitiesFc.features.length = entityIdx;
+  operatorsFc.features.length = operatorIdx;
+  return entitiesAndOperatorsResult;
 }
 
 function buildTrailsAndVectorsFc(
   layers: Record<SkyEntity['category'], boolean>
-): GeoJSON.FeatureCollection {
-  const trailFeatures: GeoJSON.Feature[] = [];
-  const seenIds = new Set<string>();
+): GeoJSON.FeatureCollection<GeoJSON.MultiLineString, TrailFeatureProperties> {
+  let trailIdx = 0;
+  seenIds.clear();
 
   for (const entity of liveKinematicsRegistry.entities.values()) {
     if (!layers[entity.category]) continue;
@@ -593,21 +883,10 @@ function buildTrailsAndVectorsFc(
     const color = resolveEntityColor(entity);
 
     if (entity.trail.length >= 1) {
-      const pts: Array<[number, number]> = entity.trail.map((p) => [p.lon, p.lat]);
-      const lastPt = pts[pts.length - 1];
-      if (!lastPt || lastPt[0] !== entity.lon || lastPt[1] !== entity.lat) {
-        pts.push([entity.lon, entity.lat]);
-      }
-      const splitTrail = splitAntimeridianLine(pts);
-      if (splitTrail.length > 0) {
-        trailFeatures.push({
-          type: 'Feature',
-          properties: { kind: 'trail', color },
-          geometry: {
-            type: 'MultiLineString',
-            coordinates: splitTrail,
-          },
-        });
+      const slot = acquireTrailSlot(trailIdx);
+      if (populateEntityTrailSlot(slot, entity, color)) {
+        trailsFc.features[trailIdx] = slot.feature;
+        trailIdx += 1;
       }
     }
 
@@ -622,19 +901,10 @@ function buildTrailsAndVectorsFc(
     ) {
       const distKm = (entity.speedMs * 60) / 1000;
       const dest = greatCircleDestination(entity.lat, entity.lon, entity.headingDeg, distKm);
-      const vecSegs = splitAntimeridianLine([
-        [entity.lon, entity.lat],
-        [dest.lon, dest.lat],
-      ]);
-      if (vecSegs.length > 0) {
-        trailFeatures.push({
-          type: 'Feature',
-          properties: { kind: 'vector', color },
-          geometry: {
-            type: 'MultiLineString',
-            coordinates: vecSegs,
-          },
-        });
+      const slot = acquireTrailSlot(trailIdx);
+      if (populatePairTrailSlot(slot, 'vector', color, entity.lon, entity.lat, dest.lon, dest.lat)) {
+        trailsFc.features[trailIdx] = slot.feature;
+        trailIdx += 1;
       }
     }
 
@@ -645,27 +915,27 @@ function buildTrailsAndVectorsFc(
       Number.isFinite(entity.operatorLat) &&
       Number.isFinite(entity.operatorLon)
     ) {
-      const tetherSegs = splitAntimeridianLine([
-        [entity.operatorLon, entity.operatorLat],
-        [entity.lon, entity.lat],
-      ]);
-      if (tetherSegs.length > 0) {
-        trailFeatures.push({
-          type: 'Feature',
-          properties: {
-            kind: 'tether',
-            color: entity.ceilingBreach || entity.tfrBreach ? BREACH_COLOR : '#94A3B8',
-          },
-          geometry: {
-            type: 'MultiLineString',
-            coordinates: tetherSegs,
-          },
-        });
+      const slot = acquireTrailSlot(trailIdx);
+      const tetherColor = entity.ceilingBreach || entity.tfrBreach ? BREACH_COLOR : '#94A3B8';
+      if (
+        populatePairTrailSlot(
+          slot,
+          'tether',
+          tetherColor,
+          entity.operatorLon,
+          entity.operatorLat,
+          entity.lon,
+          entity.lat
+        )
+      ) {
+        trailsFc.features[trailIdx] = slot.feature;
+        trailIdx += 1;
       }
     }
   }
 
-  return { type: 'FeatureCollection', features: trailFeatures };
+  trailsFc.features.length = trailIdx;
+  return trailsFc;
 }
 
 function hasWebGLContext(): boolean {
@@ -716,7 +986,21 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     source: SOURCE_IDS.uasfm,
     paint: {
       'fill-color': uasfmColorExpr,
-      'fill-opacity': 0.12,
+      'fill-opacity': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        6.0,
+        0.0,
+        7.5,
+        0.02,
+        9.0,
+        0.045,
+        10.0,
+        0.09,
+        12.0,
+        0.14,
+      ],
     },
   });
   map.addLayer({
@@ -725,8 +1009,34 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     source: SOURCE_IDS.uasfm,
     paint: {
       'line-color': uasfmColorExpr,
-      'line-width': 1,
-      'line-opacity': 0.45,
+      'line-width': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        7.5,
+        0.4,
+        9.5,
+        0.65,
+        11.0,
+        1.0,
+        13.0,
+        1.3,
+      ],
+      'line-opacity': [
+        'interpolate',
+        ['linear'],
+        ['zoom'],
+        6.5,
+        0.0,
+        8.0,
+        0.06,
+        9.5,
+        0.16,
+        10.5,
+        0.36,
+        12.5,
+        0.52,
+      ],
     },
   });
 
@@ -737,7 +1047,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     source: SOURCE_IDS.sua,
     paint: {
       'fill-color': '#FB7185',
-      'fill-opacity': 0.08,
+      'fill-opacity': ['interpolate', ['linear'], ['zoom'], 5.0, 0.035, 8.5, 0.055, 10.5, 0.08],
     },
   });
   map.addLayer({
@@ -747,7 +1057,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     paint: {
       'line-color': '#FB7185',
       'line-width': 1.5,
-      'line-opacity': 0.72,
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 5.0, 0.38, 8.5, 0.56, 10.5, 0.72],
       'line-dasharray': [4, 3],
     },
   });
@@ -1089,6 +1399,62 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const initialRect = container.getBoundingClientRect();
     syncLabelCanvasSize(initialRect.width, initialRect.height);
 
+    interface LabelCandidate {
+      entity: SkyEntity | null;
+      px: number;
+      py: number;
+      priority: number;
+      isSelected: boolean;
+      isHovered: boolean;
+      isAlert: boolean;
+      color: string;
+    }
+
+    const labelSeenIds = new Set<string>();
+    const candidatePool: LabelCandidate[] = [];
+    const candidates: LabelCandidate[] = [];
+    const spriteBoxPool: LabelBox[] = [];
+    const spriteBoxes: LabelBox[] = [];
+    const placedBoxPool: LabelBox[] = [];
+    const placedLabelBoxes: LabelBox[] = [];
+    const labelProjCoord: [number, number] = [0, 0];
+    const slotCandidates: readonly [LabelBox, LabelBox, LabelBox, LabelBox] = [
+      { x: 0, y: 0, w: 0, h: 0 },
+      { x: 0, y: 0, w: 0, h: 0 },
+      { x: 0, y: 0, w: 0, h: 0 },
+      { x: 0, y: 0, w: 0, h: 0 },
+    ];
+
+    const acquireLabelCandidate = (idx: number): LabelCandidate => {
+      let cand = candidatePool[idx];
+      if (!cand) {
+        cand = {
+          entity: null,
+          px: 0,
+          py: 0,
+          priority: 0,
+          isSelected: false,
+          isHovered: false,
+          isAlert: false,
+          color: '#22D3EE',
+        };
+        candidatePool[idx] = cand;
+      }
+      return cand;
+    };
+
+    const acquirePooledBox = (pool: LabelBox[], idx: number): LabelBox => {
+      let box = pool[idx];
+      if (!box) {
+        box = { x: 0, y: 0, w: 0, h: 0 };
+        pool[idx] = box;
+      }
+      return box;
+    };
+
+    const compareLabelCandidatesDesc = (a: LabelCandidate, b: LabelCandidate): number =>
+      b.priority - a.priority;
+
     const drawMapLabels = () => {
       const labelCanvas = labelCanvasRef.current;
       if (!labelCanvas) return;
@@ -1125,30 +1491,25 @@ export function TacticalMap({ className }: TacticalMapProps) {
       }
 
       const zoom = activeMap.getZoom();
-      const maxAutoLabels = zoom < 6.0 ? 0 : zoom < 8.0 ? 10 : zoom < 10.0 ? 22 : 42;
+      const maxAutoLabels = zoom < 6.0 ? 0 : zoom < 8.0 ? 8 : zoom < 10.0 ? 18 : 34;
 
-      interface LabelCandidate {
-        entity: SkyEntity;
-        px: number;
-        py: number;
-        priority: number;
-        isSelected: boolean;
-        isHovered: boolean;
-        isAlert: boolean;
-        color: string;
-      }
-
-      const seenIds = new Set<string>();
-      const candidates: LabelCandidate[] = [];
-      const spriteBoxes: LabelBox[] = [];
+      labelSeenIds.clear();
+      candidates.length = 0;
+      spriteBoxes.length = 0;
+      placedLabelBoxes.length = 0;
+      let candIdx = 0;
+      let spriteIdx = 0;
+      let placedIdx = 0;
 
       for (const entity of liveKinematicsRegistry.entities.values()) {
         if (!state.layers[entity.category]) continue;
-        if (seenIds.has(entity.id)) continue;
+        if (labelSeenIds.has(entity.id)) continue;
         if (!Number.isFinite(entity.lat) || !Number.isFinite(entity.lon)) continue;
-        seenIds.add(entity.id);
+        labelSeenIds.add(entity.id);
 
-        const pt = activeMap.project([normalizeLonDeg(entity.lon), entity.lat]);
+        labelProjCoord[0] = normalizeLonDeg(entity.lon);
+        labelProjCoord[1] = entity.lat;
+        const pt = activeMap.project(labelProjCoord);
         if (
           !Number.isFinite(pt.x) ||
           !Number.isFinite(pt.y) ||
@@ -1160,8 +1521,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
           continue;
         }
 
-        // Reserve each sprite's central 22x22 icon bounding box
-        spriteBoxes.push({ x: pt.x - 11, y: pt.y - 11, w: 22, h: 22 });
+        // Reserve each sprite's central 26x26 icon exclusion bounding box
+        const sBox = acquirePooledBox(spriteBoxPool, spriteIdx);
+        sBox.x = pt.x - 13;
+        sBox.y = pt.y - 13;
+        sBox.w = 26;
+        sBox.h = 26;
+        spriteBoxes[spriteIdx] = sBox;
+        spriteIdx += 1;
 
         const isSelected = entity.id === state.selectedId;
         const isHovered = entity.id === state.hoveredId;
@@ -1174,23 +1541,28 @@ export function TacticalMap({ className }: TacticalMapProps) {
           continue;
         }
 
-        candidates.push({
-          entity,
-          px: pt.x,
-          py: pt.y,
-          priority: getLabelPriority(entity, isSelected, isHovered, isAlert),
-          isSelected,
-          isHovered,
-          isAlert,
-          color: resolveEntityColor(entity),
-        });
+        const cand = acquireLabelCandidate(candIdx);
+        cand.entity = entity;
+        cand.px = pt.x;
+        cand.py = pt.y;
+        cand.priority = getLabelPriority(entity, isSelected, isHovered, isAlert);
+        cand.isSelected = isSelected;
+        cand.isHovered = isHovered;
+        cand.isAlert = isAlert;
+        cand.color = resolveEntityColor(entity);
+        candidates[candIdx] = cand;
+        candIdx += 1;
       }
 
-      if (candidates.length === 0) return;
+      candidates.length = candIdx;
+      spriteBoxes.length = spriteIdx;
 
-      candidates.sort((a, b) => b.priority - a.priority);
+      if (candIdx === 0) return;
 
-      const placedLabelBoxes: LabelBox[] = [];
+      if (candIdx > 1) {
+        candidates.sort(compareLabelCandidatesDesc);
+      }
+
       let autoDrawn = 0;
 
       ctx.save();
@@ -1198,18 +1570,23 @@ export function TacticalMap({ className }: TacticalMapProps) {
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
 
-      for (const item of candidates) {
+      for (let i = 0; i < candIdx; i += 1) {
+        const item = candidates[i];
+        const entity = item.entity;
+        item.entity = null;
+        if (!entity) continue;
+
         const mustShow = item.isSelected || item.isHovered;
         const zoomAlertBypass = state.mapLabelsEnabled && zoom < 6.0 && item.isAlert;
         if (!mustShow && !zoomAlertBypass && autoDrawn >= maxAutoLabels) {
           continue;
         }
 
-        const rawCallsign = item.entity.callsign || item.entity.id;
+        const rawCallsign = entity.callsign || entity.id;
         const callsignText =
           rawCallsign.length > 18 ? `${rawCallsign.slice(0, 17)}…` : rawCallsign;
-        const altText = formatAltitudeCompact(item.entity, state.units);
-        const vRate = item.entity.vertRateMs;
+        const altText = formatAltitudeCompact(entity, state.units);
+        const vRate = entity.vertRateMs;
         const vRateChevron =
           Number.isFinite(vRate) && Math.abs(vRate) >= 1.5 ? (vRate > 0 ? ' ↑' : ' ↓') : '';
 
@@ -1222,68 +1599,74 @@ export function TacticalMap({ className }: TacticalMapProps) {
         const boxH = 15;
         const offset = 14;
 
-        const slots: Array<{ x: number; y: number }> = [
-          { x: item.px + offset, y: item.py - boxH / 2 },
-          { x: item.px - offset - boxW, y: item.py - boxH / 2 },
-          { x: item.px - boxW / 2, y: item.py - offset - boxH },
-          { x: item.px - boxW / 2, y: item.py + offset },
-        ];
+        slotCandidates[0].x = item.px + offset;
+        slotCandidates[0].y = item.py - boxH / 2;
+        slotCandidates[0].w = boxW;
+        slotCandidates[0].h = boxH;
 
-        let chosenBox: LabelBox | null = null;
-        for (const slot of slots) {
-          if (
-            slot.x < 6 ||
-            slot.x + boxW > width - 6 ||
-            slot.y < 6 ||
-            slot.y + boxH > height - 6
-          ) {
-            continue;
-          }
-          const candidateBox: LabelBox = { x: slot.x, y: slot.y, w: boxW, h: boxH };
-          if (
-            !overlapsAny(candidateBox, spriteBoxes) &&
-            !overlapsAny(candidateBox, placedLabelBoxes)
-          ) {
-            chosenBox = candidateBox;
-            break;
-          }
+        slotCandidates[1].x = item.px - offset - boxW;
+        slotCandidates[1].y = item.py - boxH / 2;
+        slotCandidates[1].w = boxW;
+        slotCandidates[1].h = boxH;
+
+        slotCandidates[2].x = item.px - boxW / 2;
+        slotCandidates[2].y = item.py - offset - boxH;
+        slotCandidates[2].w = boxW;
+        slotCandidates[2].h = boxH;
+
+        slotCandidates[3].x = item.px - boxW / 2;
+        slotCandidates[3].y = item.py + offset;
+        slotCandidates[3].w = boxW;
+        slotCandidates[3].h = boxH;
+
+        let chosenSlot = findAvailableLabelSlot(
+          slotCandidates,
+          width,
+          height,
+          spriteBoxes,
+          placedLabelBoxes,
+          true
+        );
+
+        if (!chosenSlot && item.isAlert && !mustShow) {
+          chosenSlot = findAvailableLabelSlot(
+            slotCandidates,
+            width,
+            height,
+            spriteBoxes,
+            placedLabelBoxes,
+            false
+          );
         }
 
-        if (!chosenBox && item.isAlert && !mustShow) {
-          for (const slot of slots) {
-            if (
-              slot.x < 6 ||
-              slot.x + boxW > width - 6 ||
-              slot.y < 6 ||
-              slot.y + boxH > height - 6
-            ) {
-              continue;
-            }
-            const candidateBox: LabelBox = { x: slot.x, y: slot.y, w: boxW, h: boxH };
-            if (!overlapsAny(candidateBox, placedLabelBoxes)) {
-              chosenBox = candidateBox;
-              break;
-            }
-          }
-        }
-
-        if (!chosenBox) {
+        let lx = 0;
+        let ly = 0;
+        if (chosenSlot) {
+          lx = chosenSlot.x;
+          ly = chosenSlot.y;
+        } else {
           if (!mustShow) continue;
           const preferLeft = item.px + offset + boxW > width - 6;
-          const fx = Math.max(
+          lx = Math.max(
             6,
             Math.min(width - boxW - 6, preferLeft ? item.px - offset - boxW : item.px + offset)
           );
-          const fy = Math.max(6, Math.min(height - boxH - 6, item.py - boxH / 2));
-          chosenBox = { x: fx, y: fy, w: boxW, h: boxH };
+          ly = Math.max(6, Math.min(height - boxH - 6, item.py - boxH / 2));
         }
 
-        placedLabelBoxes.push(chosenBox);
+        const placedBox = acquirePooledBox(placedBoxPool, placedIdx);
+        placedBox.x = lx;
+        placedBox.y = ly;
+        placedBox.w = boxW;
+        placedBox.h = boxH;
+        placedLabelBoxes[placedIdx] = placedBox;
+        placedIdx += 1;
+        placedLabelBoxes.length = placedIdx;
+
         if (!mustShow) {
           autoDrawn += 1;
         }
 
-        const { x: lx, y: ly } = chosenBox;
         ctx.fillStyle = mustShow
           ? 'rgba(7, 10, 17, 0.94)'
           : item.isAlert
@@ -1300,7 +1683,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         const ty = ly + boxH / 2 + 0.5;
         ctx.fillStyle = mustShow
           ? '#F8FAFC'
-          : item.entity.topocentric.belowHorizon
+          : entity.topocentric.belowHorizon
             ? '#94A3B8'
             : '#E2E8F0';
         ctx.fillText(callsignText, tx, ty);
@@ -1491,7 +1874,11 @@ export function TacticalMap({ className }: TacticalMapProps) {
     // 60fps GeoJSON update loop reading directly from liveKinematicsRegistry
     let rafId = 0;
     let lastEntityVersion = -1;
-    let lastLayersKey = '';
+    let lastLayerFlight = !initialState.layers.flight;
+    let lastLayerMilitary = !initialState.layers.military;
+    let lastLayerSatellite = !initialState.layers.satellite;
+    let lastLayerBalloon = !initialState.layers.balloon;
+    let lastLayerDrone = !initialState.layers.drone;
     let lastSelectedId: string | null = null;
     let lastHoveredId: string | null = null;
     let lastMapLabelsEnabled = initialState.mapLabelsEnabled;
@@ -1527,10 +1914,15 @@ export function TacticalMap({ className }: TacticalMapProps) {
       const layoutChanged = state.layout !== lastLayout;
       lastLayout = state.layout;
 
-      const layersKey = `${state.layers.flight}-${state.layers.military}-${state.layers.satellite}-${state.layers.balloon}-${state.layers.drone}`;
+      const layersChanged =
+        state.layers.flight !== lastLayerFlight ||
+        state.layers.military !== lastLayerMilitary ||
+        state.layers.satellite !== lastLayerSatellite ||
+        state.layers.balloon !== lastLayerBalloon ||
+        state.layers.drone !== lastLayerDrone;
       const versionChanged = liveKinematicsRegistry.version !== lastEntityVersion;
       const stateChanged =
-        layersKey !== lastLayersKey ||
+        layersChanged ||
         state.selectedId !== lastSelectedId ||
         state.hoveredId !== lastHoveredId;
       const labelsChanged = state.mapLabelsEnabled !== lastMapLabelsEnabled;
@@ -1544,7 +1936,11 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
       if (versionChanged || stateChanged || (hasHighlight && pulseTickDue)) {
         lastEntityVersion = liveKinematicsRegistry.version;
-        lastLayersKey = layersKey;
+        lastLayerFlight = state.layers.flight;
+        lastLayerMilitary = state.layers.military;
+        lastLayerSatellite = state.layers.satellite;
+        lastLayerBalloon = state.layers.balloon;
+        lastLayerDrone = state.layers.drone;
         lastSelectedId = state.selectedId;
         lastHoveredId = state.hoveredId;
         lastPulseSyncMs = nowMs;
