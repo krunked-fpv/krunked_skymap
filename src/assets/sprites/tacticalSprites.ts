@@ -24,10 +24,7 @@ export type TacticalSpriteId =
 const SPRITE_SIZE = 96;
 const HALO_COLOR = 'rgba(6, 9, 15, 0.92)';
 
-function createSpriteCanvas(): {
-  canvas: HTMLCanvasElement;
-  ctx: CanvasRenderingContext2D;
-} | null {
+function createSpriteCanvas(): CanvasRenderingContext2D | null {
   if (typeof document === 'undefined') return null;
   const canvas = document.createElement('canvas');
   canvas.width = SPRITE_SIZE;
@@ -37,7 +34,7 @@ function createSpriteCanvas(): {
   ctx.clearRect(0, 0, SPRITE_SIZE, SPRITE_SIZE);
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
-  return { canvas, ctx };
+  return ctx;
 }
 
 function registerCanvasSprite(
@@ -45,9 +42,8 @@ function registerCanvasSprite(
   id: TacticalSpriteId,
   draw: (ctx: CanvasRenderingContext2D) => void
 ): void {
-  const created = createSpriteCanvas();
-  if (!created) return;
-  const { ctx } = created;
+  const ctx = createSpriteCanvas();
+  if (!ctx) return;
   draw(ctx);
   const imgData = ctx.getImageData(0, 0, SPRITE_SIZE, SPRITE_SIZE);
   if (map.hasImage(id)) {
