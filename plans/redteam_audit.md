@@ -329,3 +329,88 @@ Both Low defects (`[DEFECT-S2-01]`, `[DEFECT-S2-02]`) were remediated on `main`:
 - `npx tsc --noEmit` -> **PASS (exit 0)**
 - `npx vitest run --pool=vmThreads tests/adversarial/chaos.test.ts` -> **27 / 27 PASS** (`Challenge 1`–`Challenge 7`)
 - `npx vitest run --pool=vmThreads` -> **74 / 74 PASS** (`tests/unit/ingest.test.ts`: 28, `tests/unit/math.test.ts`: 19, `tests/adversarial/chaos.test.ts`: 27)
+
+---
+
+## Sprint 03 — Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA, Scale & Glass-Cockpit Overlay Audit (Round 1 Challenge)
+
+**Auditor:** `@astro-redteam`  
+**Branch / Worktree:** `sprint/astro-redteam` (`c:\krunked_skymap\.worktrees\astro-redteam`, branched from `65ee8b7`)  
+**Scope:** [sky-contracts.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/types/sky-contracts.ts), [useSkyStore.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/store/useSkyStore.ts), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx), [httpClient.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/httpClient.ts), [balloonsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/balloonsService.ts), [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts), [openDroneIdService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/openDroneIdService.ts), [satellitesService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/satellitesService.ts), [airspaceService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/airspaceService.ts), [TopTelemetryBar.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/TopTelemetryBar.tsx), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx), [OpenDroneIdModal.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/OpenDroneIdModal.tsx), [TargetInspector.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/inspector/TargetInspector.tsx) (canonical path vs brief alias), [TacticalMap.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/map/TacticalMap.tsx), [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx), [cockpit.css](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/styles/cockpit.css), [vite.config.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/vite.config.ts), [sw.js](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/sw.js), and [refresh-ephemeris.mjs](file:///c:/krunked_skymap/.worktrees/astro-redteam/scripts/refresh-ephemeris.mjs).
+
+### Executive Defect Tally
+
+| Severity | Count | Findings |
+| :--- | :---: | :--- |
+| **Critical** | **0** | None |
+| **High** | **2** | `[DEFECT-S3-01]`, `[DEFECT-S3-02]` |
+| **Medium** | **4** | `[DEFECT-S3-03]`, `[DEFECT-S3-04]`, `[DEFECT-S3-05]`, `[DEFECT-S3-06]` |
+| **Low** | **2** | `[DEFECT-S3-07]`, `[DEFECT-S3-08]` |
+| **Total** | **8** | **8 / 8 reproducible `[DEFECT-S3-*]` probes failing** in [chaos.test.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/tests/adversarial/chaos.test.ts) (`85 / 93` total passing; `tsc --noEmit` exit `0`) |
+
+### Challenge 8 Verified Passing Controls (No Regression Found)
+1. **WindBorne Validation, Snapshot Alignment & Antimeridian Kinematics:** `parseWindBorneConstellation` and `buildWindBorneTrail` reject `null`, `NaN`, `Infinity`, `(0, 0)` Null Island, and out-of-range coordinates/altitudes cleanly; tolerate mismatched `00.json` / `01.json` / `02.json` snapshot array lengths; enforce the `> 450 km` hourly index-shift outlier jump guard; and compute finite Antimeridian `±180°` crossing heading and groundspeed (`179.5°` → `-179.5°`).
+2. **Global `/v2/mil` + `/v2/ladd` + `/v2/pia` Hex Deduplication & Circuit-Breaker Isolation:** Deduplicates overlapping ICAO `hex` entries across global endpoints while accumulating `dbFlags` / military precedence, and isolates `globalFlightsCircuitBreaker` (`429`/`503` trip) cleanly from local `flightsCircuitBreaker` (`/v2/point`).
+3. **High-Altitude Stratospheric, Military UAS (`B6`), LTA (`B2`) & Low-Groundspeed Hover Retention:** Retains `alt_baro: null` + `alt_geom: 62000` stratospheric targets, preserves `isMilitary: true` on `B6` UAS (`MQ-9` / `RQ-4`), classifies `B2` LTA targets cleanly, and retains `gs < 5 kts` hovering rotors/UAS/balloons without drift suppression bugs.
+4. **Scale & Memory Hygiene (`1,000` WindBorne + `500` Military + `2,000` Satellites):** `parseWindBorneConstellation` (1,000 balloons = `19.90ms`), global military ingestion (`500` flights = `6.85ms`), and SGP4 worker propagation (`2,000` satellites = `47.69ms`) execute within real-time frame budgets with zero unbounded trail growth or NaN poisoning. (`public/data/windborne-balloons.json` verified intact on disk with `1,000` tuples.)
+5. **Service Worker `krunked-skymap-v3` Bypass & Caching:** [sw.js](file:///c:/krunked_skymap/.worktrees/astro-redteam/public/sw.js) bypasses `/api-proxy/windborne` and live same-origin `.json` telemetry payloads (`network-only`) while serving/caching `manifest.json`.
+6. **Sprint 01 / 02 / 02.1 Baseline Preservation:** All `27 / 27` tests in `Challenge 1`–`Challenge 7`, `19 / 19` in [math.test.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/tests/unit/math.test.ts), and `34 / 34` in [ingest.test.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/tests/unit/ingest.test.ts) pass.
+
+### Detailed Sprint 03 Findings (`[DEFECT-S3-01]` – `[DEFECT-S3-08]`)
+
+#### 1. `[DEFECT-S3-01]` (High) — Duplicate `⌘K` / `Ctrl+K` Global Listeners Self-Cancel & `/` Leaks Past `OpenDroneIdModal`
+- **Files & Lines:** [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L361-L397), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L219-L251)
+- **Root Cause:** Both `ControlDock` (mounted inside `App`, so its `useEffect` registers first on `window`) and `App` attach `window.addEventListener('keydown', ...)` handlers that execute `setCommandPaletteOpen(!useSkyStore.getState().commandPaletteOpen)` on `Ctrl+K` / `⌘K` without `stopImmediatePropagation()`. Pressing `Ctrl+K` once invokes both listeners sequentially (`false -> true -> false`), leaving the Command Palette closed. Additionally, [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L234) activates on `/` without guarding `!useSkyStore.getState().odidModalOpen`.
+- **Fix Recipe:** Remove global `Ctrl+K` / `⌘K` and `/` keybinding handling from [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L219-L251), keep keyboard shortcut ownership centralized in [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L361-L397), and reject `/` when `odidModalOpen` is `true`.
+
+#### 2. `[DEFECT-S3-02]` (High) — Non-Atomic Multi-Overlay `Escape` Handling Cascades Into `TargetInspector`
+- **Files & Lines:** [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L386-L392), [ControlDock.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/ControlDock.tsx#L240-L246), [TopTelemetryBar.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/TopTelemetryBar.tsx#L171-L176), [TargetInspector.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/inspector/TargetInspector.tsx#L130-L137), [OpenDroneIdModal.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/OpenDroneIdModal.tsx#L56-L60)
+- **Root Cause:** Five independent `window` `keydown` listeners react to the same `Escape` event without shared tray state or `stopImmediatePropagation()`:
+  1. When `diagnosticsOpen` (or `settingsOpen`) and `inspectorOpen` are both `true`, `App.tsx` closes `closeAllPopovers()` first, and `TargetInspector.tsx` subsequently sees `diagnosticsOpen === false` and calls `selectEntity(null, false)`.
+  2. When a `ControlDock` sub-tray is open alongside `TargetInspector`, `ControlDock` clears its local `activeTrayCategory` while `App.tsx` (or `TargetInspector`) falls through and dismisses `inspectorOpen`.
+  3. When `commandPaletteOpen` is `true` with focus outside an `<input>`, `ControlDock` closes the palette and downstream listeners see `commandPaletteOpen === false` and dismiss `inspectorOpen`.
+- **Fix Recipe:** Promote `activeDockTray` (or tray state) into [useSkyStore.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/store/useSkyStore.ts) and consolidate `Escape` handling into one ordered dispatcher (`odidModalOpen` → `commandPaletteOpen` → `diagnosticsOpen || settingsOpen` → `activeDockTray` → `inspectorOpen`) calling `e.stopImmediatePropagation()` so one `Escape` press dismisses strictly one overlay layer.
+
+#### 3. `[DEFECT-S3-03]` (Medium) — Global `/v2/{mil,ladd,pia}` Hex Merge Downgrades `airframeClass` (`heavy`/`heli`) & Drops Metadata
+- **Files & Lines:** [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L1909-L1931), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L218-L241), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L1494-L1515)
+- **Root Cause:** At [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L1928) (`existing.airframeClass === 'fast-mil' ? existing.airframeClass : f.airframeClass`), merging an existing `/v2/mil` `heavy` (`C17`) or `heli` (`H60`) target with a downstream `/v2/ladd` or `/v2/pia` record that lacks aircraft type `t` overwrites `'heavy'`/`'heli'` with `'fast-mil'` (or `'jet'`). Similarly, [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L1503) lets `'jet'` local `/v2/point` frames overwrite richer global military airframe classes, and `syncAdsbSecondaryRegistries` replaces `adsb-uas` / `adsb-lta` records without retaining `isMilitary` / `isLadd` / `isPia` and optional airframe metadata.
+- **Fix Recipe:** Introduce a helper ranking airframe specificity (`heli`/`heavy` > `fast-mil` > `prop` > `jet`) when merging ICAO `hex` matches across `/v2/{mil,ladd,pia}`, local/global flights, and `syncAdsbSecondaryRegistries`, preserving non-empty `aircraftType`, `registration`, and `squawk`.
+
+#### 4. `[DEFECT-S3-04]` (Medium) — `fetchBalloons` Masks SondeHub 503 + WindBorne Cached Seed Behind `status: 'live'` & `Date.now()`
+- **File & Lines:** [balloonsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/balloonsService.ts#L1124-L1164)
+- **Root Cause:** In `scope: 'global'`, when `/sondes` rejects (`503`) while `/amateur` returns `200 {}` (`0` telemetry records) and WindBorne falls back to cached `./data/windborne-balloons.json` (`wbStatus: 'cached'`, `isCachedSeed: true`), `sondeOk` evaluates `true` (`amateurRes.status === 'fulfilled'`). Line 1134 then emits `status: 'live'` and line 1164 stamps `timestampMs: Date.now()` instead of reporting `'cached'` and preserving `windborneRes.timestampMs`.
+- **Fix Recipe:** When `wbStatus === 'cached'` and SondeHub contributed `0` live entities (especially when `sondesRes.status === 'rejected'`), return `status: 'cached'` and `timestampMs: windborneRes.timestampMs` instead of synthesizing `'live'` telemetry timestamps.
+
+#### 5. `[DEFECT-S3-05]` (Medium) — `TopTelemetryBar` System Beacon Masks Local `flights: 'error'` as `FEEDS LIVE` When `balloons: 'live'`
+- **File & Lines:** [TopTelemetryBar.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/hud/TopTelemetryBar.tsx#L63-L93)
+- **Root Cause:** `resolveSystemBeacon` evaluates `if (flights === 'live' || military === 'live' || balloons === 'live')` at line 77 before checking `if (flights === 'error')` at line 80 (and omits `military === 'error'` checks entirely). An active local ADS-B outage (`flights: 'error'`) is hidden behind a green `FEEDS LIVE` beacon whenever SondeHub/WindBorne balloons are `'live'`.
+- **Fix Recipe:** Check `flights === 'error'` (and `military === 'error'` when `atmosphericScope === 'global'`) prior to resolving a green `'live'` beacon state when primary ADS-B flight feeds are unhealthy.
+
+#### 6. `[DEFECT-S3-06]` (Medium) — `App.tsx` Runs 60fps WGS-84 Extrapolation on Disabled Atmospheric Layers & Delays WindBorne Pruning on `GLOBAL -> LOCAL`
+- **Files & Lines:** [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L973-L989), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L1408), [App.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/App.tsx#L1521-L1529)
+- **Root Cause:** `stepKinematics` iterates all entries in `rawGlobalFlights`, `rawBalloons`, `rawAdsbBalloons`, `rawDrones`, and `rawAdsbDrones` through WGS-84 ECEF/ENU `pushAtmospheric` on every animation frame even when `st.layers.balloon`, `st.layers.military`, or `st.layers.drone` is `false` (discarding only downstream at line 1408 inside `pushExtrapolatedEntity`). Furthermore, the `GLOBAL -> LOCAL` scope transition handler synchronously clears `rawGlobalFlights` and `globalAdsb*` entries, but leaves global `subSource === 'windborne'` / out-of-range balloons inside `liveKinematicsRegistry.rawBalloons` until an async SondeHub fetch returns.
+- **Fix Recipe:** Gate each `pushAtmospheric` loop in `stepKinematics` on its corresponding `st.layers.*` toggle (`layers.military`, `layers.balloon`, `layers.drone`) and synchronously prune `subSource === 'windborne'` / out-of-range balloons from `liveKinematicsRegistry.rawBalloons` in the `atmosphericScope === 'local'` effect.
+
+#### 7. `[DEFECT-S3-07]` (Low) — Secondary Proxy `404` Latches `globalViteProxyUnavailable` Permanently & `B6` UAS Compliance Gate Uses MSL Not AGL
+- **File & Lines:** [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L812), [flightsService.ts](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/services/flightsService.ts#L1855-L1863)
+- **Root Cause:** (A) If the primary `/api-proxy/adsb-lol` returns transient `503` and failover hits a secondary proxy (e.g., `airplanes-live/v2/ladd`) returning JSON `404`, lines 1855–1863 latch `globalViteProxyUnavailable = true` globally, blocking primary `/api-proxy/adsb-lol` on subsequent cycles. (B) Line 812 checks `core.altM <= 500` (MSL) instead of `core.altM - (observer.altM ?? 0) <= 500` (AGL), causing `B6` UAS compliance / FAA UASFM ceiling checks to be skipped at high-elevation US airports (e.g., Denver `1,655 m` MSL).
+- **Fix Recipe:** Latch `globalViteProxyUnavailable` strictly on `/api-proxy/adsb-lol` `404`/`405` or HTML static fallback responses, and compute AGL height `(core.altM - (observer.altM ?? 0))` at line 812.
+
+#### 8. `[DEFECT-S3-08]` (Low) — Tablet (`768px–1040px`) Dock / Inspector Squeeze & Mobile SkyDome Legend Overlap
+- **Files & Lines:** [cockpit.css](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/styles/cockpit.css#L1164-L1177), [cockpit.css](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/styles/cockpit.css#L1758-L1762), [cockpit.css](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/styles/cockpit.css#L2360-L2366), [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L2042)
+- **Root Cause:** Inside `@media (min-width: 768px) and (max-width: 1440px)` when `.target-inspector.is-open` shifts `.control-dock-wrap` to `right: 364px` (leaving ~`404px` width at `768px`), `.dock-pill` lacks `flex-wrap: wrap`, squeezing dock controls horizontally. Meanwhile, the bottom-right legend in [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L2042) carries inline `bottom: 8px` positioning with no `.skydome-legend` CSS class hook to clear the stacked mobile `ControlDock` at `<= 767px`.
+- **Fix Recipe:** Add `.dock-pill { flex-wrap: wrap; justify-content: center; }` within `@media (min-width: 768px) and (max-width: 1120px)` when inspector is open, add `className="skydome-legend"` in [PolarSkyDome.tsx](file:///c:/krunked_skymap/.worktrees/astro-redteam/src/components/skydome/PolarSkyDome.tsx#L2042), and lift `.skydome-legend` under `@media (max-width: 767px)` (`bottom: 92px !important`).
+
+### Exact Verification Commands & Counts (Round 1 Challenge)
+```powershell
+$env:PATH = "$env:LOCALAPPDATA\nodejs-v22;$env:PATH"
+npm run typecheck
+npx vitest run --pool=vmThreads
+```
+- `npm run typecheck` -> **PASS (exit 0)**
+- `npx vitest run --pool=vmThreads` -> **3 test files | 93 tests: 85 passed, 8 failed (`[DEFECT-S3-01]` – `[DEFECT-S3-08]` intentional Sprint 03 challenge probes)**
+  - `tests/unit/math.test.ts` -> **19 / 19 PASS**
+  - `tests/unit/ingest.test.ts` -> **34 / 34 PASS**
+  - `tests/adversarial/chaos.test.ts` -> **32 / 40 PASS** (`Challenge 1`–`Challenge 7`: `27 / 27 PASS`; `Challenge 8`: `5 / 13 PASS`, `8 / 8 [DEFECT-S3-*]` FAIL as expected before remediation)
+  - Scale timings observed: `Challenge 3` 2,000-sat median `45.40ms` (`visible=96`); `Challenge 8` `wb1000=19.90ms`, `mil500=6.85ms`, `sat2000=47.69ms`.
+
