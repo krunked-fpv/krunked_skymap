@@ -50,6 +50,32 @@ export function normalizeAzimuthDeg(deg: number): number {
   return wrapped >= 360 || wrapped === 0 ? 0 : wrapped;
 }
 
+/**
+ * Signed shortest-arc angular delta from `fromDeg` to `toDeg` in degrees within [-180, 180].
+ * Positive means clockwise rotation; negative means counter-clockwise.
+ */
+export function shortestAngleDeltaDeg(fromDeg: number, toDeg: number): number {
+  if (!Number.isFinite(fromDeg) || !Number.isFinite(toDeg)) return 0;
+  const diffRad = (toDeg - fromDeg) * DEG_TO_RAD;
+  const delta = Math.atan2(Math.sin(diffRad), Math.cos(diffRad)) * RAD_TO_DEG;
+  return delta === 0 ? 0 : delta;
+}
+
+/**
+ * Wrap-safe circular low-pass filter for compass heading smoothing across the 359° <-> 0° seam.
+ */
+export function smoothCompassHeadingDeg(
+  currentDeg: number,
+  targetDeg: number,
+  alpha = 0.18
+): number {
+  if (!Number.isFinite(targetDeg)) return normalizeAzimuthDeg(currentDeg);
+  if (!Number.isFinite(currentDeg)) return normalizeAzimuthDeg(targetDeg);
+  const clampedAlpha = Number.isFinite(alpha) ? Math.max(0, Math.min(1, alpha)) : 0.18;
+  const delta = shortestAngleDeltaDeg(currentDeg, targetDeg);
+  return normalizeAzimuthDeg(currentDeg + delta * clampedAlpha);
+}
+
 /** Convert WGS-84 geodetic coordinates (deg, deg, m) into ECEF coordinates in meters. */
 export function geodeticToEcef(
   latDeg: number,
@@ -699,6 +725,7 @@ export function elevationToVaultNormR(elDeg: number, zoomMode: SkyDomeZoomMode =
 
 /**
  * Project topocentric (azDeg, elDeg) onto the circular sky-dome canvas with strict horizon/minEl culling.
+ * When `rotationDeg` is set to heading theta, azimuth theta sits at 12 o'clock (top of dome).
  */
 export function projectToSkyDome(
   azDeg: number,
@@ -706,7 +733,8 @@ export function projectToSkyDome(
   cx: number,
   cy: number,
   radius: number,
-  zoomMode: SkyDomeZoomMode = 'hemisphere'
+  zoomMode: SkyDomeZoomMode = 'hemisphere',
+  rotationDeg = 0
 ): SkyDomeProjectionPoint {
   const safeCx = Number.isFinite(cx) ? cx : 0;
   const safeCy = Number.isFinite(cy) ? cy : 0;
@@ -723,9 +751,11 @@ export function projectToSkyDome(
     return { x: safeCx, y: safeCy, r: 0, normR: 0, visible: false };
   }
 
+  const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
   const normR = elevationToVaultNormR(elDeg, zoomMode);
   const r = normR * radius;
-  const theta = ((normalizeAzimuthDeg(azDeg) - 90) * Math.PI) / 180;
+  const displayAzDeg = normalizeAzimuthDeg(azDeg - safeRot);
+  const theta = ((displayAzDeg - 90) * Math.PI) / 180;
   return {
     x: cx + r * Math.cos(theta),
     y: cy + r * Math.sin(theta),
@@ -736,7 +766,8 @@ export function projectToSkyDome(
 }
 
 /**
- * Invert sky-dome canvas coordinates back to (azimuthDeg, elevationDeg) via safeguarded Newton-Raphson.
+ * Invert sky-dome canvas coordinates back to true topocentric (azimuthDeg, elevationDeg)
+ * via safeguarded Newton-Raphson, accounting for `rotationDeg` heading orientation.
  */
 export function unprojectFromSkyDome(
   px: number,
@@ -744,7 +775,8 @@ export function unprojectFromSkyDome(
   cx: number,
   cy: number,
   radius: number,
-  zoomMode: SkyDomeZoomMode = 'hemisphere'
+  zoomMode: SkyDomeZoomMode = 'hemisphere',
+  rotationDeg = 0
 ): SkyDomeUnprojectionResult {
   const minEl = skyDomeMinElevation(zoomMode);
   if (
@@ -758,10 +790,12 @@ export function unprojectFromSkyDome(
     return { azimuthDeg: 0, elevationDeg: minEl, inBounds: false };
   }
 
+  const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
   const dx = px - cx;
   const dy = py - cy;
   const dist = Math.hypot(dx, dy);
-  const azimuthDeg = dist < 1e-12 ? 0 : normalizeAzimuthDeg(Math.atan2(dy, dx) * RAD_TO_DEG + 90);
+  const azimuthDeg =
+    dist < 1e-12 ? 0 : normalizeAzimuthDeg(Math.atan2(dy, dx) * RAD_TO_DEG + 90 + safeRot);
   const inBounds = dist <= radius + 1e-6;
   const normR = Math.max(0, Math.min(1, dist / radius));
 
@@ -819,7 +853,8 @@ export function projectEnuToSkyDome(
   cy: number,
   radius: number,
   zoomMode: SkyDomeZoomMode = 'hemisphere',
-  allowBelowMinEl = false
+  allowBelowMinEl = false,
+  rotationDeg = 0
 ): SkyDomeProjectionPoint {
   const safeCx = Number.isFinite(cx) ? cx : 0;
   const safeCy = Number.isFinite(cy) ? cy : 0;
@@ -856,8 +891,18 @@ export function projectEnuToSkyDome(
   const fMin = vaultCurveValue(minEl);
   const k = (radius / fMin) * scale;
 
-  const dx = k * e;
-  const dy = -k * n;
+  const dx0 = k * e;
+  const dy0 = -k * n;
+  const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
+  let dx = dx0;
+  let dy = dy0;
+  if (safeRot !== 0) {
+    const phi = safeRot * DEG_TO_RAD;
+    const cosPhi = Math.cos(phi);
+    const sinPhi = Math.sin(phi);
+    dx = dx0 * cosPhi + dy0 * sinPhi;
+    dy = -dx0 * sinPhi + dy0 * cosPhi;
+  }
   const r = Math.hypot(dx, dy);
 
   return {
@@ -959,10 +1004,13 @@ export function computeSkyDomeTrajectoryTangent(
   cx: number,
   cy: number,
   radius: number,
-  zoomMode: SkyDomeZoomMode = 'hemisphere'
+  zoomMode: SkyDomeZoomMode = 'hemisphere',
+  rotationDeg = 0
 ): number {
   const safeHeading = Number.isFinite(target.headingDeg) ? (target.headingDeg as number) : 0;
-  const fallbackAngle = ((safeHeading - 90) * Math.PI) / 180;
+  const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
+  const fallbackRaw = ((safeHeading - safeRot - 90) * Math.PI) / 180;
+  const fallbackAngle = Math.atan2(Math.sin(fallbackRaw), Math.cos(fallbackRaw));
 
   let state = computeTargetEnuState(observer, target);
   if (target.headingValid !== false && Math.hypot(state.ve, state.vn, state.vu) <= 0.1) {
@@ -978,8 +1026,28 @@ export function computeSkyDomeTrajectoryTangent(
   const dt = Math.max(0.25, Math.min(10, (0.005 * Math.max(100, slantRangeM)) / Math.max(1, vMag)));
   const half = 0.5 * dt;
 
-  const pMinus = projectEnuToSkyDome(e - ve * half, n - vn * half, u - vu * half, cx, cy, radius, zoomMode, true);
-  const pPlus = projectEnuToSkyDome(e + ve * half, n + vn * half, u + vu * half, cx, cy, radius, zoomMode, true);
+  const pMinus = projectEnuToSkyDome(
+    e - ve * half,
+    n - vn * half,
+    u - vu * half,
+    cx,
+    cy,
+    radius,
+    zoomMode,
+    true,
+    safeRot
+  );
+  const pPlus = projectEnuToSkyDome(
+    e + ve * half,
+    n + vn * half,
+    u + vu * half,
+    cx,
+    cy,
+    radius,
+    zoomMode,
+    true,
+    safeRot
+  );
 
   const dx = pPlus.x - pMinus.x;
   const dy = pPlus.y - pMinus.y;

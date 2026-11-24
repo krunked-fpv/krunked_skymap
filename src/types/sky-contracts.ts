@@ -23,6 +23,19 @@ export type AtmosphericScope = 'local' | 'global';
 
 export type SkyDomeZoomMode = 'hemisphere' | 'zenith';
 
+/** Primary high-overhead cone threshold (degrees above local horizon). */
+export const OVERHEAD_PRIMARY_MIN_EL_DEG = 45;
+
+/** Fallback overhead cone threshold when no targets are >= 45 deg. */
+export const OVERHEAD_FALLBACK_MIN_EL_DEG = 20;
+
+export interface SkyDomeOrientationState {
+  domeRotationDeg: number;
+  domeRotationLocked: boolean;
+  domeCompassActive: boolean;
+  domeCompassSupported: boolean | null;
+}
+
 export type TwilightState = 'day' | 'civil-twilight' | 'nautical-twilight' | 'night';
 
 export interface CelestialBodyPosition {

@@ -1,5 +1,7 @@
 import { create } from 'zustand';
 import {
+  OVERHEAD_FALLBACK_MIN_EL_DEG,
+  OVERHEAD_PRIMARY_MIN_EL_DEG,
   type AirspaceData,
   type AtmosphericScope,
   type BalloonEntity,
@@ -22,10 +24,11 @@ import {
   type SkyEntity,
   type UnitSystem,
 } from '../types/sky-contracts';
-import { haversineDistanceKm } from '../math/geodesy';
+import { haversineDistanceKm, normalizeAzimuthDeg } from '../math/geodesy';
 
 export interface SkyCounts extends Record<SkyCategory, number> {
   overhead: number;
+  overheadConeDeg?: 45 | 20;
   total: number;
 }
 
@@ -65,6 +68,7 @@ export interface UrlHydrationPatch {
   atmosphericScope?: AtmosphericScope;
   skyDomePip?: boolean;
   skyDomeZoom?: SkyDomeZoomMode;
+  domeRotationDeg?: number;
   selectedId?: string | null;
 }
 
@@ -84,6 +88,10 @@ export interface SkyStoreState {
   layout: LayoutMode;
   skyDomePip: boolean;
   skyDomeZoom: SkyDomeZoomMode;
+  domeRotationDeg: number;
+  domeRotationLocked: boolean;
+  domeCompassActive: boolean;
+  domeCompassSupported: boolean | null;
   audioEnabled: boolean;
   audioVolume: number;
   sweepEnabled: boolean;
@@ -138,6 +146,13 @@ export interface SkyStoreState {
   toggleSkyDomePip: () => void;
   setSkyDomeZoom: (zoom: SkyDomeZoomMode) => void;
   toggleSkyDomeZoom: () => void;
+  setDomeRotationDeg: (deg: number, options?: { force?: boolean }) => void;
+  setDomeRotationLocked: (locked: boolean) => void;
+  toggleDomeRotationLock: () => void;
+  setDomeCompassActive: (active: boolean) => void;
+  setDomeCompassSupported: (supported: boolean | null) => void;
+  resetDomeNorth: () => void;
+  lockHighestOverheadTarget: () => string | null;
   setAudioEnabled: (enabled: boolean) => void;
   setAudioVolume: (volume: number) => void;
   setSweepEnabled: (enabled: boolean) => void;
@@ -356,7 +371,61 @@ const createInitialFeeds = (): Record<FeedKey, FeedTelemetryState> => ({
   },
 });
 
-export const useSkyStore = create<SkyStoreState>((set) => ({
+export type OverheadSelectionContext = Pick<
+  SkyStoreState,
+  'layers' | 'satGroups' | 'balloonSublayers' | 'droneSublayers'
+>;
+
+/**
+ * Collect visible overhead targets sorted deterministically by descending elevation,
+ * ascending slant range, and ID. Prefers targets in the high overhead cone (EL >= 45 deg),
+ * falling back to EL >= 20 deg when the primary cone is empty.
+ */
+export function getOverheadCandidates(ctx: OverheadSelectionContext): {
+  candidates: SkyEntity[];
+  coneMinElDeg: 45 | 20;
+} {
+  const primary: SkyEntity[] = [];
+  const fallback: SkyEntity[] = [];
+
+  for (const entity of liveKinematicsRegistry.entities.values()) {
+    if (!ctx.layers[entity.category]) continue;
+    if (entity.category === 'satellite' && !ctx.satGroups[entity.group]) continue;
+    if (entity.category === 'balloon' && !isBalloonSublayerEnabled(entity, ctx.balloonSublayers)) {
+      continue;
+    }
+    if (entity.category === 'drone' && !isDroneSublayerEnabled(entity, ctx.droneSublayers)) {
+      continue;
+    }
+    const el = entity.topocentric?.elevationDeg;
+    if (!Number.isFinite(el) || el < OVERHEAD_FALLBACK_MIN_EL_DEG) continue;
+    if (el >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+      primary.push(entity);
+    } else {
+      fallback.push(entity);
+    }
+  }
+
+  const coneMinElDeg: 45 | 20 = primary.length > 0 ? 45 : 20;
+  const candidates = primary.length > 0 ? primary : fallback;
+  candidates.sort((a, b) => {
+    if (b.topocentric.elevationDeg !== a.topocentric.elevationDeg) {
+      return b.topocentric.elevationDeg - a.topocentric.elevationDeg;
+    }
+    const aRng = Number.isFinite(a.topocentric.slantRangeKm)
+      ? a.topocentric.slantRangeKm
+      : Number.POSITIVE_INFINITY;
+    const bRng = Number.isFinite(b.topocentric.slantRangeKm)
+      ? b.topocentric.slantRangeKm
+      : Number.POSITIVE_INFINITY;
+    if (aRng !== bRng) return aRng - bRng;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+  });
+
+  return { candidates, coneMinElDeg };
+}
+
+export const useSkyStore = create<SkyStoreState>((set, get) => ({
   observer: { ...PENDING_OBSERVER },
   locationStatus: 'locating',
   locationError: null,
@@ -390,6 +459,10 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   layout: 'split',
   skyDomePip: true,
   skyDomeZoom: 'hemisphere',
+  domeRotationDeg: 0,
+  domeRotationLocked: false,
+  domeCompassActive: false,
+  domeCompassSupported: null,
   audioEnabled: false,
   audioVolume: 0.35,
   sweepEnabled: true,
@@ -595,6 +668,35 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     set((state) => ({
       skyDomeZoom: state.skyDomeZoom === 'hemisphere' ? 'zenith' : 'hemisphere',
     })),
+  setDomeRotationDeg: (deg, options) =>
+    set((state) => {
+      if (!Number.isFinite(deg)) return {};
+      if (state.domeRotationLocked && !options?.force) return {};
+      return { domeRotationDeg: normalizeAzimuthDeg(deg) };
+    }),
+  setDomeRotationLocked: (domeRotationLocked) => set({ domeRotationLocked }),
+  toggleDomeRotationLock: () =>
+    set((state) => ({ domeRotationLocked: !state.domeRotationLocked })),
+  setDomeCompassActive: (domeCompassActive) => set({ domeCompassActive }),
+  setDomeCompassSupported: (domeCompassSupported) => set({ domeCompassSupported }),
+  resetDomeNorth: () => set({ domeRotationDeg: 0, domeCompassActive: false }),
+  lockHighestOverheadTarget: () => {
+    const state = get();
+    const { candidates } = getOverheadCandidates(state);
+    if (candidates.length === 0) return null;
+    const currIdx =
+      state.inspectorOpen && state.selectedId
+        ? candidates.findIndex((entity) => entity.id === state.selectedId)
+        : -1;
+    const nextTarget =
+      currIdx >= 0 ? candidates[(currIdx + 1) % candidates.length] : candidates[0];
+    set({
+      selectedId: nextTarget.id,
+      inspectorOpen: true,
+      selectedEntitySnapshot: { ...nextTarget },
+    });
+    return nextTarget.id;
+  },
   setAudioEnabled: (audioEnabled) => set({ audioEnabled }),
   setAudioVolume: (audioVolume) =>
     set({ audioVolume: Math.max(0, Math.min(1, audioVolume)) }),
@@ -720,6 +822,10 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
         atmosphericScope: nextScope,
         skyDomePip: patch.skyDomePip ?? state.skyDomePip,
         skyDomeZoom: patch.skyDomeZoom ?? state.skyDomeZoom,
+        domeRotationDeg:
+          patch.domeRotationDeg !== undefined && Number.isFinite(patch.domeRotationDeg)
+            ? normalizeAzimuthDeg(patch.domeRotationDeg)
+            : state.domeRotationDeg,
         selectedId: patch.selectedId !== undefined ? patch.selectedId : state.selectedId,
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
