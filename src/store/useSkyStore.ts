@@ -1,6 +1,5 @@
 import { create } from 'zustand';
 import {
-  AEROSPACE_PRESETS,
   type AirspaceData,
   type AtmosphericScope,
   type BalloonEntity,
@@ -12,6 +11,7 @@ import {
   type FlightEntity,
   type LayoutMode,
   type ObserverLocation,
+  type ObserverLocationStatus,
   type OpenDroneIdConfig,
   type OrbitalScope,
   type SatelliteEntity,
@@ -70,6 +70,8 @@ export interface UrlHydrationPatch {
 
 export interface SkyStoreState {
   observer: ObserverLocation;
+  locationStatus: ObserverLocationStatus;
+  locationError: string | null;
   radiusKm: number;
   layers: Record<SkyCategory, boolean>;
   satGroups: Record<SatelliteGroup, boolean>;
@@ -111,6 +113,13 @@ export interface SkyStoreState {
   selectedEntitySnapshot: SkyEntity | null;
 
   setObserver: (observer: ObserverLocation) => void;
+  updateObserverLabel: (
+    expectedLat: number,
+    expectedLon: number,
+    expectedSource: ObserverLocation['source'],
+    label: string
+  ) => void;
+  setLocationStatus: (status: ObserverLocationStatus, error?: string | null) => void;
   setRadiusKm: (radiusKm: number) => void;
   toggleLayer: (category: SkyCategory) => void;
   setLayer: (category: SkyCategory, enabled: boolean) => void;
@@ -160,7 +169,15 @@ export interface SkyStoreState {
   hydrateFromUrlState: (patch: UrlHydrationPatch) => void;
 }
 
-const defaultPreset = AEROSPACE_PRESETS[0];
+export const PENDING_OBSERVER: ObserverLocation = {
+  lat: 0,
+  lon: 0,
+  altM: 0,
+  label: 'Locating…',
+  source: 'pending',
+};
+
+export const DEFAULT_SCAN_RADIUS_KM = 120;
 
 const EMPTY_FC: GeoJSON.FeatureCollection = {
   type: 'FeatureCollection',
@@ -340,14 +357,10 @@ const createInitialFeeds = (): Record<FeedKey, FeedTelemetryState> => ({
 });
 
 export const useSkyStore = create<SkyStoreState>((set) => ({
-  observer: {
-    lat: defaultPreset.lat,
-    lon: defaultPreset.lon,
-    altM: defaultPreset.altM,
-    label: defaultPreset.name,
-    source: 'default',
-  },
-  radiusKm: defaultPreset.defaultRadiusKm,
+  observer: { ...PENDING_OBSERVER },
+  locationStatus: 'locating',
+  locationError: null,
+  radiusKm: DEFAULT_SCAN_RADIUS_KM,
   layers: {
     flight: true,
     military: true,
@@ -423,7 +436,31 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   selectedEntitySnapshot: null,
 
   setObserver: (observer) =>
-    set((state) => ({ observer, recenterNonce: state.recenterNonce + 1 })),
+    set((state) => ({
+      observer,
+      locationStatus: observer.source === 'pending' ? 'locating' : 'ready',
+      locationError: null,
+      recenterNonce: state.recenterNonce + 1,
+    })),
+  updateObserverLabel: (expectedLat, expectedLon, expectedSource, label) =>
+    set((state) => {
+      if (
+        state.observer.source !== expectedSource ||
+        Math.abs(state.observer.lat - expectedLat) > 1e-5 ||
+        Math.abs(state.observer.lon - expectedLon) > 1e-5 ||
+        state.observer.label === label
+      ) {
+        return {};
+      }
+      return {
+        observer: {
+          ...state.observer,
+          label,
+        },
+      };
+    }),
+  setLocationStatus: (locationStatus, locationError = null) =>
+    set({ locationStatus, locationError }),
   setRadiusKm: (radiusKm) =>
     set({ radiusKm: Math.max(10, Math.min(250, Math.round(radiusKm))) }),
   toggleLayer: (category) =>
@@ -672,6 +709,8 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
       }
       return {
         observer: nextObserver,
+        locationStatus: patch.observer ? 'ready' : state.locationStatus,
+        locationError: patch.observer ? null : state.locationError,
         recenterNonce: patch.observer ? state.recenterNonce + 1 : state.recenterNonce,
         radiusKm: nextRadiusKm,
         layers: nextLayers,

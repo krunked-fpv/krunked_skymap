@@ -2593,3 +2593,131 @@ select {
   bottom: env(safe-area-inset-bottom);
   right: env(safe-area-inset-right);
 }
+
+/* ==========================================================================
+   Live Geographic Location Controls & Acquisition Gate Overlay
+   ========================================================================== */
+
+.topbar-locate-btn {
+  flex-shrink: 0;
+}
+
+.topbar-locate-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.location-gate-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 42;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  pointer-events: none;
+}
+
+.location-gate-card {
+  pointer-events: auto;
+  width: 100%;
+  max-width: 390px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 16px 18px;
+  border-radius: 14px;
+  background: var(--bg-panel-strong);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--border-hairline-strong);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.72), inset 0 1px 0 var(--border-specular);
+  color: var(--text-primary);
+}
+
+.location-gate-card--unavailable {
+  border-color: rgba(245, 158, 11, 0.42);
+}
+
+.location-gate-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.location-gate-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--cat-flight);
+  box-shadow: 0 0 10px var(--cat-flight);
+  animation: pulse-beacon 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.location-gate-card__kicker {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--text-bright);
+}
+
+.location-gate-card__desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.location-gate-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+
+.location-gate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.location-gate-btn--primary {
+  border: 1px solid rgba(56, 189, 248, 0.48);
+  background: rgba(56, 189, 248, 0.16);
+  color: var(--accent-sky);
+}
+
+.location-gate-btn--primary:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.26);
+  border-color: rgba(56, 189, 248, 0.68);
+}
+
+.location-gate-btn--primary:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.location-gate-btn--ghost {
+  border: 1px solid var(--border-hairline-strong);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-primary);
+}
+
+.location-gate-btn--ghost:hover {
+  background: rgba(255, 255, 255, 0.09);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+

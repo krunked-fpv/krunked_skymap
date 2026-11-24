@@ -180,6 +180,7 @@ export function ControlDock({
   gpsError = null,
 }: ControlDockProps) {
   const observer = useSkyStore((s) => s.observer);
+  const locationStatus = useSkyStore((s) => s.locationStatus);
   const setObserver = useSkyStore((s) => s.setObserver);
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const setRadiusKm = useSkyStore((s) => s.setRadiusKm);
@@ -379,11 +380,12 @@ export function ControlDock({
   };
 
   const matchedPresetId = useMemo(() => {
+    if (observer.source === 'pending') return '';
     const match = AEROSPACE_PRESETS.find(
       (p) => Math.abs(p.lat - observer.lat) < 0.002 && Math.abs(p.lon - observer.lon) < 0.002,
     );
     return match?.id ?? '';
-  }, [observer.lat, observer.lon]);
+  }, [observer.lat, observer.lon, observer.source]);
 
   const handlePresetSelect = (presetId: string) => {
     const preset = AEROSPACE_PRESETS.find((p) => p.id === presetId);
@@ -736,7 +738,11 @@ export function ControlDock({
                 <div className="command-palette__section-head" style={{ marginBottom: 7 }}>
                   <span>Aerospace Hotspot Presets</span>
                   <span className="tabular">
-                    ACTIVE: {observer.label} ({formatCoords(observer.lat, observer.lon, 2)})
+                    {observer.source === 'pending'
+                      ? locationStatus === 'unavailable'
+                        ? 'ACTIVE: AWAITING LOCATION'
+                        : 'ACTIVE: ACQUIRING LOCATION…'
+                      : `ACTIVE: ${observer.label} (${formatCoords(observer.lat, observer.lon, 2)})`}
                   </span>
                 </div>
                 <div className="command-palette__presets">

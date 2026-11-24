@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Crosshair, Search } from 'lucide-react';
 import {
   type AtmosphericScope,
   type BalloonEntity,
@@ -28,6 +29,12 @@ import { fetchBalloons } from './services/balloonsService';
 import { evaluateDroneAirspaceCompliance, fetchAirspace } from './services/airspaceService';
 import { OpenDroneIdClient, stepSimulatedDrones } from './services/openDroneIdService';
 import { searchLocation } from './services/geocodingService';
+import {
+  fetchIpGeolocation,
+  requestBrowserGeolocation,
+  resolveCurrentGeographicLocation,
+  reverseGeocodeLabel,
+} from './services/locationService';
 import { tacticalAudio } from './audio/tacticalAudio';
 import { TopTelemetryBar } from './components/hud/TopTelemetryBar';
 import { ControlDock, type LocationSearchResult } from './components/hud/ControlDock';
@@ -45,7 +52,23 @@ interface BeforeInstallPromptEvent extends Event {
   prompt(): Promise<void>;
 }
 
-function parseUrlHashPatch(): UrlHydrationPatch | null {
+/**
+ * Detect unpinned legacy default DC hashes auto-written by older builds
+ * so reloading a stale tab or bookmark resolves the user's current geographic location instead.
+ */
+function isLegacyDefaultDcHash(params: URLSearchParams, lat: number, lon: number): boolean {
+  if (params.get('pin') === '1' || params.get('selected')) {
+    return false;
+  }
+  const label = (params.get('label') ?? '').trim();
+  return (
+    Math.abs(lat - 38.8512) < 0.0005 &&
+    Math.abs(lon - -77.0402) < 0.0005 &&
+    (label === 'DC / Potomac Corridor' || label === '')
+  );
+}
+
+function parseUrlHashPatch(options: { ignoreLegacyDefaultDc?: boolean } = {}): UrlHydrationPatch | null {
   if (typeof window === 'undefined' || !window.location.hash) return null;
   const raw = window.location.hash.replace(/^#/, '');
   if (!raw) return null;
@@ -66,14 +89,18 @@ function parseUrlHashPatch(): UrlHydrationPatch | null {
       lon >= -180 &&
       lon <= 180
     ) {
-      const altParam = Number.parseFloat(params.get('alt') ?? '12');
-      patch.observer = {
-        lat,
-        lon,
-        altM: Number.isFinite(altParam) ? altParam : 12,
-        label: params.get('label') || `${lat.toFixed(2)}, ${lon.toFixed(2)}`,
-        source: 'url',
-      };
+      const skipLegacyDc =
+        options.ignoreLegacyDefaultDc !== false && isLegacyDefaultDcHash(params, lat, lon);
+      if (!skipLegacyDc) {
+        const altParam = Number.parseFloat(params.get('alt') ?? '12');
+        patch.observer = {
+          lat,
+          lon,
+          altM: Number.isFinite(altParam) ? altParam : 12,
+          label: params.get('label') || `${lat.toFixed(2)}, ${lon.toFixed(2)}`,
+          source: 'url',
+        };
+      }
     }
   }
 
@@ -138,10 +165,18 @@ function parseUrlHashPatch(): UrlHydrationPatch | null {
 function buildUrlHashString(): string {
   const s = useSkyStore.getState();
   const params = new URLSearchParams();
-  params.set('lat', s.observer.lat.toFixed(4));
-  params.set('lon', s.observer.lon.toFixed(4));
-  params.set('alt', String(Math.round(s.observer.altM)));
-  params.set('label', s.observer.label);
+  const isPinnedStation =
+    s.observer.source === 'search' ||
+    s.observer.source === 'manual' ||
+    s.observer.source === 'preset' ||
+    s.observer.source === 'url';
+  if (isPinnedStation) {
+    params.set('pin', '1');
+    params.set('lat', s.observer.lat.toFixed(4));
+    params.set('lon', s.observer.lon.toFixed(4));
+    params.set('alt', String(Math.round(s.observer.altM)));
+    params.set('label', s.observer.label);
+  }
   params.set('r', String(s.radiusKm));
   const activeLayers = ALL_CATEGORIES.filter((cat) => s.layers[cat]);
   params.set('layers', activeLayers.join(','));
@@ -158,6 +193,9 @@ function buildUrlHashString(): string {
 
 export default function App() {
   const observer = useSkyStore((s) => s.observer);
+  const locationStatus = useSkyStore((s) => s.locationStatus);
+  const locationError = useSkyStore((s) => s.locationError);
+  const commandPaletteOpen = useSkyStore((s) => s.commandPaletteOpen);
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const layers = useSkyStore((s) => s.layers);
   const satGroups = useSkyStore((s) => s.satGroups);
@@ -188,6 +226,8 @@ export default function App() {
   const globalAdsbDronesRef = useRef<Map<string, DroneEntity>>(new Map());
   const simStartMsRef = useRef<number>(Date.now());
   const hydratedRef = useRef(false);
+  const autoLocateCancelRef = useRef<(() => void) | null>(null);
+  const reverseGeoAbortRef = useRef<AbortController | null>(null);
 
   const flightsInFlightRef = useRef(false);
   const globalFlightsInFlightRef = useRef(false);
@@ -214,10 +254,9 @@ export default function App() {
   const prevSelectedIdRef = useRef<string | null>(null);
   const prevAtmosphericScopeRef = useRef<AtmosphericScope>(atmosphericScope);
   const prevBalloonSublayersRef = useRef(balloonSublayers);
-  const lastFetchedCoordsRef = useRef<{ lat: number; lon: number }>({
-    lat: observer.lat,
-    lon: observer.lon,
-  });
+  const lastFetchedCoordsRef = useRef<{ lat: number; lon: number } | null>(
+    observer.source === 'pending' ? null : { lat: observer.lat, lon: observer.lon }
+  );
 
   const syncAdsbSecondaryRegistries = useCallback(() => {
     const scope = useSkyStore.getState().atmosphericScope;
@@ -274,55 +313,74 @@ export default function App() {
     liveKinematicsRegistry.rawAdsbDrones = nextDrones;
   }, []);
 
-  // 1. Hydrate from URL permalink immediately once & honor pre-granted geolocation non-blockingly
+  const startAutoLocate = useCallback(() => {
+    autoLocateCancelRef.current?.();
+    const st0 = useSkyStore.getState();
+    if (st0.observer.source === 'pending') {
+      st0.setLocationStatus('locating', null);
+    }
+
+    const cancel = resolveCurrentGeographicLocation({
+      onFix: (fix) => {
+        const st = useSkyStore.getState();
+        if (fix.source === 'ip' && st.observer.source !== 'pending') {
+          return;
+        }
+        if (
+          fix.source === 'gps' &&
+          st.observer.source !== 'pending' &&
+          st.observer.source !== 'ip'
+        ) {
+          return;
+        }
+        st.setObserver({
+          lat: fix.lat,
+          lon: fix.lon,
+          altM: fix.altM,
+          label: fix.label,
+          source: fix.source,
+        });
+      },
+      onLabelResolved: (lat, lon, source, label) => {
+        useSkyStore.getState().updateObserverLabel(lat, lon, source, label);
+      },
+      onUnavailable: (reason) => {
+        const st = useSkyStore.getState();
+        if (st.observer.source === 'pending') {
+          st.setLocationStatus('unavailable', reason);
+        }
+      },
+    });
+
+    autoLocateCancelRef.current = cancel;
+    return () => {
+      cancel();
+      if (autoLocateCancelRef.current === cancel) {
+        autoLocateCancelRef.current = null;
+      }
+    };
+  }, []);
+
+  // 1. Hydrate from explicit URL permalink & always resolve live current geographic location when unpinned
   useEffect(() => {
     if (!hydratedRef.current) {
       hydratedRef.current = true;
-      const patch = parseUrlHashPatch();
+      const patch = parseUrlHashPatch({ ignoreLegacyDefaultDc: true });
       if (patch) {
         useSkyStore.getState().hydrateFromUrlState(patch);
-      } else if (
-        typeof navigator !== 'undefined' &&
-        navigator.permissions?.query &&
-        navigator.geolocation
-      ) {
-        navigator.permissions
-          .query({ name: 'geolocation' })
-          .then((status) => {
-            if (status.state === 'granted') {
-              navigator.geolocation.getCurrentPosition(
-                (pos) => {
-                  const st = useSkyStore.getState();
-                  if (st.observer.source === 'default') {
-                    st.setObserver({
-                      lat: pos.coords.latitude,
-                      lon: pos.coords.longitude,
-                      altM: Number.isFinite(pos.coords.altitude ?? NaN)
-                        ? (pos.coords.altitude as number)
-                        : 12,
-                      label: 'GPS Station',
-                      source: 'gps',
-                    });
-                  }
-                },
-                () => {
-                  // Stay on default aerospace hub silently
-                },
-                { enableHighAccuracy: true, timeout: 6000, maximumAge: 15_000 }
-              );
-            }
-          })
-          .catch(() => {
-            // Permissions API unsupported — keep default hub
-          });
       }
     }
-  }, []);
+
+    if (useSkyStore.getState().observer.source === 'pending') {
+      return startAutoLocate();
+    }
+    return undefined;
+  }, [startAutoLocate]);
 
   // Listen for manual URL hash edits cleanly across React StrictMode mounts
   useEffect(() => {
     const handleHashChange = () => {
-      const nextPatch = parseUrlHashPatch();
+      const nextPatch = parseUrlHashPatch({ ignoreLegacyDefaultDc: false });
       if (nextPatch) {
         useSkyStore.getState().hydrateFromUrlState(nextPatch);
       }
@@ -460,7 +518,7 @@ export default function App() {
 
   // 2. Debounced URL Hash Permalink Synchronization
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || observer.source === 'pending') return;
     const timer = window.setTimeout(() => {
       try {
         const nextHash = buildUrlHashString();
@@ -487,14 +545,16 @@ export default function App() {
           count,
           status: st.feeds.satellites.status === 'idle' ? 'cached' : st.feeds.satellites.status,
         });
-        client.updateConfig({
-          observer: st.observer,
-          radiusKm: st.radiusKm,
-          orbitalScope: st.orbitalScope,
-          activeGroups: st.satGroups,
-          fullConstellation: st.fullConstellation,
-        });
-        client.tick(Date.now());
+        if (st.observer.source !== 'pending') {
+          client.updateConfig({
+            observer: st.observer,
+            radiusKm: st.radiusKm,
+            orbitalScope: st.orbitalScope,
+            activeGroups: st.satGroups,
+            fullConstellation: st.fullConstellation,
+          });
+          client.tick(Date.now());
+        }
       },
       onPropagated: ({ satellites }) => {
         if (disposed) return;
@@ -566,7 +626,7 @@ export default function App() {
     const tickTimer = window.setInterval(() => {
       if (typeof document !== 'undefined' && document.hidden) return;
       const st = useSkyStore.getState();
-      if (st.layers.satellite && st.workerReady) {
+      if (st.layers.satellite && st.workerReady && st.observer.source !== 'pending') {
         client.tick(Date.now());
       } else if (!st.layers.satellite && liveKinematicsRegistry.satellites.size > 0) {
         liveKinematicsRegistry.satellites.clear();
@@ -585,7 +645,7 @@ export default function App() {
   // Push worker configuration whenever observer / radius / scope / groups change
   useEffect(() => {
     const client = astroClientRef.current;
-    if (!client) return;
+    if (!client || observer.source === 'pending') return;
     client.updateConfig({
       observer,
       radiusKm,
@@ -601,7 +661,7 @@ export default function App() {
   // Compute satellite ground track & Sky-Dome pass arc when a satellite is selected
   useEffect(() => {
     const client = astroClientRef.current;
-    if (!selectedId || !selectedId.startsWith('sat-')) {
+    if (!selectedId || !selectedId.startsWith('sat-') || observer.source === 'pending') {
       liveKinematicsRegistry.orbitOverlay = null;
       return;
     }
@@ -617,7 +677,7 @@ export default function App() {
     void client.computeOrbit(noradId, Date.now(), observer);
     const timer = window.setInterval(() => {
       const st = useSkyStore.getState();
-      if (st.selectedId === selectedId && st.workerReady) {
+      if (st.selectedId === selectedId && st.workerReady && st.observer.source !== 'pending') {
         void client.computeOrbit(noradId, Date.now(), st.observer);
       }
     }, 15_000);
@@ -629,6 +689,7 @@ export default function App() {
   const runFlightsRefresh = useCallback(
     async (force = false, resetBreakers = false, abortPrevious = false) => {
       if (typeof document !== 'undefined' && document.hidden && !force) return;
+      if (useSkyStore.getState().observer.source === 'pending') return;
       if (abortPrevious && flightsAbortRef.current) {
         flightsAbortRef.current.abort();
         flightsAbortRef.current = null;
@@ -730,6 +791,7 @@ export default function App() {
     async (force = false, resetBreakers = false, abortPrevious = false) => {
       if (typeof document !== 'undefined' && document.hidden && !force) return;
       const st0 = useSkyStore.getState();
+      if (st0.observer.source === 'pending') return;
       if (st0.atmosphericScope !== 'global') return;
       if (abortPrevious && globalFlightsAbortRef.current) {
         globalFlightsAbortRef.current.abort();
@@ -832,6 +894,7 @@ export default function App() {
 
   const runBalloonsRefresh = useCallback(
     async (force = false, resetBreakers = false, abortPrevious = false) => {
+      if (useSkyStore.getState().observer.source === 'pending') return;
       if (abortPrevious && balloonsAbortRef.current) {
         balloonsAbortRef.current.abort();
         balloonsAbortRef.current = null;
@@ -907,6 +970,7 @@ export default function App() {
   );
 
   const runAirspaceRefresh = useCallback(async (abortPrevious = false) => {
+    if (useSkyStore.getState().observer.source === 'pending') return;
     if (abortPrevious && airspaceAbortRef.current) {
       airspaceAbortRef.current.abort();
       airspaceAbortRef.current = null;
@@ -961,6 +1025,10 @@ export default function App() {
   // Abort active fetch controllers cleanly on App unmount
   useEffect(() => {
     return () => {
+      autoLocateCancelRef.current?.();
+      autoLocateCancelRef.current = null;
+      reverseGeoAbortRef.current?.abort();
+      reverseGeoAbortRef.current = null;
       flightsAbortRef.current?.abort();
       globalFlightsAbortRef.current?.abort();
       balloonsAbortRef.current?.abort();
@@ -970,12 +1038,12 @@ export default function App() {
 
   // Refresh feeds on observer/radius change (purging distant targets immediately on >50km jumps)
   useEffect(() => {
-    const jumpKm = haversineDistanceKm(
-      lastFetchedCoordsRef.current.lat,
-      lastFetchedCoordsRef.current.lon,
-      observer.lat,
-      observer.lon
-    );
+    if (observer.source === 'pending') return undefined;
+
+    const prevCoords = lastFetchedCoordsRef.current;
+    const jumpKm = prevCoords
+      ? haversineDistanceKm(prevCoords.lat, prevCoords.lon, observer.lat, observer.lon)
+      : Number.POSITIVE_INFINITY;
     lastFetchedCoordsRef.current = { lat: observer.lat, lon: observer.lon };
 
     if (jumpKm > 50) {
@@ -1017,6 +1085,7 @@ export default function App() {
   }, [
     observer.lat,
     observer.lon,
+    observer.source,
     radiusKm,
     runFlightsRefresh,
     runGlobalFlightsRefresh,
@@ -1248,6 +1317,7 @@ export default function App() {
   useEffect(() => {
     const tickDrones = () => {
       const st = useSkyStore.getState();
+      if (st.observer.source === 'pending') return;
       const combined = new Map<string, DroneEntity>();
 
       if (st.odidConfig.simulatorEnabled && st.droneSublayers.simOdid) {
@@ -1372,6 +1442,13 @@ export default function App() {
       const nowMs = Date.now();
       const st = useSkyStore.getState();
       const obs = st.observer;
+      if (obs.source === 'pending') {
+        if (liveKinematicsRegistry.entities.size > 0) {
+          liveKinematicsRegistry.entities.clear();
+          liveKinematicsRegistry.version += 1;
+        }
+        return;
+      }
       const nextEntities = new Map<string, SkyEntity>();
 
       const counts = {
@@ -1733,34 +1810,82 @@ export default function App() {
 
   // 8. Control Handlers
   const handleLocateGps = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) {
-      setGpsError('Geolocation API is unavailable in this browser.');
-      return;
-    }
+    autoLocateCancelRef.current?.();
+    autoLocateCancelRef.current = null;
+    reverseGeoAbortRef.current?.abort();
+    const revController = new AbortController();
+    reverseGeoAbortRef.current = revController;
+
     setGpsBusy(true);
     setGpsError(null);
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
+
+    void requestBrowserGeolocation({
+      highAccuracyTimeoutMs: 8000,
+      coarseTimeoutMs: 8000,
+      maximumAgeMs: 0,
+    })
+      .then((fix) => {
+        if (revController.signal.aborted) return;
         setGpsBusy(false);
-        const alt =
-          typeof pos.coords.altitude === 'number' && Number.isFinite(pos.coords.altitude)
-            ? pos.coords.altitude
-            : 12;
-        useSkyStore.getState().setObserver({
-          lat: pos.coords.latitude,
-          lon: pos.coords.longitude,
-          altM: alt,
-          label: 'GPS Station',
+        const st = useSkyStore.getState();
+        st.setObserver({
+          lat: fix.lat,
+          lon: fix.lon,
+          altM: fix.altM,
+          label: fix.label,
           source: 'gps',
         });
-      },
-      (err) => {
+        st.setCommandPaletteOpen(false);
+
+        void reverseGeocodeLabel(fix.lat, fix.lon, revController.signal).then((resolvedLabel) => {
+          if (!revController.signal.aborted && resolvedLabel) {
+            useSkyStore.getState().updateObserverLabel(fix.lat, fix.lon, 'gps', resolvedLabel);
+          }
+        });
+      })
+      .catch(async (err) => {
+        if (revController.signal.aborted) return;
+        const gpsMsg =
+          err instanceof Error && err.message
+            ? err.message
+            : 'Unable to acquire browser GPS fix.';
+        const stBefore = useSkyStore.getState();
+        // If not already on an IP fix, fall back to IP geolocation so Locate Me still centers on current geographic area
+        if (stBefore.observer.source !== 'ip') {
+          const ipFix = await fetchIpGeolocation({ signal: revController.signal });
+          if (revController.signal.aborted) return;
+          if (ipFix) {
+            setGpsBusy(false);
+            setGpsError(null);
+            const stNow = useSkyStore.getState();
+            stNow.setObserver({
+              lat: ipFix.lat,
+              lon: ipFix.lon,
+              altM: ipFix.altM,
+              label: ipFix.label,
+              source: 'ip',
+            });
+            stNow.setCommandPaletteOpen(false);
+            return;
+          }
+        }
+
         setGpsBusy(false);
-        setGpsError(err.message || 'Unable to acquire GPS fix.');
-      },
-      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 0 }
-    );
+        setGpsError(gpsMsg);
+        const stNow = useSkyStore.getState();
+        if (stNow.observer.source === 'pending') {
+          stNow.setLocationStatus(
+            'unavailable',
+            `${gpsMsg} Network IP geolocation was also unavailable.`
+          );
+        }
+      });
   }, []);
+
+  const handleRetryAutoLocate = useCallback(() => {
+    setGpsError(null);
+    startAutoLocate();
+  }, [startAutoLocate]);
 
   const handleSearchLocation = useCallback(
     async (query: string): Promise<LocationSearchResult[]> => {
@@ -1819,11 +1944,15 @@ export default function App() {
     useSkyStore.getState().setPwaInstallState({ dismissed: true });
   }, []);
 
+  const showLocationGate = observer.source === 'pending' && !commandPaletteOpen;
+
   return (
     <div className="cockpit-shell">
       <TopTelemetryBar
         onToggleAudio={handleToggleAudio}
         onManualSweep={handleManualSweep}
+        onLocateCurrent={handleLocateGps}
+        gpsBusy={gpsBusy}
         onInstallPwa={() => void handleInstallPwa()}
         onDismissPwa={handleDismissPwa}
       />
@@ -1845,6 +1974,77 @@ export default function App() {
         >
           <PolarSkyDome />
         </section>
+
+        {showLocationGate && locationStatus === 'locating' && (
+          <div
+            className="location-gate-overlay"
+            data-testid="location-status-overlay"
+            role="status"
+            aria-live="polite"
+          >
+            <div className="location-gate-card location-gate-card--locating">
+              <div className="location-gate-card__head">
+                <span className="location-gate-pulse" aria-hidden="true" />
+                <span className="location-gate-card__kicker tabular">ACQUIRING YOUR LOCATION</span>
+              </div>
+              <p className="location-gate-card__desc">
+                Detecting your current geographic position via browser geolocation…
+              </p>
+              <div className="location-gate-card__actions">
+                <button
+                  type="button"
+                  className="location-gate-btn location-gate-btn--ghost"
+                  onClick={() => useSkyStore.getState().setCommandPaletteOpen(true)}
+                >
+                  <Search size={12} aria-hidden="true" />
+                  <span>Enter Manually (⌘K)</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showLocationGate && locationStatus === 'unavailable' && (
+          <div
+            className="location-gate-overlay"
+            data-testid="location-unavailable-overlay"
+            role="alert"
+          >
+            <div className="location-gate-card location-gate-card--unavailable">
+              <div className="location-gate-card__head">
+                <Crosshair size={14} color="#F59E0B" aria-hidden="true" />
+                <span className="location-gate-card__kicker tabular">
+                  CURRENT LOCATION REQUIRED
+                </span>
+              </div>
+              <p className="location-gate-card__desc">
+                {locationError ||
+                  'Unable to determine your current geographic location automatically.'}
+              </p>
+              <div className="location-gate-card__actions">
+                <button
+                  type="button"
+                  className="location-gate-btn location-gate-btn--primary"
+                  data-testid="location-retry-btn"
+                  onClick={handleRetryAutoLocate}
+                  disabled={gpsBusy}
+                >
+                  <Crosshair size={12} aria-hidden="true" />
+                  <span>{gpsBusy ? 'Locating…' : 'Retry Auto-Locate'}</span>
+                </button>
+                <button
+                  type="button"
+                  className="location-gate-btn location-gate-btn--ghost"
+                  data-testid="location-manual-btn"
+                  onClick={() => useSkyStore.getState().setCommandPaletteOpen(true)}
+                >
+                  <Search size={12} aria-hidden="true" />
+                  <span>Search City / Coords (⌘K)</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         <ControlDock
           onLocateGps={handleLocateGps}

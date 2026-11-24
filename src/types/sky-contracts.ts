@@ -104,12 +104,14 @@ export const CATEGORY_LABELS: Record<SkyCategory, string> = {
   drone: 'UAS / Drone Airspace',
 };
 
+export type ObserverLocationStatus = 'locating' | 'ready' | 'unavailable';
+
 export interface ObserverLocation {
   lat: number;
   lon: number;
   altM: number;
   label: string;
-  source: 'default' | 'gps' | 'search' | 'manual' | 'preset' | 'url';
+  source: 'pending' | 'gps' | 'ip' | 'search' | 'manual' | 'preset' | 'url';
 }
 
 export interface AerospacePreset {
