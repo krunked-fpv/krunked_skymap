@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AirspaceData, FlightEntity, ObserverLocation } from '../../src/types/sky-contracts';
+import type {
+  AirspaceData,
+  BalloonEntity,
+  FlightEntity,
+  ObserverLocation,
+} from '../../src/types/sky-contracts';
 import {
   computeBearingDeg,
   computeTopocentricLookAngles,
@@ -13,14 +18,20 @@ import {
   CircuitOpenError,
   HttpError,
   TokenBucketRateLimiter,
+  extractRelayedJsonValue,
   fetchJsonWithTimeout,
   fetchTextWithTimeout,
 } from '../../src/services/httpClient';
 import {
+  adsbRateLimiter,
   classifyMilitary,
   clearFlightsServiceCache,
   extractRelayedJsonPayload,
   fetchFlightsCascade,
+  fetchGlobalSpecialFlights,
+  flightsCircuitBreaker,
+  globalAdsbRateLimiter,
+  globalFlightsCircuitBreaker,
   isLocalDevOrLanRuntime,
   normalizeAdsbxAircraft,
   normalizeOpenSkyState,
@@ -32,9 +43,14 @@ import {
   refreshTlesIfStale,
 } from '../../src/services/satellitesService';
 import {
+  WINDBORNE_DB_NAME,
+  WINDBORNE_TTL_MS,
   balloonsCircuitBreaker,
+  clearBalloonsCache,
   fetchBalloons,
   normalizeSondeRecord,
+  parseWindBorneConstellation,
+  windborneCircuitBreaker,
 } from '../../src/services/balloonsService';
 import {
   evaluateDroneAirspaceCompliance,
@@ -1767,5 +1783,632 @@ describe('geocodingService coordinate parsing & multi-provider search', () => {
     // Total outage returns [] safely
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
     await expect(searchLocation('Cape Canaveral')).resolves.toEqual([]);
+  });
+});
+
+describe('Sprint 03 Zero-Key Relay, WindBorne, Mil/LADD/PIA, ATC UAS & ADS-B LTA Ingest', () => {
+  beforeEach(() => {
+    clearFlightsServiceCache();
+    clearBalloonsCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('extractRelayedJsonValue parses arrays, objects, Jina envelopes & Published Time while rejecting HTML/{Error}/truncated', () => {
+    // Direct object & direct array
+    expect(extractRelayedJsonValue(' {"ac":[{"hex":"ae1234"}]} ', 'direct')).toEqual({
+      value: { ac: [{ hex: 'ae1234' }] },
+    });
+    expect(extractRelayedJsonValue(' [[38.85, -77.04, 18.4]] ', 'direct')).toEqual({
+      value: [[38.85, -77.04, 18.4]],
+    });
+
+    // Jina { data: { content, publishedTime } } envelope (including array inside content)
+    const pubIso = '2026-11-23T20:15:00.000Z';
+    const jinaJsonEnvelope = JSON.stringify({
+      code: 200,
+      data: {
+        publishedTime: pubIso,
+        content: '[[35.5, 139.7, 21.2]]',
+      },
+    });
+    expect(extractRelayedJsonValue(jinaJsonEnvelope, 'jina-json')).toEqual({
+      value: [[35.5, 139.7, 21.2]],
+      publishedTimeMs: Date.parse(pubIso),
+    });
+
+    // Jina Markdown Content text envelope with valid Published Time
+    const rfcTime = 'Mon, 23 Nov 2026 20:00:00 GMT';
+    const mdWithPub = [
+      'Title: ',
+      '',
+      'URL Source: https://a.windbornesystems.com/treasure/00.json',
+      '',
+      `Published Time: ${rfcTime}`,
+      '',
+      'Markdown Content:',
+      '[[10.0, 179.95, 19.0]]',
+    ].join('\n');
+    expect(extractRelayedJsonValue(mdWithPub, 'jina-md')).toEqual({
+      value: [[10.0, 179.95, 19.0]],
+      publishedTimeMs: Date.parse(rfcTime),
+    });
+
+    // Empty or invalid Published Time must not bleed into Markdown Content
+    const mdInvalidPub = [
+      'Published Time: ',
+      'Markdown Content:',
+      '{"ac":[{"hex":"a12345"}]}',
+    ].join('\n');
+    expect(extractRelayedJsonValue(mdInvalidPub, 'jina-md')).toEqual({
+      value: { ac: [{ hex: 'a12345' }] },
+    });
+
+    // Reject HTML, empty, truncated JSON, primitives, and { Error }
+    expect(() => extractRelayedJsonValue('<!doctype html><html>502</html>', 'relay')).toThrow(
+      'Invalid payload from relay'
+    );
+    expect(() => extractRelayedJsonValue('<html><body>Blocked</body></html>', 'relay')).toThrow(
+      'Invalid payload from relay'
+    );
+    expect(() => extractRelayedJsonValue('<pre>err</pre>', 'relay')).toThrow(
+      'Invalid payload from relay'
+    );
+    expect(() => extractRelayedJsonValue('   ', 'relay')).toThrow('Invalid payload from relay');
+    expect(() => extractRelayedJsonValue('Markdown Content:\nnull', 'relay')).toThrow(
+      'Invalid payload from relay'
+    );
+    expect(() => extractRelayedJsonValue('[[38.8, -77.0', 'relay')).toThrow();
+    expect(() => extractRelayedJsonValue('{"Error":"Proxy limit"}', 'relay')).toThrow(
+      'Proxy limit'
+    );
+    expect(() =>
+      extractRelayedJsonValue(
+        JSON.stringify({ data: { content: JSON.stringify({ Error: 'Upstream blocked' }) } }),
+        'relay'
+      )
+    ).toThrow('Upstream blocked');
+    expect(() => extractRelayedJsonValue(JSON.stringify({ Error: true }), 'relay')).toThrow(
+      'Upstream error from relay'
+    );
+  });
+
+  it('parseWindBorneConstellation derives 3D kinematics across Antimeridian, guards teleports & corrupt tuples, and caps trails <= 24', () => {
+    const t0Ts = 1_760_000_000_000;
+    const t0Raw: unknown[] = [
+      [10.0, -179.9, 17.4], // index 0 -> WB-GSB-001 (ascending + eastbound across Antimeridian)
+      [40.0, -75.0, 14.0], // index 1 -> WB-GSB-002 (descending)
+      [50.0, 10.0, 20.0], // index 2 -> WB-GSB-003 (stationary -> float, headingValid=false)
+      [0, 0, 15.0], // index 3 -> Null Island (skipped)
+      [0.00005, -0.00005, 15.0], // index 4 -> Near Null Island (skipped)
+      [95.0, 10.0, 15.0], // index 5 -> Out of bounds lat (skipped)
+      [35.0, 190.0, 15.0], // index 6 -> Out of bounds lon (skipped)
+      [35.0, -70.0, -0.8], // index 7 -> Out of bounds altKm (skipped)
+      [35.0, -70.0, 62.0], // index 8 -> Out of bounds altKm (skipped)
+      [Number.NaN, -70.0, 15.0], // index 9 -> NaN (skipped)
+      [35.0, -70.0], // index 10 -> short tuple (skipped)
+      null, // index 11 -> null (skipped)
+      [25.0, 120.0, 18.0], // index 12 -> WB-GSB-013 (slot-reassignment teleport > 450 km from T-1h)
+      [-15.0, -45.0, 16.5], // index 13 -> WB-GSB-014 (t0 longer than t1/t2)
+    ];
+
+    const t1Raw: unknown[] = [
+      [10.0, 179.9, 12.0], // +0.2 deg east across Antimeridian (~21.9 km), +5.4 km alt -> +1.5 m/s
+      [40.0, -75.2, 20.0], // -6.0 km alt -> -1.667 m/s
+      [50.0, 10.0, 20.0], // 0 km move
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      [25.0, 126.0, 17.0], // ~605 km away -> > 450 km slot jump!
+    ];
+
+    const t2Raw: unknown[] = [
+      [10.0, 179.7, 11.5], // T-2h -> T-1h is ~21.9 km (<= 450 km)
+      [40.0, -82.0, 21.0], // T-2h -> T-1h is ~578 km (> 450 km teleport, T-2h skipped from trail)
+    ];
+
+    const parsed = parseWindBorneConstellation(t0Raw, t1Raw, t2Raw, DCA_OBSERVER, {
+      timestampMs: t0Ts,
+    });
+
+    expect(parsed.map((b) => b.constellationId)).toEqual([
+      'WB-GSB-001',
+      'WB-GSB-002',
+      'WB-GSB-003',
+      'WB-GSB-013',
+      'WB-GSB-014',
+    ]);
+
+    const wb1 = parsed[0];
+    expect(wb1.id).toBe('balloon:WB-GSB-001');
+    expect(wb1.subSource).toBe('windborne');
+    expect(wb1.sondeType).toBe('WindBorne Global Sounding Balloon');
+    expect(wb1.country).toBe('WindBorne Systems');
+    expect(wb1.altM).toBeCloseTo(17_400, 1);
+    const expectedDist1Km = haversineDistanceKm(10.0, 179.9, 10.0, -179.9);
+    expect(expectedDist1Km).toBeCloseTo(21.9, 0);
+    expect(wb1.speedMs).toBeCloseTo((expectedDist1Km * 1000) / 3600, 3);
+    expect(wb1.headingValid).toBe(true);
+    expect(wb1.headingDeg).toBeCloseTo(90, 0);
+    expect(wb1.vertRateMs).toBeCloseTo(1.5, 3);
+    expect(wb1.burstState).toBe('ascending');
+    expect(wb1.subtitle).toContain('ASCENDING');
+    expect(wb1.trail).toHaveLength(3);
+    expect(wb1.trail.map((p) => p.ts)).toEqual([t0Ts - 7_200_000, t0Ts - 3_600_000, t0Ts]);
+
+    const wb2 = parsed[1];
+    expect(wb2.burstState).toBe('descending');
+    expect(wb2.vertRateMs).toBeCloseTo(-6000 / 3600, 3);
+    expect(wb2.trail).toHaveLength(2); // T-2h omitted due to >450 km step to T-1h
+
+    const wb3 = parsed[2];
+    expect(wb3.headingValid).toBe(false);
+    expect(wb3.headingDeg).toBe(0);
+    expect(wb3.speedMs).toBe(0);
+    expect(wb3.burstState).toBe('float');
+
+    const wb13 = parsed[3]; // >450 km slot jump -> zeroed kinematics & single-point trail
+    expect(wb13.speedMs).toBe(0);
+    expect(wb13.headingValid).toBe(false);
+    expect(wb13.vertRateMs).toBe(0);
+    expect(wb13.trail).toHaveLength(1);
+
+    const wb14 = parsed[4]; // beyond t1/t2 length -> single-point trail
+    expect(wb14.trail).toHaveLength(1);
+
+    // Trail merging & MAX_TRAIL_POINTS = 24 cap across 30 consecutive polls
+    let prevMap = new Map<string, BalloonEntity>(parsed.map((b) => [b.id, b]));
+    for (let step = 1; step <= 30; step++) {
+      const nextLat = 10.0 + step * 0.002;
+      const stepEntities = parseWindBorneConstellation(
+        [[nextLat, -179.9, 17.5]],
+        [[10.0, 179.9, 12.0]],
+        [[10.0, 179.7, 11.5]],
+        DCA_OBSERVER,
+        { timestampMs: t0Ts + step * 60_000, prevMap }
+      );
+      expect(stepEntities[0].trail.length).toBeLessThanOrEqual(24);
+      prevMap = new Map(stepEntities.map((b) => [b.id, b]));
+    }
+    expect(prevMap.get('balloon:WB-GSB-001')?.trail).toHaveLength(24);
+  });
+
+  it('fetchBalloons enforces 5-min WindBorne TTL cache, zero-preflight proxy fast-bypass, scope clipping, and seed fallback', async () => {
+    expect(WINDBORNE_TTL_MS).toBe(300_000);
+    expect(WINDBORNE_DB_NAME).toBe('krunked_windborne_v1');
+
+    // Localhost proxy 404 fast-bypasses to zero-preflight r.jina.ai relay and caches for 5 min
+    vi.stubGlobal('window', { location: { hostname: 'localhost' } });
+    const capturedCalls: Array<{ url: string; headers?: HeadersInit }> = [];
+    const baseMs = 1_760_000_000_000;
+
+    const farBalloon: [number, number, number] = [48.8566, 2.3522, 18.5]; // Paris (far from DCA)
+    const localBalloon: [number, number, number] = [38.9, -77.1, 19.2]; // Near DCA
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        capturedCalls.push({ url, headers: init?.headers });
+        if (url.startsWith('/api-proxy/windborne/')) {
+          return new Response('Not Found', { status: 404 });
+        }
+        if (url.startsWith('https://r.jina.ai/https://a.windbornesystems.com/treasure/00.json')) {
+          return new Response(
+            `Published Time: Mon, 23 Nov 2026 20:00:00 GMT\n\nMarkdown Content:\n${JSON.stringify([
+              farBalloon,
+              localBalloon,
+            ])}`,
+            { status: 200 }
+          );
+        }
+        if (url.startsWith('https://r.jina.ai/https://a.windbornesystems.com/treasure/01.json')) {
+          return new Response(JSON.stringify([[48.8, 2.2, 18.0], [38.85, -77.15, 18.8]]), {
+            status: 200,
+          });
+        }
+        if (url.startsWith('https://r.jina.ai/https://a.windbornesystems.com/treasure/02.json')) {
+          return new Response('Upstream blip', { status: 503 });
+        }
+        if (url.includes('/sondes')) {
+          expect(url).toContain('distance=600000');
+          return new Response(
+            JSON.stringify([{ serial: 'R41-GLOBAL', lat: 45.0, lon: 10.0, alt: 11000, vel_v: 4.5, vel_h: 18 }]),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/amateur')) {
+          return new Response(JSON.stringify({}), { status: 200 });
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
+    );
+
+    const globalLive = await fetchBalloons(DCA_OBSERVER, 120, undefined, {
+      scope: 'global',
+      nowMs: baseMs,
+    });
+    expect(globalLive.status).toBe('live');
+    expect(globalLive.windborneStatus).toBe('live');
+    expect(globalLive.sourceCounts).toEqual({ windborne: 2, sondehub: 1 });
+    expect(globalLive.entities.some((e) => e.subSource === 'windborne')).toBe(true);
+    expect(globalLive.entities.some((e) => e.subSource === 'sondehub')).toBe(true);
+
+    const relayCalls = capturedCalls.filter((c) => c.url.startsWith('https://r.jina.ai/'));
+    expect(relayCalls.length).toBeGreaterThanOrEqual(1);
+    for (const c of relayCalls) {
+      expect(c.headers).toBeUndefined();
+    }
+
+    // Within 5-min TTL (< 300_000 ms), WindBorne uses cache with 0 WindBorne network fetches; local scope clips to radiusKm * 1.05
+    const callsBeforeTtlHit = capturedCalls.length;
+    const localCached = await fetchBalloons(DCA_OBSERVER, 120, undefined, {
+      scope: 'local',
+      includeWindBorne: true,
+      nowMs: baseMs + 120_000,
+    });
+    expect(localCached.windborneStatus).toBe('cached');
+    expect(localCached.sourceCounts?.windborne).toBe(1);
+    expect(localCached.sourceCounts?.sondehub).toBe(0);
+    const windborneCallsDuringTtl = capturedCalls
+      .slice(callsBeforeTtlHit)
+      .filter((c) => c.url.includes('windborne'));
+    expect(windborneCallsDuringTtl).toHaveLength(0);
+
+    // After 5-min TTL expires, live + relay fail -> falls back to ./data/windborne-balloons.json seed
+    const seedTs = 1_759_000_000_000;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('windborne-balloons.json')) {
+          return new Response(
+            JSON.stringify({
+              capturedAtMs: seedTs,
+              t0: [[34.05, -118.24, 17.5]],
+              t1: [[34.0, -118.3, 17.0]],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
+    );
+
+    const seedFallback = await fetchBalloons(DCA_OBSERVER, 120, undefined, {
+      scope: 'global',
+      nowMs: baseMs + WINDBORNE_TTL_MS + 1000,
+    });
+    expect(seedFallback.status).toBe('cached');
+    expect(seedFallback.windborneStatus).toBe('cached');
+    expect(seedFallback.timestampMs).toBe(seedTs);
+    expect(seedFallback.entities).toHaveLength(1);
+    expect(seedFallback.entities[0].isCachedSeed).toBe(true);
+    expect(seedFallback.entities[0].timestampMs).toBe(seedTs);
+    expect(seedFallback.entities[0].subSource).toBe('windborne');
+
+    // clearBalloonsCache resets breakers & proxy latch cleanly
+    windborneCircuitBreaker.recordFailure('windborne-relay', new Error('err1'));
+    windborneCircuitBreaker.recordFailure('windborne-relay', new Error('err2'));
+    windborneCircuitBreaker.recordFailure('windborne-relay', new Error('err3'));
+    expect(windborneCircuitBreaker.getState('windborne-relay')).toBe('open');
+    clearBalloonsCache();
+    expect(windborneCircuitBreaker.getState('windborne-relay')).toBe('closed');
+  });
+
+  it('flightsService expands military recognition, routes B6 ATC UAS & B2 LTA balloons, and preserves hovering/high-alt targets', async () => {
+    // Expanded military hex (Canada, France), type codes (C17, F35, RQ4), callsigns (COAST, ORDER, NATO)
+    expect(classifyMilitary('c0cdf9', 'CFC101', 0)).toBe(true);
+    expect(classifyMilitary('3b0123', 'FAF200', 0)).toBe(true);
+    expect(classifyMilitary('a12345', 'UAL418', 0, 'C17')).toBe(true);
+    expect(classifyMilitary('a12345', 'UAL418', 0, 'F35')).toBe(true);
+    expect(classifyMilitary('a11111', 'COAST12', 0)).toBe(true);
+    expect(classifyMilitary('a11111', 'ORDER66', 0)).toBe(true);
+    expect(classifyMilitary('a11111', 'NATO01', 0)).toBe(true);
+    expect(classifyMilitary('a12345', 'UAL418', 8)).toBe(false);
+    expect(classifyMilitary('a11111', 'SAMA100', 0)).toBe(false);
+
+    // Military C17 preserves 'heavy' airframeClass; airborne LADD gets category 'military'
+    const c17 = normalizeAdsbxAircraft(
+      {
+        hex: 'a12345',
+        flight: 'RCH501',
+        t: 'C17',
+        lat: 38.86,
+        lon: -77.05,
+        alt_baro: 28000,
+        gs: 420,
+        track: 90,
+      },
+      DCA_OBSERVER
+    );
+    expect(c17?.category).toBe('military');
+    expect(c17?.isMilitary).toBe(true);
+    expect(c17?.airframeClass).toBe('heavy');
+
+    const airborneLadd = normalizeAdsbxAircraft(
+      {
+        hex: 'a23456',
+        flight: 'EXEC1',
+        t: 'G650',
+        lat: 38.86,
+        lon: -77.05,
+        alt_baro: 41000,
+        gs: 480,
+        track: 180,
+        dbFlags: 8,
+      },
+      DCA_OBSERVER
+    );
+    expect(airborneLadd?.category).toBe('military');
+    expect(airborneLadd?.isLadd).toBe(true);
+    expect(airborneLadd?.isMilitary).toBe(false);
+    expect(airborneLadd?.airframeClass).toBe('jet');
+
+    // Altitude cap raised to 70,000 m (~230k ft) and gs: 0 hovering target preserved
+    const highAlt = normalizeAdsbxAircraft(
+      {
+        hex: 'a34567',
+        flight: 'TESTHI',
+        lat: 38.86,
+        lon: -77.05,
+        alt_baro: null,
+        alt_geom: 225_000,
+        gs: 0,
+        track: null,
+      },
+      DCA_OBSERVER
+    );
+    expect(highAlt).not.toBeNull();
+    expect(highAlt?.altM).toBeCloseTo(225_000 * 0.3048, 1);
+    expect(highAlt?.speedMs).toBe(0);
+
+    // Fetch cascade routes B6/RQ4 -> uasEntities and B2/floater -> balloonEntities, excluding U2/WB57
+    vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            JSON.stringify({
+              aircraft: [
+                {
+                  hex: 'ae5401',
+                  flight: 'FORTE10',
+                  t: 'RQ4',
+                  category: 'B6',
+                  lat: 38.865,
+                  lon: -77.07,
+                  alt_baro: null,
+                  alt_geom: 55000,
+                  gs: 320,
+                  track: 110,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'a77001',
+                  flight: 'UASVTOL',
+                  t: 'S100',
+                  lat: 38.865,
+                  lon: -77.07,
+                  alt_baro: 450,
+                  gs: 3,
+                  track: 45,
+                  seen_pos: 1,
+                },
+                {
+                  hex: 'a77002',
+                  flight: 'HBAL701',
+                  category: 'B2',
+                  lat: 38.9,
+                  lon: -77.02,
+                  alt_baro: null,
+                  alt_geom: 62000,
+                  gs: 12,
+                  track: 75,
+                  seen_pos: 3,
+                },
+                {
+                  hex: 'a77003',
+                  flight: 'NASA926',
+                  t: 'WB57',
+                  lat: 38.91,
+                  lon: -77.01,
+                  alt_baro: null,
+                  alt_geom: 61000,
+                  gs: 85,
+                  track: 200,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'a77004',
+                  flight: 'HELI01',
+                  t: 'H135',
+                  category: 'A7',
+                  lat: 38.85,
+                  lon: -77.05,
+                  alt_baro: 800,
+                  gs: 0,
+                  track: 0,
+                  seen_pos: 1,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const res = await fetchFlightsCascade(DCA_OBSERVER, 120, undefined, {
+      force: true,
+      airspace: SAMPLE_AIRSPACE,
+    });
+    expect(res.status).toBe('live');
+
+    // RQ4 and S100 routed to uasEntities; RQ4 FL550 must NEVER trip low-alt UASFM breach
+    expect(res.uasEntities).toHaveLength(2);
+    const rq4 = res.uasEntities?.find((d) => d.callsign === 'FORTE10');
+    expect(rq4).toMatchObject({
+      id: 'drone:adsb-ae5401',
+      subSource: 'adsb-uas',
+      hasOperatorLocation: false,
+      isMilitary: true,
+      uaType: 'fixed-wing',
+      missionDesc: 'LIVE ATC UAS · MILITARY',
+      ceilingBreach: false,
+      faaCeilingFt: null,
+    });
+    expect(rq4?.altM).toBeCloseTo(55000 * 0.3048, 1);
+
+    const s100 = res.uasEntities?.find((d) => d.callsign === 'UASVTOL');
+    expect(s100).toMatchObject({
+      subSource: 'adsb-uas',
+      uaType: 'vtol',
+      missionDesc: 'LIVE ATC UAS · ADS-B',
+      ceilingBreach: true, // 450 ft <= 500 m inside 200 ft cell
+    });
+
+    // B2 routed to balloonEntities
+    expect(res.balloonEntities).toHaveLength(1);
+    expect(res.balloonEntities?.[0]).toMatchObject({
+      id: 'balloon:adsb-a77002',
+      subSource: 'adsb-lta',
+      sondeType: 'ADS-B Stratospheric Balloon',
+    });
+    expect(res.balloonEntities?.[0].altM).toBeCloseTo(62000 * 0.3048, 1);
+
+    // WB57 and hovering HELI01 remain in entities; B6/B2 are omitted
+    expect(res.entities.map((e) => e.callsign).sort()).toEqual(['HELI01', 'NASA926']);
+  });
+
+  it('fetchGlobalSpecialFlights polls /v2/{mil,ladd,pia} safely, deduplicates by hex, and isolates breakers from local cascade', async () => {
+    // Verify localhost proxy order & strict rule: NEVER hit adsb.fi /ladd or /pia
+    vi.stubGlobal('window', { location: { hostname: 'localhost' } });
+    const proxyUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        proxyUrls.push(url);
+        if (url === '/api-proxy/adsb-lol/v2/mil') {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                { hex: 'ae1001', flight: 'RCH101', t: 'C17', lat: 51.5, lon: -0.1, alt_baro: 32000, gs: 440, track: 90 },
+                { hex: 'ae5401', flight: 'FORTE11', t: 'RQ4', category: 'B6', lat: 44.0, lon: 33.0, alt_baro: null, alt_geom: 54000, gs: 310, track: 180 },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url === '/api-proxy/adsb-lol/v2/ladd') {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                { hex: 'ae1001', flight: 'RCH101', t: 'C17', lat: 51.5, lon: -0.1, alt_baro: 32000, gs: 440, track: 90, dbFlags: 8 },
+                { hex: 'a90001', flight: 'LADD99', t: 'GLF5', lat: 34.0, lon: -118.0, alt_baro: 43000, gs: 470, track: 270 },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url === '/api-proxy/adsb-lol/v2/pia') {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                { hex: '~2b1122', flight: 'PIA01', t: 'B737', lat: 40.7, lon: -74.0, alt_baro: 35000, gs: 450, track: 60 },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unexpected', { status: 500 });
+      })
+    );
+
+    const globalRes = await fetchGlobalSpecialFlights(DCA_OBSERVER);
+    expect(globalRes.status).toBe('live');
+    expect(globalRes.sourceCounts).toEqual({ mil: 2, ladd: 2, pia: 1 });
+    expect(globalRes.uasEntities).toHaveLength(1);
+    expect(globalRes.entities).toHaveLength(3); // ae1001 deduped + a90001 + ~2b1122
+    const dedupedMilLadd = globalRes.entities.find((e) => e.icaoHex === 'ae1001');
+    expect(dedupedMilLadd?.isMilitary).toBe(true);
+    expect(dedupedMilLadd?.isLadd).toBe(true);
+    expect(globalRes.entities.find((e) => e.icaoHex === 'a90001')?.category).toBe('military');
+    expect(globalRes.entities.find((e) => e.icaoHex === '~2b1122')?.isPia).toBe(true);
+    expect(globalRes.entities.find((e) => e.icaoHex === '~2b1122')?.category).toBe('military');
+    expect(proxyUrls.some((u) => u.includes('adsb-fi') && (u.includes('ladd') || u.includes('pia')))).toBe(
+      false
+    );
+
+    // Rate-limit isolation: global 15s cooldown does NOT block local 10s fetchFlightsCascade, and trips global breakers without affecting flightsCircuitBreaker
+    clearFlightsServiceCache();
+    vi.stubGlobal('window', { location: { hostname: 'krunked.github.io' } });
+    const relayHeaders: Array<HeadersInit | undefined> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.startsWith('https://r.jina.ai/')) {
+          relayHeaders.push(init?.headers);
+        }
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/api/v3/')) {
+          return new Response(
+            JSON.stringify({
+              aircraft: [{ hex: 'a12345', flight: 'LOCAL1', lat: 38.86, lon: -77.05, alt_baro: 9000, gs: 250, track: 90 }],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    for (let i = 0; i < 3; i++) {
+      const failGlobal = await fetchGlobalSpecialFlights(DCA_OBSERVER, undefined, { force: true });
+      expect(failGlobal.status).toBe('error');
+    }
+    expect(globalFlightsCircuitBreaker.getState('global-mil-relay-adsb-lol')).toBe('open');
+    expect(flightsCircuitBreaker.getState('cors-relay-adsb-fi')).toBe('closed');
+    for (const h of relayHeaders) {
+      expect(h).toBeUndefined();
+    }
+
+    const localStillWorks = await fetchFlightsCascade(DCA_OBSERVER, 120);
+    expect(localStillWorks.status).toBe('live');
+    expect(localStillWorks.entities.map((e) => e.callsign)).toEqual(['LOCAL1']);
+    expect(globalAdsbRateLimiter.canConsume('global-special')).toBe(false);
+    expect(adsbRateLimiter.canConsume('other-key')).toBe(true);
+  });
+
+  it('openDroneIdService tags odid-sim and odid-live subSource & hasOperatorLocation=true', () => {
+    const sim = stepSimulatedDrones(DCA_OBSERVER, 120, 5, SAMPLE_AIRSPACE);
+    expect(sim).toHaveLength(4);
+    for (const d of sim) {
+      expect(d.subSource).toBe('odid-sim');
+      expect(d.hasOperatorLocation).toBe(true);
+    }
+
+    const live = normalizeOdidPayload(
+      [{ uasId: 'LIVE-ODID-1', lat: 38.86, lon: -77.05, altAglM: 70 }],
+      DCA_OBSERVER,
+      SAMPLE_AIRSPACE
+    );
+    expect(live).toHaveLength(1);
+    expect(live[0].subSource).toBe('odid-live');
+    expect(live[0].hasOperatorLocation).toBe(true);
   });
 });
