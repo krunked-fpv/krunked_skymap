@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'krunked-skymap-v3';
+const CACHE_VERSION = 'krunked-skymap-v4';
 
 const PRECACHE_URLS = [
   './',
