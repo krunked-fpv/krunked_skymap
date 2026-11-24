@@ -2,7 +2,7 @@
 
 > **Live 60fps Aerospace Situational Awareness Command Deck & Serverless Client-Side Astrodynamics Lab**
 
-Krunked Sky-Map is a zero-API-key, dark-cockpit aerospace visualization dashboard that renders everything currently flying or orbiting overhead for any point on Earth—combining a **MapLibre GL JS Tactical Map**, a **High-DPI Polar Sky-Dome Hemisphere Radar** (including a **240×240px PIP** overlay in Map view), **Web Worker SGP4 orbital mechanics**, **WGS-84 topocentric curvature math**, **WindBorne Systems global stratospheric balloon constellations**, **global `/v2/mil`, `/v2/ladd`, and `/v2/pia` ADS-B tracking**, **FAA UAS airspace compliance**, and **procedural WebAudio cockpit acoustics**.
+Krunked Sky-Map is a zero-API-key, dark-cockpit aerospace visualization dashboard that renders everything currently flying or orbiting overhead for any point on Earth—combining a **MapLibre GL JS Tactical Map**, a **High-DPI Polar Sky-Dome Hemisphere Radar** (including a **320×320px right-side translucent PIP** overlay in Map view), **Web Worker SGP4 orbital mechanics**, **WGS-84 topocentric curvature math**, **WindBorne Systems global stratospheric balloon constellations**, **global `/v2/mil`, `/v2/ladd`, and `/v2/pia` ADS-B tracking**, **FAA UAS airspace compliance**, and **procedural WebAudio cockpit acoustics**.
 
 ---
 
@@ -13,8 +13,8 @@ Krunked Sky-Map is a zero-API-key, dark-cockpit aerospace visualization dashboar
 | TopTelemetryBar (44px): ⌘K Location Palette · LOCAL/GLOBAL Scope · MAP/SPLIT/DOME/PIP |
 +------------------------------------+----------------------------------------------+
 | MapLibre GL JS (TacticalMap.tsx)   | Polar Sky-Dome (PolarSkyDome.tsx)            |
-| - Esri Dark Gray Canvas (zero-key) | - High-DPI ResizeObserver Canvas (90° -> -5°)|
-| - 3x Retina procedural sprites     | - 240x240px PIP mode over Map view w/ AZ/EL  |
+| - Esri Dark Gray Canvas (zero-key) | - High-DPI ResizeObserver Canvas (90° -> 0°) |
+| - 3x Retina procedural sprites     | - 320x320px right-side glass PIP w/ AZ/EL    |
 | - Zoom-decluttered labels & tracks | - Overhead satellite pass arcs + TCA peak    |
 | - FAA UASFM / SUA / TFR overlays   | - Bidirectional hover & click target-locking |
 | - ATC B6 UAS & ODID tether layers  | - Synchronized phosphor sweep & AZ/EL cursor |
@@ -26,8 +26,8 @@ Krunked Sky-Map is a zero-API-key, dark-cockpit aerospace visualization dashboar
 
 ### Command Deck Controls & Views
 - **`LOCAL / GLOBAL` Scope Toggle:** Switches seamlessly between cylinder-scoped regional airspace (`10–250 km` around the observer) and planetary situational awareness (global WindBorne stratospheric constellation, widened SondeHub v2 radiosondes, and global `/v2/mil` + `/v2/ladd` + `/v2/pia` ADS-B networks). Switching to `GLOBAL` smoothly eases the tactical map camera out to planetary view; switching back to `LOCAL` restores observer-centered zoom.
-- **`⌘K` / `/` Location Command Palette:** Keyboard-driven observer command palette for instant coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), aerospace hotspot presets, GPS lock, and Open-Meteo / Nominatim geocoding.
-- **`240×240px` PIP Polar Sky-Dome:** When in `MAP` layout mode, the Polar Sky-Dome docks as a compact `240×240px` corner radar HUD featuring live `AZ / EL / RNG` cursor & target lock readouts plus one-click Expand-to-Split and Minimize controls.
+- **`⌘K` / `/` Location Command Palette:** Portal-mounted (`document.body`) observer command palette for instant coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), aerospace hotspot presets, GPS lock, and Open-Meteo / Nominatim geocoding.
+- **`320×320px` Right-Side Translucent PIP Polar Sky-Dome:** When in `MAP` layout mode, the Polar Sky-Dome docks on the right as a translucent `320×320px` corner radar HUD (responsive on mobile, auto-shifting left to avoid `TargetInspector`) featuring live `AZ / EL / RNG` cursor & target lock readouts, compass/drag azimuth rotation, and one-click Expand-to-Split and Minimize controls.
 
 ---
 
@@ -102,7 +102,7 @@ Krunked Sky-Map supports standalone installation on desktop and mobile devices (
 
 - **Web App Manifest (`public/manifest.json`):** Configured with `start_url: "./"`, `scope: "./"`, `display: "standalone"`, and `#06090F` obsidian theme/background colors.
 - **Raster PNG Icons (`scripts/generate-pwa-icons.mjs`):** Zero-dependency Node script generating valid `192x192`, `512x512`, and `180x180` (`apple-touch-icon.png`) binary PNG radar icons inside the maskable safe zone (`public/icons/`).
-- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v4`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`, `krunked-skymap-v3`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
+- **Versioned Service Worker (`public/sw.js`):** Network-first app-shell caching (`krunked-skymap-v5`) that pre-caches core shell assets for offline boot and deletes superseded caches (`krunked-skymap-v1`, `krunked-skymap-v2`, `krunked-skymap-v3`, `krunked-skymap-v4`) on activation, while strictly bypassing cross-origin requests, `/api-proxy/` routes (including `/api-proxy/windborne` and ADS-B proxies), same-origin `.json` data requests (`public/data/windborne-balloons.json` and live JSON endpoints, excluding `./manifest.json`), and Vite HMR dev paths so telemetry is never served stale.
 
 ---
 
@@ -139,3 +139,13 @@ npm run preview                        # Preview built bundle locally
 - **3D ENU Closest Approach:** `computeClosestApproach` yields `TCA`, `MAX EL` and minimum slant range; the Sky-Dome shows a `◆ MAX EL` apex tick and the Target Inspector a live `TCA / PEAK EL` card for approaching targets.
 - **Keyboard shortcuts** (when no input is focused): `M` Map · `S` Split · `D` Dome · `P` toggle PIP · `L` Dome labels · `⌘K` / `/` Command Palette · `Esc` close popovers / clear target lock.
 - **MapLibre:** FAA UASFM grid opacity and borders are zoom-progressive (whisper-subtle regionally, crisp at `z ≥ 10`).
+
+---
+
+## Sprint 05 — Translucent Sky-Dome, Compass/Drag Azimuth Control & Cockpit HUD Fixes
+
+- **Translucent Smoked-Glass Sky-Dome Across All Modes:** `PIP`, `SPLIT`, and full-screen `DOME` render over continuous full-bleed MapLibre live air traffic with lightweight smoked glass (`rgba(6, 10, 18, 0.30)`, `1px` backdrop blur), dynamic `SPLIT` camera padding so observer centering frames the exposed map pane cleanly, and 100% opaque crisp dome foreground graphics (reticles, rings, ticks, wakes, arcs, and labels).
+- **Hardware Compass, Fingertip Drag & Orientation Lock:** Live DeviceOrientation `COMPASS` toggle supporting iOS `DeviceOrientationEvent.requestPermission()` and Android `deviceorientationabsolute` with screen-orientation compensation and wrap-safe shortest-arc smoothing (`359.8° <-> 0.2°`), 1:1 fingertip/mouse drag-to-rotate with park-on-release (zero spring-back), explicit `LOCK / UNLOCK` toggle to prevent accidental rotation, and a 1-tap `HDG · N▲` North reset button (alongside clearer `FULL SKY` ⇄ `OVERHEAD 2×` vault zoom controls).
+- **Right-Side `+33%` Larger PIP Sky-Dome:** Upgraded to `320×320px` on desktop (responsive `min(208px, calc(100vw - 24px))` on mobile) docked on the right side with automatic left-shift coordination (`translateX`) whenever `TargetInspector` opens—eliminating inspector overlap.
+- **Portal `⌘K` Palette & Actionable `OVERHEAD` Quick-Lock:** Mounts the `⌘K` Location Command Palette directly into `document.body` via React Portal for reliable click, submit, and close handling across all controls, and upgrades the top-bar `OVERHEAD` chip into an interactive highest-target quick-lock cycler (`EL >= 45°`, automatically falling back to `EL >= 20°`).
+- **Service Worker Cache `krunked-skymap-v5`:** Bumps `public/sw.js` to `krunked-skymap-v5` to purge superseded `v1`–`v4` app-shell caches while preserving strict bypass of live telemetry, `/api-proxy/`, same-origin JSON data, and Vite HMR paths.
