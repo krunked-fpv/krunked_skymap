@@ -8,6 +8,10 @@ const TLE_DIR = path.join(DATA_DIR, 'tle');
 
 const FETCH_TIMEOUT_MS = 12_000;
 const STARLINK_MAX_ENTRIES = 600;
+const USER_AGENT = 'KrunkedSkyMap/2.0 (+https://github.com/krunked-fpv/krunked_skymap)';
+
+const WINDBORNE_T0_URL = 'https://a.windbornesystems.com/treasure/00.json';
+const WINDBORNE_T1_URL = 'https://a.windbornesystems.com/treasure/01.json';
 
 const CELESTRAK_GROUP_URLS = {
   stations: 'https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle',
@@ -308,9 +312,9 @@ function serializeThreeLineTles(entries) {
   return `${entries.map((entry) => `${entry.name}\n${entry.line1}\n${entry.line2}`).join('\n')}\n`;
 }
 
-async function fetchWithTimeout(url, accept) {
+async function fetchWithTimeout(url, accept, extraHeaders = {}) {
   const response = await fetch(url, {
-    headers: { Accept: accept },
+    headers: { Accept: accept, ...extraHeaders },
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!response.ok) {
@@ -420,12 +424,124 @@ async function seedAirspace() {
   );
 }
 
+function sanitizeWindBorneTuple(tuple) {
+  if (!Array.isArray(tuple) || tuple.length < 3) return null;
+  const [lat, lon, altKm] = tuple;
+  if (
+    typeof lat !== 'number' ||
+    !Number.isFinite(lat) ||
+    typeof lon !== 'number' ||
+    !Number.isFinite(lon) ||
+    typeof altKm !== 'number' ||
+    !Number.isFinite(altKm)
+  ) {
+    return null;
+  }
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || altKm < -0.5 || altKm > 60) {
+    return null;
+  }
+  if (Math.abs(lat) < 1e-4 && Math.abs(lon) < 1e-4) {
+    return null;
+  }
+  return [Number(lat.toFixed(5)), Number(lon.toFixed(5)), Number(altKm.toFixed(3))];
+}
+
+function sanitizeWindBorneArray(raw) {
+  if (!Array.isArray(raw)) return null;
+  // Preserve exact array indices with null placeholders so T-0h and T-1h rows remain aligned
+  return raw.map(sanitizeWindBorneTuple);
+}
+
+function countValidWindBorneTuples(arr) {
+  if (!Array.isArray(arr)) return 0;
+  let valid = 0;
+  for (const item of arr) {
+    if (sanitizeWindBorneTuple(item) !== null) valid += 1;
+  }
+  return valid;
+}
+
+async function fetchWindBorneSnapshot(url, label) {
+  try {
+    const response = await fetchWithTimeout(url, 'application/json', {
+      'User-Agent': USER_AGENT,
+    });
+    const payload = await response.json();
+    const sanitized = sanitizeWindBorneArray(payload);
+    if (sanitized) {
+      return { data: sanitized, live: true };
+    }
+    console.warn(`[windborne:${label}] upstream returned non-array payload`);
+  } catch (err) {
+    console.warn(`[windborne:${label}] fetch failed: ${err.message}`);
+  }
+  return { data: null, live: false };
+}
+
+async function seedWindBorneBalloons() {
+  const outPath = path.join(DATA_DIR, 'windborne-balloons.json');
+  const existing = await readExistingJson(outPath);
+
+  const [t0Result, t1Result] = await Promise.all([
+    fetchWindBorneSnapshot(WINDBORNE_T0_URL, '00'),
+    fetchWindBorneSnapshot(WINDBORNE_T1_URL, '01'),
+  ]);
+
+  const liveT0Count = countValidWindBorneTuples(t0Result.data);
+  if (t0Result.live && t0Result.data && liveT0Count > 0) {
+    const t0 = t0Result.data;
+    const t1 = t1Result.live && t1Result.data ? t1Result.data : [];
+    const nowMs = Date.now();
+    const output = {
+      capturedAtMs: nowMs,
+      capturedAtIso: new Date(nowMs).toISOString(),
+      source: 'windborne-treasure',
+      count: liveT0Count,
+      t0,
+      t1,
+    };
+    await writeFile(outPath, `${JSON.stringify(output)}\n`, 'utf8');
+    console.log(
+      `[windborne] wrote count=${liveT0Count} (rows=${t0.length}, t1=${t1.length}) -> ${outPath}`
+    );
+    return;
+  }
+
+  const existingValidCount = countValidWindBorneTuples(existing?.t0);
+  if (
+    existing &&
+    typeof existing === 'object' &&
+    Number.isFinite(existing.capturedAtMs) &&
+    Array.isArray(existing.t0) &&
+    Array.isArray(existing.t1) &&
+    existingValidCount > 0
+  ) {
+    console.log(
+      `[windborne] preserved existing snapshot (count=${existingValidCount}) -> ${outPath}`
+    );
+    return;
+  }
+
+  const nowMs = Date.now();
+  const emptyFallback = {
+    capturedAtMs: nowMs,
+    capturedAtIso: new Date(nowMs).toISOString(),
+    source: 'windborne-treasure',
+    count: 0,
+    t0: [],
+    t1: [],
+  };
+  await writeFile(outPath, `${JSON.stringify(emptyFallback)}\n`, 'utf8');
+  console.log(`[windborne] wrote empty fallback schema (count=0) -> ${outPath}`);
+}
+
 async function main() {
   await mkdir(TLE_DIR, { recursive: true });
   await seedTleGroup('stations');
   await seedTleGroup('visual');
   await seedTleGroup('starlink');
   await seedAirspace();
+  await seedWindBorneBalloons();
 }
 
 await main();

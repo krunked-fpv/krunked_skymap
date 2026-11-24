@@ -13,13 +13,18 @@ function shouldBypassCache(request, url) {
     return true;
   }
 
-  // Strictly bypass all cross-origin requests (ADS-B, SondeHub, CelesTrak, ArcGIS, Open-Meteo, Esri tiles)
+  // Strictly bypass all cross-origin requests (ADS-B, WindBorne, SondeHub, CelesTrak, ArcGIS, Open-Meteo, Esri tiles)
   if (url.origin !== self.location.origin) {
     return true;
   }
 
-  // Strictly bypass Vite dev/preview live ADS-B proxy routes
+  // Strictly bypass Vite dev/preview live ADS-B and WindBorne proxy routes
   if (url.pathname.includes('/api-proxy/')) {
+    return true;
+  }
+
+  // Strictly bypass same-origin JSON data requests (e.g. windborne-balloons.json) except ./manifest.json
+  if (url.pathname.endsWith('.json') && !url.pathname.endsWith('/manifest.json')) {
     return true;
   }
 
