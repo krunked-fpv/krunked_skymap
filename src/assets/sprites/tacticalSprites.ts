@@ -7,12 +7,15 @@ export type TacticalSpriteId =
   | 'sprite-prop-civil'
   | 'sprite-heli-civil'
   | 'sprite-fast-military'
+  | 'sprite-heavy-military'
   | 'sprite-heli-military'
   | 'sprite-emergency'
   | 'sprite-satellite'
   | 'sprite-satellite-eclipsed'
   | 'sprite-balloon'
+  | 'sprite-balloon-windborne'
   | 'sprite-drone'
+  | 'sprite-drone-hale'
   | 'sprite-drone-breach'
   | 'sprite-operator'
   | 'sprite-observer'
@@ -274,6 +277,66 @@ function drawFastMilitary(ctx: CanvasRenderingContext2D, color: string): void {
   ctx.fill();
 }
 
+function drawHeavyMilitary(ctx: CanvasRenderingContext2D, color: string): void {
+  // 4-engine heavy strategic tanker / airlifter facing North (-Y), centered at (48, 48)
+  ctx.beginPath();
+  ctx.moveTo(48, 8);
+  ctx.lineTo(54.5, 21.5);
+  ctx.lineTo(55, 32);
+  ctx.lineTo(88, 52);
+  ctx.lineTo(88, 59.5);
+  ctx.lineTo(55, 51);
+  ctx.lineTo(53, 73);
+  ctx.lineTo(70, 81);
+  ctx.lineTo(70, 86.5);
+  ctx.lineTo(50.5, 81.5);
+  ctx.lineTo(48, 88.5);
+  ctx.lineTo(45.5, 81.5);
+  ctx.lineTo(26, 86.5);
+  ctx.lineTo(26, 81);
+  ctx.lineTo(43, 73);
+  ctx.lineTo(41, 51);
+  ctx.lineTo(8, 59.5);
+  ctx.lineTo(8, 52);
+  ctx.lineTo(41, 32);
+  ctx.lineTo(41.5, 21.5);
+  ctx.closePath();
+  fillAndHalo(ctx, color, 5.4, 'rgba(254, 243, 199, 0.72)');
+
+  // Four wing-mounted strategic engine pods with dark halo separation
+  const nacelles: Array<[number, number]> = [
+    [30, 42.5],
+    [19.5, 48.5],
+    [66, 42.5],
+    [76.5, 48.5],
+  ];
+  for (const [nx, ny] of nacelles) {
+    ctx.beginPath();
+    ctx.moveTo(nx, ny - 6.5);
+    ctx.lineTo(nx, ny + 4);
+    ctx.strokeStyle = HALO_COLOR;
+    ctx.lineWidth = 5.4;
+    ctx.stroke();
+    ctx.strokeStyle = '#FEF3C7';
+    ctx.lineWidth = 2.8;
+    ctx.stroke();
+  }
+
+  // Flight-deck glass & fuselage tactical spine
+  ctx.beginPath();
+  ctx.ellipse(48, 19.5, 3.8, 3.2, 0, Math.PI, Math.PI * 2);
+  ctx.strokeStyle = '#FEF3C7';
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(48, 25);
+  ctx.lineTo(48, 73);
+  ctx.strokeStyle = 'rgba(254, 243, 199, 0.6)';
+  ctx.lineWidth = 1.6;
+  ctx.stroke();
+}
+
 function drawEmergency(ctx: CanvasRenderingContext2D, color: string): void {
   // Alert outer octagon beacon centered at (48, 48)
   ctx.beginPath();
@@ -405,6 +468,100 @@ function drawBalloon(ctx: CanvasRenderingContext2D, color: string): void {
   ctx.arc(42.75, 27.75, 10.5, Math.PI * 1.05, Math.PI * 1.65);
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.72)';
   ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawBalloonWindBorne(ctx: CanvasRenderingContext2D, color: string): void {
+  // Crisp tether line from tear-drop envelope neck to smart gondola
+  ctx.beginPath();
+  ctx.moveTo(48, 59.5);
+  ctx.lineTo(48, 71.5);
+  ctx.strokeStyle = HALO_COLOR;
+  ctx.lineWidth = 4.6;
+  ctx.stroke();
+  ctx.strokeStyle = '#A7F3D0';
+  ctx.lineWidth = 1.9;
+  ctx.stroke();
+
+  // Compact instrumented WindBorne gondola package
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(40.5, 71, 15, 11.5, 3);
+  } else {
+    ctx.rect(40.5, 71, 15, 11.5);
+  }
+  fillAndHalo(ctx, '#064E3B', 4.2, '#A7F3D0');
+
+  ctx.beginPath();
+  ctx.arc(48, 76.75, 2.5, 0, Math.PI * 2);
+  ctx.fillStyle = '#34D399';
+  ctx.fill();
+
+  // Tear-drop stratospheric sounding envelope
+  ctx.beginPath();
+  ctx.moveTo(48, 10.5);
+  ctx.bezierCurveTo(63.5, 10.5, 69, 25, 66.5, 36.5);
+  ctx.bezierCurveTo(64, 48, 53.5, 55, 48, 60.5);
+  ctx.bezierCurveTo(42.5, 55, 32, 48, 29.5, 36.5);
+  ctx.bezierCurveTo(27, 25, 32.5, 10.5, 48, 10.5);
+  ctx.closePath();
+  fillAndHalo(ctx, color, 5.1, '#A7F3D0');
+
+  // Subtle central gore seam
+  ctx.beginPath();
+  ctx.moveTo(48, 12);
+  ctx.quadraticCurveTo(51.5, 35, 48, 58.5);
+  ctx.strokeStyle = 'rgba(167, 243, 208, 0.45)';
+  ctx.lineWidth = 1.35;
+  ctx.stroke();
+
+  // Specular highlight along upper-left envelope crown
+  ctx.beginPath();
+  ctx.moveTo(39.5, 17.5);
+  ctx.quadraticCurveTo(34, 25, 36, 36.5);
+  ctx.strokeStyle = '#A7F3D0';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+function drawDroneHale(ctx: CanvasRenderingContext2D, color: string): void {
+  // Sleek swept-wing & V-tail HALE fixed-wing UAV facing North (-Y), centered at (48, 48)
+  ctx.beginPath();
+  ctx.moveTo(48, 10);
+  ctx.quadraticCurveTo(54.5, 15, 53.2, 27);
+  ctx.lineTo(52.2, 39.5);
+  ctx.lineTo(89, 49.5);
+  ctx.lineTo(89, 54);
+  ctx.lineTo(52, 47.5);
+  ctx.lineTo(51, 69);
+  ctx.lineTo(64.5, 79.5);
+  ctx.lineTo(64.5, 84);
+  ctx.lineTo(50, 76.5);
+  ctx.lineTo(48, 82);
+  ctx.lineTo(46, 76.5);
+  ctx.lineTo(31.5, 84);
+  ctx.lineTo(31.5, 79.5);
+  ctx.lineTo(45, 69);
+  ctx.lineTo(44, 47.5);
+  ctx.lineTo(7, 54);
+  ctx.lineTo(7, 49.5);
+  ctx.lineTo(43.8, 39.5);
+  ctx.lineTo(42.8, 27);
+  ctx.quadraticCurveTo(41.5, 15, 48, 10);
+  ctx.closePath();
+  fillAndHalo(ctx, color, 5.1, '#ECFCCB');
+
+  // Forward SATCOM radome highlight & dorsal spine
+  ctx.beginPath();
+  ctx.ellipse(48, 21, 3.1, 6.2, 0, 0, Math.PI * 2);
+  ctx.fillStyle = '#ECFCCB';
+  ctx.fill();
+
+  ctx.beginPath();
+  ctx.moveTo(48, 29);
+  ctx.lineTo(48, 72);
+  ctx.strokeStyle = 'rgba(236, 252, 203, 0.72)';
+  ctx.lineWidth = 1.6;
   ctx.stroke();
 }
 
@@ -581,12 +738,17 @@ export function registerTacticalSprites(map: maplibregl.Map): void {
   registerCanvasSprite(map, 'sprite-prop-civil', (ctx) => drawPropCivil(ctx, '#38BDF8'));
   registerCanvasSprite(map, 'sprite-heli-civil', (ctx) => drawHelicopter(ctx, '#22D3EE', false));
   registerCanvasSprite(map, 'sprite-fast-military', (ctx) => drawFastMilitary(ctx, '#F59E0B'));
+  registerCanvasSprite(map, 'sprite-heavy-military', (ctx) => drawHeavyMilitary(ctx, '#F59E0B'));
   registerCanvasSprite(map, 'sprite-heli-military', (ctx) => drawHelicopter(ctx, '#F59E0B', true));
   registerCanvasSprite(map, 'sprite-emergency', (ctx) => drawEmergency(ctx, '#EF4444'));
   registerCanvasSprite(map, 'sprite-satellite', (ctx) => drawSatellite(ctx, '#E879F9'));
   registerCanvasSprite(map, 'sprite-satellite-eclipsed', (ctx) => drawSatellite(ctx, '#7E22CE'));
   registerCanvasSprite(map, 'sprite-balloon', (ctx) => drawBalloon(ctx, '#34D399'));
+  registerCanvasSprite(map, 'sprite-balloon-windborne', (ctx) =>
+    drawBalloonWindBorne(ctx, '#34D399')
+  );
   registerCanvasSprite(map, 'sprite-drone', (ctx) => drawDrone(ctx, '#A3E635', false));
+  registerCanvasSprite(map, 'sprite-drone-hale', (ctx) => drawDroneHale(ctx, '#A3E635'));
   registerCanvasSprite(map, 'sprite-drone-breach', (ctx) => drawDrone(ctx, '#FB7185', true));
   registerCanvasSprite(map, 'sprite-operator', (ctx) => drawOperator(ctx, '#94A3B8'));
   registerCanvasSprite(map, 'sprite-observer', (ctx) => drawObserver(ctx, '#38BDF8'));
@@ -603,7 +765,9 @@ export function resolveSpriteForEntity(entity: SkyEntity): TacticalSpriteId {
         return 'sprite-emergency';
       }
       if (entity.isMilitary || entity.category === 'military') {
-        return entity.airframeClass === 'heli' ? 'sprite-heli-military' : 'sprite-fast-military';
+        if (entity.airframeClass === 'heli') return 'sprite-heli-military';
+        if (entity.airframeClass === 'heavy') return 'sprite-heavy-military';
+        return 'sprite-fast-military';
       }
       switch (entity.airframeClass) {
         case 'heavy':
@@ -621,10 +785,13 @@ export function resolveSpriteForEntity(entity: SkyEntity): TacticalSpriteId {
     case 'satellite':
       return entity.sunlit ? 'sprite-satellite' : 'sprite-satellite-eclipsed';
     case 'balloon':
-      return 'sprite-balloon';
+      return entity.subSource === 'windborne' ? 'sprite-balloon-windborne' : 'sprite-balloon';
     case 'drone':
-      return entity.ceilingBreach || entity.tfrBreach || Boolean(entity.emergencyFlag)
-        ? 'sprite-drone-breach'
+      if (entity.ceilingBreach || entity.tfrBreach || Boolean(entity.emergencyFlag)) {
+        return 'sprite-drone-breach';
+      }
+      return entity.subSource === 'adsb-uas' || entity.uaType === 'fixed-wing'
+        ? 'sprite-drone-hale'
         : 'sprite-drone';
   }
 }
