@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Crosshair, Search } from 'lucide-react';
 import {
+  OVERHEAD_FALLBACK_MIN_EL_DEG,
+  OVERHEAD_PRIMARY_MIN_EL_DEG,
   type AtmosphericScope,
   type BalloonEntity,
   type DroneEntity,
@@ -1505,15 +1507,27 @@ export default function App() {
       bufferToggleRef.current = bufferToggleRef.current === 0 ? 1 : 0;
       nextEntities.clear();
 
-      const counts = {
+      const counts: {
+        flight: number;
+        military: number;
+        satellite: number;
+        balloon: number;
+        drone: number;
+        overhead: number;
+        overheadConeDeg: 45 | 20;
+        total: number;
+      } = {
         flight: 0,
         military: 0,
         satellite: 0,
         balloon: 0,
         drone: 0,
         overhead: 0,
+        overheadConeDeg: 45,
         total: 0,
       };
+      let overheadPrimary = 0;
+      let overheadFallback = 0;
 
       const checkAcousticEvents = (entity: SkyEntity, enabled: boolean) => {
         if (!enabled) return;
@@ -1581,15 +1595,19 @@ export default function App() {
               if (st.layers[prevExisting.category]) {
                 counts[prevExisting.category] = Math.max(0, counts[prevExisting.category] - 1);
                 counts.total = Math.max(0, counts.total - 1);
-                if (prevExisting.topocentric.elevationDeg >= 30) {
-                  counts.overhead = Math.max(0, counts.overhead - 1);
+                if (prevExisting.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+                  overheadPrimary = Math.max(0, overheadPrimary - 1);
+                } else if (prevExisting.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
+                  overheadFallback = Math.max(0, overheadFallback - 1);
                 }
               }
               if (st.layers[nextCat]) {
                 counts[nextCat] += 1;
                 counts.total += 1;
-                if (prevExisting.topocentric.elevationDeg >= 30) {
-                  counts.overhead += 1;
+                if (prevExisting.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+                  overheadPrimary += 1;
+                } else if (prevExisting.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
+                  overheadFallback += 1;
                 }
               } else {
                 nextEntities.delete(entity.id);
@@ -1617,7 +1635,11 @@ export default function App() {
         nextEntities.set(entity.id, entity);
         counts[entity.category] += 1;
         counts.total += 1;
-        if (entity.topocentric.elevationDeg >= 30) counts.overhead += 1;
+        if (entity.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+          overheadPrimary += 1;
+        } else if (entity.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
+          overheadFallback += 1;
+        }
         checkAcousticEvents(entity, st.audioEnabled);
       };
 
@@ -1784,10 +1806,17 @@ export default function App() {
 
           counts.satellite += 1;
           counts.total += 1;
-          if (topocentric.elevationDeg >= 30) counts.overhead += 1;
+          if (topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+            overheadPrimary += 1;
+          } else if (topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
+            overheadFallback += 1;
+          }
           checkAcousticEvents(updated, st.audioEnabled);
         }
       }
+
+      counts.overhead = overheadPrimary > 0 ? overheadPrimary : overheadFallback;
+      counts.overheadConeDeg = overheadPrimary > 0 ? 45 : 20;
 
       liveKinematicsRegistry.entities = nextEntities;
       liveKinematicsRegistry.version += 1;
@@ -1810,6 +1839,7 @@ export default function App() {
           prevCounts.balloon !== counts.balloon ||
           prevCounts.drone !== counts.drone ||
           prevCounts.overhead !== counts.overhead ||
+          prevCounts.overheadConeDeg !== counts.overheadConeDeg ||
           prevCounts.total !== counts.total
         ) {
           st.setCounts(counts);
