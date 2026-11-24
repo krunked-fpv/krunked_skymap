@@ -132,6 +132,11 @@ function parseUrlHashPatch(): UrlHydrationPatch | null {
     patch.selectedId = selectedParam;
   }
 
+  const dzParam = params.get('dz');
+  if (dzParam === 'zenith' || dzParam === 'hemisphere') {
+    patch.skyDomeZoom = dzParam;
+  }
+
   return Object.keys(patch).length > 0 ? patch : null;
 }
 
@@ -150,6 +155,7 @@ function buildUrlHashString(): string {
   params.set('scope', s.orbitalScope);
   params.set('atm', s.atmosphericScope);
   params.set('pip', s.skyDomePip ? '1' : '0');
+  params.set('dz', s.skyDomeZoom);
   if (s.selectedId) {
     params.set('selected', s.selectedId);
   }
@@ -169,6 +175,7 @@ export default function App() {
   const units = useSkyStore((s) => s.units);
   const layout = useSkyStore((s) => s.layout);
   const skyDomePip = useSkyStore((s) => s.skyDomePip);
+  const skyDomeZoom = useSkyStore((s) => s.skyDomeZoom);
   const selectedId = useSkyStore((s) => s.selectedId);
   const workerReady = useSkyStore((s) => s.workerReady);
   const odidConfig = useSkyStore((s) => s.odidConfig);
@@ -188,6 +195,11 @@ export default function App() {
   const globalAdsbDronesRef = useRef<Map<string, DroneEntity>>(new Map());
   const simStartMsRef = useRef<number>(Date.now());
   const hydratedRef = useRef(false);
+  const entityBuffersRef = useRef<[Map<string, SkyEntity>, Map<string, SkyEntity>]>([
+    new Map(),
+    new Map(),
+  ]);
+  const bufferToggleRef = useRef<0 | 1>(0);
 
   const flightsInFlightRef = useRef(false);
   const globalFlightsInFlightRef = useRef(false);
@@ -446,10 +458,50 @@ export default function App() {
           st.setActiveDockTray(null);
           return;
         }
-        if (st.inspectorOpen) {
+        if (st.inspectorOpen || st.selectedId !== null) {
           event.preventDefault();
           event.stopImmediatePropagation();
           st.selectEntity(null, false);
+        }
+        return;
+      }
+
+      if (
+        !isTextEntry &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !st.odidModalOpen &&
+        !st.commandPaletteOpen
+      ) {
+        switch (event.key.toLowerCase()) {
+          case 'm':
+            event.preventDefault();
+            st.setLayout('map');
+            break;
+          case 's':
+            event.preventDefault();
+            st.setLayout('split');
+            break;
+          case 'd':
+            event.preventDefault();
+            st.setLayout('dome');
+            break;
+          case 'p':
+            event.preventDefault();
+            if (st.layout === 'map') {
+              st.toggleSkyDomePip();
+            } else {
+              st.setLayout('map');
+              st.setSkyDomePip(true);
+            }
+            break;
+          case 'l':
+            event.preventDefault();
+            st.toggleDomeLabels();
+            break;
+          default:
+            break;
         }
       }
     };
@@ -472,7 +524,7 @@ export default function App() {
       }
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [observer, radiusKm, layers, units, layout, orbitalScope, atmosphericScope, skyDomePip, selectedId]);
+  }, [observer, radiusKm, layers, units, layout, orbitalScope, atmosphericScope, skyDomePip, skyDomeZoom, selectedId]);
 
   // 3. Dedicated SGP4 Web Worker Lifecycle & TLE Bootstrap
   useEffect(() => {
@@ -1372,7 +1424,9 @@ export default function App() {
       const nowMs = Date.now();
       const st = useSkyStore.getState();
       const obs = st.observer;
-      const nextEntities = new Map<string, SkyEntity>();
+      const nextEntities = entityBuffersRef.current[bufferToggleRef.current];
+      bufferToggleRef.current = bufferToggleRef.current === 0 ? 1 : 0;
+      nextEntities.clear();
 
       const counts = {
         flight: 0,
