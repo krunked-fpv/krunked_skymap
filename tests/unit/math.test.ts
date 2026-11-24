@@ -5,10 +5,12 @@ import {
   WGS84_F,
   computeBearingDeg,
   computeClosestApproach,
+  computeScreenCompensatedHeadingDeg,
   computeSkyDomeTrajectoryTangent,
   computeSolarLunarTopocentric,
   computeTargetEnuState,
   computeTopocentricLookAngles,
+  deriveCompassHeadingDeg,
   ecefToEnu,
   elevationToVaultNormR,
   extrapolateDeadReckoning,
@@ -16,11 +18,14 @@ import {
   geodeticToEcef,
   greatCircleDestination,
   haversineDistanceKm,
+  normalizeAzimuthDeg,
   normalizeLonDeg,
   pointInGeoJsonFeature,
   pointInGeoJsonPolygon,
   projectEnuToSkyDome,
   projectToSkyDome,
+  shortestAngleDeltaDeg,
+  smoothCompassHeadingDeg,
   splitAntimeridianLine,
   unprojectFromSkyDome,
 } from '../../src/math/geodesy';
@@ -654,6 +659,344 @@ describe('3D Sky-Dome vault projection, ENU tangents, celestial ephemeris & TCA'
     expect(clamped.isApproaching).toBe(true);
     expect(clamped.tcaSeconds).toBe(600);
     expect(clamped.minSlantRangeKm).toBeLessThan(110);
+  });
+});
+
+describe('Rotation-aware Sky-Dome projection, ENU equivalence, tangents & compass smoothing', () => {
+  it('places heading theta at 12 o-clock (-Y) and round-trips projectToSkyDome <-> unprojectFromSkyDome across arbitrary rotations', () => {
+    const cx = 320;
+    const cy = 240;
+    const radius = 180;
+    const rotations = [
+      0,
+      45,
+      90,
+      143.7,
+      180,
+      270,
+      359.9,
+      -45,
+      720,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ];
+    const azimuths = [0, 22.5, 90, 143.7, 180, 247.3, 315, 359.9];
+
+    for (const mode of ['hemisphere', 'zenith'] as const) {
+      const minEl = mode === 'zenith' ? 30 : 0;
+      const elevations = mode === 'zenith' ? [30, 40, 60, 75, 89.95] : [0, 10, 30, 55, 85, 89.95];
+
+      for (const rot of rotations) {
+        const expectedHeadingAtTop = Number.isFinite(rot) ? normalizeAzimuthDeg(rot) : 0;
+
+        // Rotating dome to heading theta places azimuth theta at 12 o'clock (x = cx, y = cy - r)
+        const topRim = projectToSkyDome(expectedHeadingAtTop, minEl, cx, cy, radius, mode, rot);
+        expect(topRim.visible).toBe(true);
+        expect(topRim.x).toBeCloseTo(cx, 9);
+        expect(topRim.y).toBeCloseTo(cy - radius, 9);
+
+        // Azimuth (theta + 90) lands at 3 o'clock (+X), (theta + 180) at 6 o'clock (+Y), (theta + 270) at 9 o'clock (-X)
+        const eastOfHeading = projectToSkyDome(expectedHeadingAtTop + 90, minEl, cx, cy, radius, mode, rot);
+        expect(eastOfHeading.x).toBeCloseTo(cx + radius, 9);
+        expect(eastOfHeading.y).toBeCloseTo(cy, 9);
+
+        const backTop = unprojectFromSkyDome(cx, cy - radius, cx, cy, radius, mode, rot);
+        expect(backTop.inBounds).toBe(true);
+        expect(Math.abs(shortestAngleDeltaDeg(backTop.azimuthDeg, expectedHeadingAtTop))).toBeLessThan(1e-9);
+        expect(backTop.elevationDeg).toBeCloseTo(minEl, 9);
+
+        for (const el of elevations) {
+          for (const az of azimuths) {
+            const pt = projectToSkyDome(az, el, cx, cy, radius, mode, rot);
+            expect(pt.visible).toBe(true);
+            const back = unprojectFromSkyDome(pt.x, pt.y, cx, cy, radius, mode, rot);
+            expect(back.inBounds).toBe(true);
+            expect(Math.abs(back.elevationDeg - el)).toBeLessThan(0.01);
+            expect(Math.abs(shortestAngleDeltaDeg(back.azimuthDeg, az))).toBeLessThan(0.01);
+          }
+        }
+
+        // Exact center stays Zenith regardless of rotation
+        const centerBack = unprojectFromSkyDome(cx, cy, cx, cy, radius, mode, rot);
+        expect(centerBack.inBounds).toBe(true);
+        expect(centerBack.elevationDeg).toBeCloseTo(90, 11);
+      }
+    }
+  });
+
+  it('matches projectEnuToSkyDome and projectToSkyDome to < 1e-9 px across all rotations and non-finite guards', () => {
+    const cx = 250;
+    const cy = 260;
+    const radius = 200;
+    const rotations = [
+      0,
+      30,
+      90,
+      143.7,
+      180,
+      270,
+      359.9,
+      -45,
+      -405,
+      540,
+      720,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ];
+    const vectors: Array<[number, number, number]> = [
+      [0, 10000, 10000], // North, 45 deg
+      [8000, 5000, 12000], // NE, ~51.8 deg
+      [-9500, -4200, 18000], // SW, ~60 deg
+      [12000, -7000, 2000], // SE, low elevation
+      [10000, 0, 0], // Exact horizon East
+      [0, 0, 10000], // Exact Zenith
+      [0, 1e-8, 10000], // Sub-micrometer Zenith neighborhood
+    ];
+
+    for (const mode of ['hemisphere', 'zenith'] as const) {
+      for (const rot of rotations) {
+        for (const [e, n, u] of vectors) {
+          const h = Math.hypot(e, n);
+          const azDeg = h < 1e-15 ? 0 : normalizeAzimuthDeg((Math.atan2(e, n) * 180) / Math.PI);
+          const elDeg = (Math.atan2(u, h) * 180) / Math.PI;
+          const enuPt = projectEnuToSkyDome(e, n, u, cx, cy, radius, mode, false, rot);
+          const azElPt = projectToSkyDome(azDeg, elDeg, cx, cy, radius, mode, rot);
+
+          expect(enuPt.visible).toBe(azElPt.visible);
+          expect(Math.abs(enuPt.x - azElPt.x)).toBeLessThan(1e-9);
+          expect(Math.abs(enuPt.y - azElPt.y)).toBeLessThan(1e-9);
+          expect(Math.abs(enuPt.r - azElPt.r)).toBeLessThan(1e-9);
+          expect(Math.abs(enuPt.normR - azElPt.normR)).toBeLessThan(1e-11);
+        }
+
+        // Exact Zenith returns exact center with no negative zero or NaN
+        const zenithPt = projectEnuToSkyDome(0, 0, 10000, 0, 0, radius, mode, false, rot);
+        expect(zenithPt.visible).toBe(true);
+        expect(Object.is(zenithPt.x, 0)).toBe(true);
+        expect(Object.is(zenithPt.y, 0)).toBe(true);
+      }
+    }
+  });
+
+  it('keeps rotated computeSkyDomeTrajectoryTangent smooth (< 2 deg/step) through Zenith & Antimeridian and rotates fallbacks consistently', () => {
+    const obs = { lat: 38.8512, lon: -77.0402, altM: 12 };
+    const cx = 250;
+    const cy = 250;
+    const radius = 200;
+    const rotations = [0, 90, 180, 270, 143.7, -45, 720, Number.NaN];
+    const offsetsKm = [-5, -1, -0.05, -0.001, 0, 0.001, 0.05, 1, 5];
+    const maxStepRad = (2 * Math.PI) / 180;
+
+    const angularDiffRad = (a: number, b: number) => Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
+
+    for (const mode of ['hemisphere', 'zenith'] as const) {
+      for (const rot of rotations) {
+        const safeRot = Number.isFinite(rot) ? normalizeAzimuthDeg(rot) : 0;
+        const expectedNorthRad = ((-90 - safeRot) * Math.PI) / 180;
+        let prevAngle: number | null = null;
+
+        for (const kmNorth of offsetsKm) {
+          const pos =
+            kmNorth === 0
+              ? { lat: obs.lat, lon: obs.lon }
+              : greatCircleDestination(obs.lat, obs.lon, kmNorth > 0 ? 0 : 180, Math.abs(kmNorth));
+          const angle = computeSkyDomeTrajectoryTangent(
+            obs,
+            { lat: pos.lat, lon: pos.lon, altM: 10012, speedMs: 250, headingDeg: 0, vertRateMs: 0 },
+            cx,
+            cy,
+            radius,
+            mode,
+            rot
+          );
+          expect(Number.isFinite(angle)).toBe(true);
+          expect(angularDiffRad(angle, expectedNorthRad)).toBeLessThan(maxStepRad);
+          if (prevAngle !== null) {
+            expect(angularDiffRad(angle, prevAngle)).toBeLessThan(maxStepRad);
+          }
+          prevAngle = angle;
+        }
+      }
+    }
+
+    // Antimeridian crossing smoothness at arbitrary rotations
+    const antObs = { lat: 0, lon: 179.95, altM: 0 };
+    for (const rot of [0, 90, 180, 270, 143.7]) {
+      const expectedEastRad = ((0 - rot) * Math.PI) / 180;
+      const westSide = computeSkyDomeTrajectoryTangent(
+        antObs,
+        { lat: 0, lon: 179.99, altM: 11000, speedMs: 240, headingDeg: 90, vertRateMs: 0 },
+        cx,
+        cy,
+        radius,
+        'hemisphere',
+        rot
+      );
+      const eastSide = computeSkyDomeTrajectoryTangent(
+        antObs,
+        { lat: 0, lon: -179.99, altM: 11000, speedMs: 240, headingDeg: 90, vertRateMs: 0 },
+        cx,
+        cy,
+        radius,
+        'hemisphere',
+        rot
+      );
+      expect(angularDiffRad(westSide, expectedEastRad)).toBeLessThan(maxStepRad);
+      expect(angularDiffRad(eastSide, expectedEastRad)).toBeLessThan(maxStepRad);
+      expect(angularDiffRad(eastSide, westSide)).toBeLessThan(maxStepRad);
+    }
+
+    // Fallback angle rotates consistently when headingValid === false or target is colocated/stationary
+    for (const rot of [0, 90, 180, 270, 143.7, -45, Number.NaN]) {
+      const safeRot = Number.isFinite(rot) ? normalizeAzimuthDeg(rot) : 0;
+      const expectedSouthFallback = ((180 - safeRot - 90) * Math.PI) / 180;
+
+      const invalidHeadingFallback = computeSkyDomeTrajectoryTangent(
+        obs,
+        { lat: obs.lat, lon: obs.lon, altM: 500, speedMs: 0, headingDeg: 180, headingValid: false },
+        cx,
+        cy,
+        radius,
+        'hemisphere',
+        rot
+      );
+      expect(angularDiffRad(invalidHeadingFallback, expectedSouthFallback)).toBeLessThan(1e-9);
+
+      const colocatedStationaryFallback = computeSkyDomeTrajectoryTangent(
+        obs,
+        { lat: obs.lat, lon: obs.lon, altM: obs.altM, speedMs: 0, headingDeg: 180, headingValid: true },
+        cx,
+        cy,
+        radius,
+        'hemisphere',
+        rot
+      );
+      expect(angularDiffRad(colocatedStationaryFallback, expectedSouthFallback)).toBeLessThan(1e-9);
+
+      const hoverOverhead = computeSkyDomeTrajectoryTangent(
+        obs,
+        { lat: obs.lat, lon: obs.lon, altM: 500, speedMs: 0, headingDeg: 90, headingValid: true },
+        cx,
+        cy,
+        radius,
+        'hemisphere',
+        rot
+      );
+      const expectedEast = ((90 - safeRot - 90) * Math.PI) / 180;
+      expect(angularDiffRad(hoverOverhead, expectedEast)).toBeLessThan(1e-3);
+    }
+  });
+
+  it('computes shortestAngleDeltaDeg and smoothCompassHeadingDeg across North seam, antipodes, wraps & non-finite guards', () => {
+    // North seam 359.8 <-> 0.2 shortest arc (+-0.4 deg, never +-359.6 deg)
+    expect(shortestAngleDeltaDeg(359.8, 0.2)).toBeCloseTo(0.4, 12);
+    expect(shortestAngleDeltaDeg(0.2, 359.8)).toBeCloseTo(-0.4, 12);
+
+    // Exact 0 / 360 / 720 / negative wraps
+    expect(shortestAngleDeltaDeg(0, 360)).toBe(0);
+    expect(shortestAngleDeltaDeg(0, 720)).toBe(0);
+    expect(shortestAngleDeltaDeg(-45, 315)).toBe(0);
+    expect(shortestAngleDeltaDeg(-10, 10)).toBeCloseTo(20, 12);
+    expect(shortestAngleDeltaDeg(730, -350)).toBe(0);
+    expect(shortestAngleDeltaDeg(1080 + 359.8, -720 + 0.2)).toBeCloseTo(0.4, 12);
+
+    // +-180 deg antipodal boundary and slight perturbations around it
+    expect(Math.abs(shortestAngleDeltaDeg(0, 180))).toBe(180);
+    expect(Math.abs(shortestAngleDeltaDeg(180, 0))).toBe(180);
+    expect(Math.abs(shortestAngleDeltaDeg(90, 270))).toBe(180);
+    expect(shortestAngleDeltaDeg(0, 179.9)).toBeCloseTo(179.9, 12);
+    expect(shortestAngleDeltaDeg(0, 180.1)).toBeCloseTo(-179.9, 12);
+
+    // Non-finite guards
+    expect(shortestAngleDeltaDeg(Number.NaN, 90)).toBe(0);
+    expect(shortestAngleDeltaDeg(90, Number.POSITIVE_INFINITY)).toBe(0);
+    expect(shortestAngleDeltaDeg(Number.NEGATIVE_INFINITY, Number.NaN)).toBe(0);
+
+    // smoothCompassHeadingDeg across North seam (never spins 359.6 deg backwards)
+    const stepCw = smoothCompassHeadingDeg(359.8, 0.2, 0.18);
+    expect(stepCw).toBeCloseTo(359.872, 9);
+    expect(Math.abs(shortestAngleDeltaDeg(stepCw, 0))).toBeLessThan(0.2);
+
+    const stepCcw = smoothCompassHeadingDeg(0.2, 359.8, 0.18);
+    expect(stepCcw).toBeCloseTo(0.128, 9);
+    expect(Math.abs(shortestAngleDeltaDeg(stepCcw, 0))).toBeLessThan(0.2);
+
+    // alpha = 0, 1, and out-of-range clamping + non-finite alpha fallback
+    expect(smoothCompassHeadingDeg(359.8, 0.2, 0)).toBeCloseTo(359.8, 12);
+    expect(smoothCompassHeadingDeg(359.8, 0.2, 1)).toBeCloseTo(0.2, 12);
+    expect(smoothCompassHeadingDeg(359.8, 0.2, -5)).toBeCloseTo(359.8, 12);
+    expect(smoothCompassHeadingDeg(359.8, 0.2, 5)).toBeCloseTo(0.2, 12);
+    expect(smoothCompassHeadingDeg(359.8, 0.2, Number.NaN)).toBeCloseTo(359.872, 9);
+    expect(smoothCompassHeadingDeg(359.8, 0.2, Number.POSITIVE_INFINITY)).toBeCloseTo(359.872, 9);
+
+    // Non-finite current / target guards & large/negative angles
+    expect(smoothCompassHeadingDeg(Number.NaN, 143.7, 0.18)).toBeCloseTo(143.7, 12);
+    expect(smoothCompassHeadingDeg(143.7, Number.POSITIVE_INFINITY, 0.18)).toBeCloseTo(143.7, 12);
+    expect(smoothCompassHeadingDeg(Number.NaN, Number.NaN, 0.18)).toBe(0);
+    expect(smoothCompassHeadingDeg(-45, 765, 0.5)).toBeCloseTo(0, 12); // 315 -> 45 halfway = 0 (North)
+    expect(smoothCompassHeadingDeg(0, 180, 0.5)).toBeCloseTo(90, 12);
+
+    // Repeated jitter convergence across 359.8 <-> 0.2 North seam stays locked near 0 deg
+    let heading = 359.8;
+    let prevErr = Math.abs(shortestAngleDeltaDeg(heading, 0.2));
+    for (let i = 0; i < 40; i++) {
+      heading = smoothCompassHeadingDeg(heading, 0.2, 0.18);
+      const err = Math.abs(shortestAngleDeltaDeg(heading, 0.2));
+      expect(err).toBeLessThanOrEqual(prevErr + 1e-12);
+      expect(Math.abs(shortestAngleDeltaDeg(heading, 0))).toBeLessThan(0.25);
+      prevErr = err;
+    }
+    expect(Math.abs(shortestAngleDeltaDeg(heading, 0.2))).toBeLessThan(1e-3);
+
+    // Symmetric jitter around North seam stays tightly centered near 0 deg (never jumps to 180 deg)
+    let jittered = 359.7;
+    const jitterSamples = [0.3, 359.6, 0.4, 359.8, 0.1, 359.9, 0.2, 359.8, 0.0, 359.95, 0.05, 0.0];
+    for (const sample of jitterSamples) {
+      jittered = smoothCompassHeadingDeg(jittered, sample, 0.18);
+      expect(Math.abs(shortestAngleDeltaDeg(jittered, 0))).toBeLessThan(0.5);
+    }
+    expect(Math.abs(shortestAngleDeltaDeg(jittered, 0))).toBeLessThan(0.15);
+  });
+
+  it('derives screen-compensated Android & iOS compass headings cleanly', () => {
+    // Android W3C alpha -> clockwise compass heading across screen orientations
+    expect(computeScreenCompensatedHeadingDeg(0, 0)).toBe(0);
+    expect(computeScreenCompensatedHeadingDeg(90, 0)).toBe(270);
+    expect(computeScreenCompensatedHeadingDeg(180, 0)).toBe(180);
+    expect(computeScreenCompensatedHeadingDeg(270, 0)).toBe(90);
+    expect(computeScreenCompensatedHeadingDeg(359.8, 0)).toBeCloseTo(0.2, 12);
+    expect(computeScreenCompensatedHeadingDeg(0, 90)).toBe(90);
+    expect(computeScreenCompensatedHeadingDeg(90, 90)).toBe(0);
+    expect(computeScreenCompensatedHeadingDeg(0, 270)).toBe(270);
+    expect(computeScreenCompensatedHeadingDeg(0, -90)).toBe(270);
+    expect(computeScreenCompensatedHeadingDeg(0, 180)).toBe(180);
+    expect(computeScreenCompensatedHeadingDeg(90, Number.NaN)).toBe(270);
+    expect(computeScreenCompensatedHeadingDeg(null, 0)).toBeNull();
+    expect(computeScreenCompensatedHeadingDeg(undefined, 90)).toBeNull();
+    expect(computeScreenCompensatedHeadingDeg(Number.NaN, 0)).toBeNull();
+    expect(computeScreenCompensatedHeadingDeg(Number.POSITIVE_INFINITY, 0)).toBeNull();
+
+    // deriveCompassHeadingDeg: iOS webkitCompassHeading precedence & Android deviceorientationabsolute fallback
+    expect(deriveCompassHeadingDeg({ webkitCompassHeading: 143.7, alpha: 10, absolute: false })).toBeCloseTo(143.7, 12);
+    expect(deriveCompassHeadingDeg({ webkitCompassHeading: 0 })).toBe(0);
+    expect(deriveCompassHeadingDeg({ webkitCompassHeading: 360 })).toBe(0);
+    expect(
+      deriveCompassHeadingDeg({ webkitCompassHeading: -1, alpha: 90, absolute: true, screenAngle: 0 })
+    ).toBe(270);
+    expect(
+      deriveCompassHeadingDeg({ webkitCompassHeading: Number.NaN, alpha: 270, absolute: true, screenAngle: 90 })
+    ).toBe(180);
+    expect(
+      deriveCompassHeadingDeg({ alpha: 90, absolute: true, screenOrientationDeg: 90 })
+    ).toBe(0);
+    expect(deriveCompassHeadingDeg({ alpha: 90, absolute: true, screenAngle: -90 })).toBe(180);
+    expect(deriveCompassHeadingDeg({ alpha: 90, absolute: false, screenAngle: 0 })).toBeNull();
+    expect(deriveCompassHeadingDeg({ alpha: 90 })).toBeNull();
+    expect(deriveCompassHeadingDeg({ alpha: null, absolute: true })).toBeNull();
+    expect(deriveCompassHeadingDeg(null)).toBeNull();
+    expect(deriveCompassHeadingDeg(undefined)).toBeNull();
   });
 });
 
