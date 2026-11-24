@@ -195,6 +195,8 @@ export function TargetInspector() {
     return (
       <aside
         className="target-inspector"
+        data-testid="target-inspector"
+        data-open="false"
         aria-hidden="true"
         aria-label="Target telemetry inspector"
       />
@@ -242,6 +244,8 @@ export function TargetInspector() {
   return (
     <aside
       className={`target-inspector${isOpen ? ' is-open' : ''}`}
+      data-testid="target-inspector"
+      data-open={isOpen ? 'true' : 'false'}
       aria-hidden={!isOpen}
       aria-label={`Target inspector for ${entity.callsign || entity.id}`}
     >
@@ -259,6 +263,7 @@ export function TargetInspector() {
         <button
           type="button"
           className="inspector-close-btn"
+          data-testid="target-inspector-close"
           onClick={() => selectEntity(null, false)}
           aria-label="Close target inspector"
           title="Close inspector (Esc)"

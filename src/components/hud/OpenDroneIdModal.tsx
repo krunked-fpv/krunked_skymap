@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { createPortal } from 'react-dom';
 import { AlertTriangle, Check, Copy, Radio, Wifi, WifiOff, X } from 'lucide-react';
 import { useSkyStore } from '../../store/useSkyStore';
 
@@ -132,11 +133,16 @@ export function OpenDroneIdModal() {
         ? 'SIM-ODID ACTIVE (4 LOCAL UAS)'
         : 'OFFLINE';
 
-  return (
+  const modalContent = (
     <div
       className="cockpit-modal-backdrop"
       role="presentation"
       onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          setOdidModalOpen(false);
+        }
+      }}
+      onClick={(event) => {
         if (event.target === event.currentTarget) {
           setOdidModalOpen(false);
         }
@@ -147,6 +153,8 @@ export function OpenDroneIdModal() {
         role="dialog"
         aria-modal="true"
         aria-labelledby="odid-modal-title"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
       >
         <div className="cockpit-modal__header">
           <h2 id="odid-modal-title" className="cockpit-modal__title">
@@ -273,6 +281,10 @@ export function OpenDroneIdModal() {
       </div>
     </div>
   );
+
+  return typeof document !== 'undefined' && document.body
+    ? createPortal(modalContent, document.body)
+    : modalContent;
 }
 
 export default OpenDroneIdModal;
