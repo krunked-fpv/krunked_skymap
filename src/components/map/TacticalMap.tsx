@@ -309,6 +309,23 @@ function formatSpeedCompact(entity: SkyEntity, units: UnitSystem): string {
   return `${Math.round(entity.speedMs * 3.6)} km/h`;
 }
 
+function resolveTooltipCategoryLabel(entity: SkyEntity): string {
+  switch (entity.category) {
+    case 'flight':
+      return entity.isMilitary ? 'MIL' : 'CIVIL';
+    case 'military':
+      return 'MIL';
+    case 'satellite':
+      return 'SAT';
+    case 'balloon':
+      if (entity.subSource === 'windborne') return 'WINDBORNE';
+      if (entity.subSource === 'adsb-lta') return 'ADS-B LTA';
+      return 'SONDEHUB';
+    case 'drone':
+      return entity.subSource === 'adsb-uas' ? 'ATC UAS' : 'UAS';
+  }
+}
+
 function buildHoverTooltip(
   entity: SkyEntity,
   x: number,
@@ -328,14 +345,6 @@ function buildHoverTooltip(
     else if (entity.isSimulated) alertTag = 'SIM-ODID';
   }
 
-  const categoryMap: Record<SkyEntity['category'], string> = {
-    flight: 'CIVIL',
-    military: 'MIL',
-    satellite: 'SAT',
-    balloon: 'SONDE',
-    drone: 'UAS',
-  };
-
   const az = Math.round(((entity.topocentric.azimuthDeg % 360) + 360) % 360)
     .toString()
     .padStart(3, '0');
@@ -347,7 +356,7 @@ function buildHoverTooltip(
     y,
     callsign: entity.callsign || entity.id,
     subtitle: entity.subtitle,
-    categoryLabel: categoryMap[entity.category],
+    categoryLabel: resolveTooltipCategoryLabel(entity),
     color: resolveEntityColor(entity),
     altText: formatAltitudeCompact(entity, units),
     speedText: formatSpeedCompact(entity, units),
@@ -508,7 +517,10 @@ function buildEntitiesAndOperatorsFc(
 
     let iconScale = 0.84;
     if (entity.category === 'flight' && entity.airframeClass === 'heavy') iconScale = 0.94;
-    if (entity.category === 'military') iconScale = 0.92;
+    if (entity.category === 'military' || (entity.category === 'flight' && entity.isMilitary)) {
+      iconScale = entity.airframeClass === 'heavy' ? 0.96 : 0.92;
+    }
+    if (entity.category === 'drone' && entity.subSource === 'adsb-uas') iconScale = 0.9;
     if (isSelected || isHovered) iconScale += 0.18;
 
     const sortKey = getEntitySortKey(entity, isSelected, isHovered, isAlert);
@@ -541,6 +553,8 @@ function buildEntitiesAndOperatorsFc(
 
     if (
       entity.category === 'drone' &&
+      entity.hasOperatorLocation !== false &&
+      entity.subSource !== 'adsb-uas' &&
       Number.isFinite(entity.operatorLat) &&
       Number.isFinite(entity.operatorLon)
     ) {
@@ -626,6 +640,8 @@ function buildTrailsAndVectorsFc(
 
     if (
       entity.category === 'drone' &&
+      entity.hasOperatorLocation !== false &&
+      entity.subSource !== 'adsb-uas' &&
       Number.isFinite(entity.operatorLat) &&
       Number.isFinite(entity.operatorLon)
     ) {
@@ -837,7 +853,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     paint: {
       'line-color': ['get', 'color'],
       'line-width': 1.5,
-      'line-opacity': 0.45,
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 1.5, 0.18, 6, 0.45],
     },
   });
   map.addLayer({
@@ -848,7 +864,7 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
     paint: {
       'line-color': ['get', 'color'],
       'line-width': 1.25,
-      'line-opacity': 0.68,
+      'line-opacity': ['interpolate', ['linear'], ['zoom'], 1.5, 0.14, 5, 0.35, 9, 0.65],
       'line-dasharray': [2, 2],
     },
   });
@@ -932,14 +948,18 @@ function registerSourcesAndLayers(map: maplibregl.Map): void {
         'interpolate',
         ['linear'],
         ['zoom'],
-        4,
-        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.56],
-        7.5,
-        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.78],
-        11,
-        ['coalesce', ['get', 'iconScale'], 0.85],
+        1.5,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.34],
+        3.5,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.52],
+        6,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.72],
+        9,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 0.9],
+        12,
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 1.05],
         14,
-        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 1.15],
+        ['*', ['coalesce', ['get', 'iconScale'], 0.85], 1.18],
       ],
       'icon-rotate': ['get', 'headingDeg'],
       'icon-rotation-alignment': 'map',
@@ -974,6 +994,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const recenterNonce = useSkyStore((s) => s.recenterNonce);
   const layers = useSkyStore((s) => s.layers);
+  const droneSublayers = useSkyStore((s) => s.droneSublayers);
+  const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
   const airspace = useSkyStore((s) => s.airspace);
   const selectedId = useSkyStore((s) => s.selectedId);
   const hoveredId = useSkyStore((s) => s.hoveredId);
@@ -994,6 +1016,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
   });
   const prevRadiusRef = useRef<number>(radiusKm);
   const prevRecenterNonceRef = useRef<number>(recenterNonce);
+  const prevScopeRef = useRef(atmosphericScope);
 
   // Initialize MapLibre once
   useEffect(() => {
@@ -1102,7 +1125,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       }
 
       const zoom = activeMap.getZoom();
-      const maxAutoLabels = zoom < 5.5 ? 0 : zoom < 7.5 ? 10 : zoom < 9.5 ? 22 : 42;
+      const maxAutoLabels = zoom < 6.0 ? 0 : zoom < 8.0 ? 10 : zoom < 10.0 ? 22 : 42;
 
       interface LabelCandidate {
         entity: SkyEntity;
@@ -1147,7 +1170,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         if (!state.mapLabelsEnabled && !isSelected && !isHovered) {
           continue;
         }
-        if (state.mapLabelsEnabled && zoom < 5.5 && !isSelected && !isHovered && !isAlert) {
+        if (state.mapLabelsEnabled && zoom < 6.0 && !isSelected && !isHovered && !isAlert) {
           continue;
         }
 
@@ -1177,7 +1200,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
       for (const item of candidates) {
         const mustShow = item.isSelected || item.isHovered;
-        const zoomAlertBypass = state.mapLabelsEnabled && zoom < 5.5 && item.isAlert;
+        const zoomAlertBypass = state.mapLabelsEnabled && zoom < 6.0 && item.isAlert;
         if (!mustShow && !zoomAlertBypass && autoDrawn >= maxAutoLabels) {
           continue;
         }
@@ -1226,6 +1249,24 @@ export function TacticalMap({ className }: TacticalMapProps) {
           }
         }
 
+        if (!chosenBox && item.isAlert && !mustShow) {
+          for (const slot of slots) {
+            if (
+              slot.x < 6 ||
+              slot.x + boxW > width - 6 ||
+              slot.y < 6 ||
+              slot.y + boxH > height - 6
+            ) {
+              continue;
+            }
+            const candidateBox: LabelBox = { x: slot.x, y: slot.y, w: boxW, h: boxH };
+            if (!overlapsAny(candidateBox, placedLabelBoxes)) {
+              chosenBox = candidateBox;
+              break;
+            }
+          }
+        }
+
         if (!chosenBox) {
           if (!mustShow) continue;
           const preferLeft = item.px + offset + boxW > width - 6;
@@ -1244,14 +1285,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
         const { x: lx, y: ly } = chosenBox;
         ctx.fillStyle = mustShow
-          ? 'rgba(9, 15, 28, 0.94)'
+          ? 'rgba(7, 10, 17, 0.94)'
           : item.isAlert
             ? 'rgba(28, 10, 16, 0.90)'
-            : 'rgba(6, 11, 20, 0.84)';
-        ctx.strokeStyle = mustShow || item.isAlert ? item.color : 'rgba(120, 190, 255, 0.24)';
-        ctx.lineWidth = mustShow || item.isAlert ? 1.1 : 0.8;
+            : 'rgba(7, 10, 17, 0.88)';
+        ctx.strokeStyle = mustShow || item.isAlert ? item.color : 'rgba(255, 255, 255, 0.14)';
+        ctx.lineWidth = mustShow || item.isAlert ? 1.2 : 1;
         ctx.beginPath();
-        traceRoundedRect(ctx, lx, ly, boxW, boxH, 3.5);
+        traceRoundedRect(ctx, lx, ly, boxW, boxH, 4);
         ctx.fill();
         ctx.stroke();
 
@@ -1377,6 +1418,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       prevObserverRef.current = { lat: st.observer.lat, lon: st.observer.lon };
       prevRadiusRef.current = st.radiusKm;
       prevRecenterNonceRef.current = st.recenterNonce;
+      prevScopeRef.current = st.atmosphericScope;
 
       (map.getSource(SOURCE_IDS.uasfm) as maplibregl.GeoJSONSource | undefined)?.setData(
         st.airspace.uasfm ?? EMPTY_FC
@@ -1407,10 +1449,12 @@ export function TacticalMap({ className }: TacticalMapProps) {
         buildTrailsAndVectorsFc(st.layers)
       );
 
-      const droneVis = st.layers.drone ? 'visible' : 'none';
-      map.setLayoutProperty(LAYER_IDS.uasfmFill, 'visibility', droneVis);
-      map.setLayoutProperty(LAYER_IDS.uasfmOutline, 'visibility', droneVis);
-      map.setLayoutProperty(LAYER_IDS.operatorsSymbol, 'visibility', droneVis);
+      const airspaceVis = st.layers.drone && st.droneSublayers.airspace ? 'visible' : 'none';
+      map.setLayoutProperty(LAYER_IDS.uasfmFill, 'visibility', airspaceVis);
+      map.setLayoutProperty(LAYER_IDS.uasfmOutline, 'visibility', airspaceVis);
+      map.setLayoutProperty(LAYER_IDS.suaFill, 'visibility', airspaceVis);
+      map.setLayoutProperty(LAYER_IDS.suaOutline, 'visibility', airspaceVis);
+      map.setLayoutProperty(LAYER_IDS.operatorsSymbol, 'visibility', airspaceVis);
 
       map.on('mousemove', LAYER_IDS.entitiesSymbol, handleMouseMove);
       map.on('mouseleave', LAYER_IDS.entitiesSymbol, handleMouseLeave);
@@ -1685,21 +1729,63 @@ export function TacticalMap({ className }: TacticalMapProps) {
     );
   }, [airspace]);
 
-  // Sync UASFM & operator visibility when drone layer toggles
+  // Sync UASFM, SUA & operator visibility when drone layer or airspace sublayer toggles
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapLoadedRef.current) return;
-    const vis = layers.drone ? 'visible' : 'none';
+    const vis = layers.drone && droneSublayers.airspace ? 'visible' : 'none';
     if (map.getLayer(LAYER_IDS.uasfmFill)) {
       map.setLayoutProperty(LAYER_IDS.uasfmFill, 'visibility', vis);
     }
     if (map.getLayer(LAYER_IDS.uasfmOutline)) {
       map.setLayoutProperty(LAYER_IDS.uasfmOutline, 'visibility', vis);
     }
+    if (map.getLayer(LAYER_IDS.suaFill)) {
+      map.setLayoutProperty(LAYER_IDS.suaFill, 'visibility', vis);
+    }
+    if (map.getLayer(LAYER_IDS.suaOutline)) {
+      map.setLayoutProperty(LAYER_IDS.suaOutline, 'visibility', vis);
+    }
     if (map.getLayer(LAYER_IDS.operatorsSymbol)) {
       map.setLayoutProperty(LAYER_IDS.operatorsSymbol, 'visibility', vis);
     }
-  }, [layers.drone]);
+  }, [layers.drone, droneSublayers.airspace]);
+
+  // Smoothly zoom out/in when user actively switches atmospheric scope
+  useEffect(() => {
+    const prevScope = prevScopeRef.current;
+    prevScopeRef.current = atmosphericScope;
+    if (prevScope === atmosphericScope) return;
+
+    const map = mapRef.current;
+    if (!map || !mapLoadedRef.current) return;
+
+    const st = useSkyStore.getState();
+    if (atmosphericScope === 'global' && prevScope === 'local') {
+      if (!st.followSelected) {
+        map.easeTo({
+          zoom: Math.min(map.getZoom(), 3.6),
+          duration: 750,
+          essential: true,
+        });
+      }
+    } else if (atmosphericScope === 'local' && prevScope === 'global') {
+      if (!st.followSelected) {
+        map.flyTo({
+          center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
+          zoom: zoomForRadiusKm(st.radiusKm, st.observer.lat),
+          duration: 650,
+          essential: true,
+        });
+      } else {
+        map.easeTo({
+          zoom: zoomForRadiusKm(st.radiusKm, st.observer.lat),
+          duration: 650,
+          essential: true,
+        });
+      }
+    }
+  }, [atmosphericScope]);
 
   // Trigger immediate easeTo when followSelected is toggled on
   useEffect(() => {
@@ -1797,19 +1883,19 @@ export function TacticalMap({ className }: TacticalMapProps) {
             minHeight: 30,
             borderRadius: 6,
             border: mapLabelsEnabled
-              ? '1px solid rgba(34, 211, 238, 0.5)'
-              : '1px solid rgba(120, 190, 255, 0.16)',
-            backgroundColor: mapLabelsEnabled
-              ? 'rgba(34, 211, 238, 0.12)'
-              : 'rgba(11, 17, 30, 0.82)',
+              ? '1px solid rgba(34, 211, 238, 0.42)'
+              : '1px solid rgba(255, 255, 255, 0.10)',
+            backgroundColor: 'rgba(7, 10, 17, 0.86)',
             color: mapLabelsEnabled ? '#E0F2FE' : '#94A3B8',
             fontFamily: MONO_FONT,
             fontSize: 10,
             fontWeight: 600,
             letterSpacing: '0.06em',
             cursor: 'pointer',
-            backdropFilter: 'blur(8px)',
-            WebkitBackdropFilter: 'blur(8px)',
+            backdropFilter: 'blur(20px) saturate(150%)',
+            WebkitBackdropFilter: 'blur(20px) saturate(150%)',
+            boxShadow:
+              'inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 8px 24px rgba(0, 0, 0, 0.48)',
             outline: 'none',
             touchAction: 'manipulation',
           }}
@@ -1896,10 +1982,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
             zIndex: 20,
             padding: '8px 10px',
             borderRadius: 8,
-            backgroundColor: 'rgba(11, 17, 30, 0.92)',
-            backdropFilter: 'blur(10px)',
-            border: `1px solid ${hoverTip.color}55`,
-            boxShadow: '0 8px 24px rgba(0, 0, 0, 0.55)',
+            backgroundColor: 'rgba(7, 10, 17, 0.86)',
+            backdropFilter: 'blur(20px) saturate(150%)',
+            WebkitBackdropFilter: 'blur(20px) saturate(150%)',
+            border: hoverTip.alertTag
+              ? `1px solid ${hoverTip.color}66`
+              : '1px solid rgba(255, 255, 255, 0.10)',
+            boxShadow:
+              'inset 0 1px 0 rgba(255, 255, 255, 0.14), 0 14px 36px rgba(0, 0, 0, 0.65)',
             color: '#E2E8F0',
             fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
             fontVariantNumeric: 'tabular-nums',
