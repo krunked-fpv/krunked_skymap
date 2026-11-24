@@ -2533,7 +2533,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       requestPermission?: () => Promise<'granted' | 'denied'>;
     };
     if (typeof DevOrientCtor?.requestPermission === 'function') {
-      void Promise.resolve(DevOrientCtor.requestPermission())
+      let permPromise: Promise<'granted' | 'denied'>;
+      try {
+        permPromise = Promise.resolve(DevOrientCtor.requestPermission());
+      } catch {
+        setDomeCompassActive(false);
+        showCompassStatus('Compass permission denied — drag dome to rotate');
+        return;
+      }
+      void permPromise
         .then((permission) => {
           if (permission === 'granted') {
             setDomeCompassSupported(true);

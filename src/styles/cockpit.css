@@ -2481,9 +2481,11 @@ select {
     bottom: calc(48% + 8px);
   }
 
+  .skymap-stage[data-layout='split'] .stage-dome-pane .skydome-bezel-controls,
+  .skymap-stage[data-layout='dome'] .stage-dome-pane .skydome-bezel-controls,
   .skymap-stage .stage-dome-pane .skydome-bezel-controls,
   .skymap-stage .stage-dome-pane .skydome-legend {
-    bottom: 122px !important;
+    bottom: 118px !important;
   }
 
   .skymap-stage[data-layout='map'] .maplibregl-ctrl-bottom-right {

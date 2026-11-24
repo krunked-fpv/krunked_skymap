@@ -500,3 +500,19 @@ npx vitest run tests/adversarial/chaos.test.ts --pool=vmThreads
 - `npx tsc --noEmit` -> **PASS (exit 0)**
 - `npx vitest run tests/adversarial/chaos.test.ts --pool=vmThreads` -> **50 / 50 PASS** (`Challenge 1`–`Challenge 10`, including SW v5 updates and all 4 Sprint 05 Challenge 10 suites)
 
+### Sprint 05 Low-Severity Remediation Sign-Off
+
+Both Low hardening items (`[DEFECT-S5-01]`, `[DEFECT-S5-02]`) were remediated on `main`:
+
+| Defect ID | File Updated | Verification Status |
+| :--- | :--- | :--- |
+| `[DEFECT-S5-01]` | `src/components/skydome/PolarSkyDome.tsx` | Fixed & Verified (`try/catch` guards synchronous throws from `DeviceOrientationEvent.requestPermission()`) |
+| `[DEFECT-S5-02]` | `src/components/hud/ControlDock.tsx` | Fixed & Verified (`window.clearTimeout(debounceRef.current)` cancels pending search debounce when Command Palette closes) |
+
+#### Sprint 05 Final Open Defect Tally
+- **Critical:** **0**
+- **High:** **0**
+- **Medium:** **0**
+- **Low:** **0**
+
+

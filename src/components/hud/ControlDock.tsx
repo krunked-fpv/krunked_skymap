@@ -245,6 +245,10 @@ export function ControlDock({
       });
       return () => window.cancelAnimationFrame(id);
     }
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
     abortRef.current?.abort();
     abortRef.current = null;
     return undefined;
