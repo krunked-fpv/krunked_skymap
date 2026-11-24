@@ -5,6 +5,7 @@ import visualTleRaw from '../../public/data/tle/visual.tle?raw';
 import starlinkTleRaw from '../../public/data/tle/starlink.tle?raw';
 import appSourceRaw from '../../src/App.tsx?raw';
 import balloonsSourceRaw from '../../src/services/balloonsService.ts?raw';
+import cockpitCssRaw from '../../src/styles/cockpit.css?raw';
 import controlDockSourceRaw from '../../src/components/hud/ControlDock.tsx?raw';
 import polarDomeSourceRaw from '../../src/components/skydome/PolarSkyDome.tsx?raw';
 import tacticalMapSourceRaw from '../../src/components/map/TacticalMap.tsx?raw';
@@ -30,11 +31,18 @@ import {
   clearFlightsServiceCache,
   extractRelayedJsonPayload,
   fetchFlightsCascade,
+  fetchGlobalSpecialFlights,
   flightsCircuitBreaker,
+  globalFlightsCircuitBreaker,
   normalizeAdsbxAircraft,
   normalizeOpenSkyState,
 } from '../../src/services/flightsService';
-import { fetchBalloons, normalizeSondeRecord } from '../../src/services/balloonsService';
+import {
+  clearBalloonsCache,
+  fetchBalloons,
+  normalizeSondeRecord,
+  parseWindBorneConstellation,
+} from '../../src/services/balloonsService';
 import { fetchAirspace } from '../../src/services/airspaceService';
 import {
   clearTleCache,
@@ -48,7 +56,8 @@ import {
   stepSimulatedDrones,
 } from '../../src/services/openDroneIdService';
 import { TacticalAudioEngine } from '../../src/audio/tacticalAudio';
-import { useSkyStore } from '../../src/store/useSkyStore';
+import { liveKinematicsRegistry, useSkyStore } from '../../src/store/useSkyStore';
+import { resolveSpriteForEntity } from '../../src/assets/sprites/tacticalSprites';
 import {
   formatAltitude as formatInspectorAltitude,
   formatDoppler as formatInspectorDoppler,
@@ -1863,5 +1872,1176 @@ describe('Challenge 7 — Sprint 02.1 Live ADS-B CORS Relays, Fast-Bypass & Circ
     expect(retryGateSlice).not.toContain("'loading'");
     expect(normalizedDock).toContain('data-testid="dock-feed-retry"');
     expect(normalizedDock).toContain('onClick={onManualSweep}');
+  });
+});
+
+async function mountAppInJsdom(): Promise<{
+  window: Window & typeof globalThis;
+  document: Document;
+  container: HTMLElement;
+  cleanup: () => Promise<void>;
+}> {
+  const jsdomMod = (await import('jsdom')) as {
+    JSDOM: new (
+      html: string,
+      opts?: Record<string, unknown>
+    ) => { window: Window & typeof globalThis };
+  };
+  const dom = new jsdomMod.JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
+    url: 'https://krunked-fpv.github.io/krunked_skymap/',
+  });
+
+  const w = dom.window as unknown as Record<string, unknown>;
+  const domUrl = dom.window.URL as unknown as {
+    createObjectURL?: (obj: unknown) => string;
+    revokeObjectURL?: (url: string) => void;
+  };
+  if (typeof domUrl.createObjectURL !== 'function') {
+    domUrl.createObjectURL = () => 'blob:mock-url';
+  }
+  if (typeof domUrl.revokeObjectURL !== 'function') {
+    domUrl.revokeObjectURL = () => {};
+  }
+  if (typeof w.requestAnimationFrame !== 'function') {
+    w.requestAnimationFrame = () => 1;
+  }
+  if (typeof w.cancelAnimationFrame !== 'function') {
+    w.cancelAnimationFrame = () => {};
+  }
+
+  useSkyStore.getState().selectEntity(null, false);
+  useSkyStore.setState({
+    commandPaletteOpen: false,
+    odidModalOpen: false,
+    diagnosticsOpen: false,
+    settingsOpen: false,
+    inspectorOpen: false,
+    selectedEntitySnapshot: null,
+  });
+
+  vi.stubGlobal('window', dom.window);
+  vi.stubGlobal('document', dom.window.document);
+  vi.stubGlobal('navigator', dom.window.navigator);
+  vi.stubGlobal('location', dom.window.location);
+  vi.stubGlobal('history', dom.window.history);
+  vi.stubGlobal('URL', dom.window.URL);
+  vi.stubGlobal('HTMLElement', dom.window.HTMLElement);
+  vi.stubGlobal('HTMLInputElement', dom.window.HTMLInputElement);
+  vi.stubGlobal('HTMLTextAreaElement', dom.window.HTMLTextAreaElement);
+  vi.stubGlobal('HTMLSelectElement', dom.window.HTMLSelectElement);
+  vi.stubGlobal('Node', dom.window.Node);
+  vi.stubGlobal('Element', dom.window.Element);
+  vi.stubGlobal('Event', dom.window.Event);
+  vi.stubGlobal('KeyboardEvent', dom.window.KeyboardEvent);
+  vi.stubGlobal('MouseEvent', dom.window.MouseEvent);
+  vi.stubGlobal('getComputedStyle', dom.window.getComputedStyle.bind(dom.window));
+  vi.stubGlobal('requestAnimationFrame', () => 1);
+  vi.stubGlobal('cancelAnimationFrame', () => {});
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+
+  if (!w.matchMedia) {
+    w.matchMedia = () => ({
+      matches: false,
+      media: '',
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    });
+  }
+  if (!w.ResizeObserver) {
+    w.ResizeObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
+
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('.tle')) {
+        return new Response('', { status: 200 });
+      }
+      if (url.includes('fallback-airspace.geojson')) {
+        return new Response(fallbackAirspaceRaw, { status: 200 });
+      }
+      if (url.includes('windborne-balloons.json')) {
+        return new Response(
+          JSON.stringify({ capturedAtMs: Date.now(), t0: [[38.85, -77.04, 18]], t1: [] }),
+          { status: 200 }
+        );
+      }
+      if (url.includes('windborne') || url.includes('treasure')) {
+        return new Response('[]', { status: 200 });
+      }
+      return new Response(JSON.stringify({ ac: [] }), { status: 200 });
+    })
+  );
+
+  // Stub heavy WebGL/2D canvas viewports so HUD & overlay keyboard tests avoid loading MapLibre WebGL workers
+  vi.doMock('../../src/components/map/TacticalMap', () => ({
+    TacticalMap: () => null,
+  }));
+  vi.doMock('../../src/components/skydome/PolarSkyDome', () => ({
+    PolarSkyDome: () => null,
+  }));
+
+  const React = await import('react');
+  const { act } = React;
+  const { createRoot } = await import('react-dom/client');
+  const { default: App } = await import('../../src/App');
+
+  const container = dom.window.document.getElementById('root')!;
+  let root: ReturnType<typeof createRoot> | null = null;
+
+  await act(async () => {
+    root = createRoot(container);
+    root.render(React.createElement(App));
+  });
+
+  return {
+    window: dom.window,
+    document: dom.window.document,
+    container,
+    cleanup: async () => {
+      await act(async () => {
+        root?.unmount();
+      });
+      dom.window.close();
+      vi.unstubAllGlobals();
+    },
+  };
+}
+
+describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA, Scale & Glass-Cockpit Overlay Audit', () => {
+  const DCA: ObserverLocation = {
+    lat: 38.8512,
+    lon: -77.0402,
+    altM: 12,
+    label: 'DCA',
+    source: 'preset',
+  };
+
+  beforeEach(() => {
+    clearFlightsServiceCache();
+    clearBalloonsCache();
+    clearTleCache();
+    liveKinematicsRegistry.entities.clear();
+    liveKinematicsRegistry.rawFlights.clear();
+    liveKinematicsRegistry.rawGlobalFlights.clear();
+    liveKinematicsRegistry.rawBalloons.clear();
+    liveKinematicsRegistry.rawAdsbBalloons.clear();
+    liveKinematicsRegistry.rawDrones.clear();
+    liveKinematicsRegistry.rawAdsbDrones.clear();
+    liveKinematicsRegistry.satellites.clear();
+    liveKinematicsRegistry.orbitOverlay = null;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    useSkyStore.setState({
+      observer: { ...DCA },
+      radiusKm: 120,
+      atmosphericScope: 'global',
+      layout: 'split',
+      skyDomePip: true,
+      layers: {
+        flight: true,
+        military: true,
+        satellite: true,
+        balloon: true,
+        drone: true,
+      },
+      selectedId: null,
+      hoveredId: null,
+      followSelected: false,
+      inspectorOpen: false,
+      selectedEntitySnapshot: null,
+      odidModalOpen: false,
+      commandPaletteOpen: false,
+      diagnosticsOpen: false,
+      settingsOpen: false,
+    });
+  });
+
+  it('hardens WindBorne tuple validation, mismatched snapshot lengths, >450km jump guard, and Antimeridian ±180° heading/speed', () => {
+    const t0Ms = 1_764_000_000_000;
+    const t0Raw: unknown[] = [
+      null, // index 0: null tuple
+      [Number.NaN, -77.0, 18.0], // index 1: NaN
+      [38.8, Number.POSITIVE_INFINITY, 18.0], // index 2: Infinity
+      [0, 0, 18.0], // index 3: Null Island exact
+      [0.00005, -0.00005, 18.0], // index 4: Null Island epsilon
+      [91.0, 10.0, 18.0], // index 5: lat > 90
+      [-91.0, 10.0, 18.0], // index 6: lat < -90
+      [10.0, 181.0, 18.0], // index 7: lon > 180
+      [10.0, -181.0, 18.0], // index 8: lon < -180
+      [10.0, 10.0, -0.6], // index 9: altKm < -0.5
+      [10.0, 10.0, 61.0], // index 10: altKm > 60
+      [10.0, 10.0], // index 11: tuple length < 3
+      ['38.8', '-77.0', '18'], // index 12: non-numeric strings
+      [0.0, -179.5, 19.8], // index 13: valid Antimeridian eastbound crossing
+      [0.0, 179.5, 17.0], // index 14: valid Antimeridian westbound crossing
+      [42.0, -71.0, 20.0], // index 15: >450 km slot reassignment teleport vs t1
+      [35.0, 139.0, 18.5], // index 16: t2 outlier (>450 km from t1) while t1 -> t0 valid
+      [51.5, -0.1, 15.0], // index 17: beyond mismatched t1/t2 array bounds
+    ];
+    const t1Raw: unknown[] = [
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [10, 10, 10],
+      [0.0, 179.5, 18.0], // index 13: 1 deg east across ±180° in 1h (~111.195 km, 90° E)
+      [0.0, -179.5, 17.0], // index 14: 1 deg west across ±180° in 1h (~111.195 km, 270° W)
+      [42.0, -64.0, 20.0], // index 15: ~579 km > 450 km jump
+      [35.0, 138.0, 18.0], // index 16: ~91 km from t0
+    ];
+    const t2Raw: unknown[] = new Array(17).fill(null);
+    t2Raw[13] = [0.0, 178.5, 16.5]; // valid T-2h -> T-1h step (~111.195 km)
+    t2Raw[15] = [42.0, -63.5, 19.5];
+    t2Raw[16] = [10.0, 10.0, 18.0]; // >450 km from t1 -> omitted from trail
+
+    const balloons = parseWindBorneConstellation(t0Raw, t1Raw, t2Raw, DCA, {
+      timestampMs: t0Ms,
+    });
+    expect(balloons.map((b) => b.constellationId)).toEqual([
+      'WB-GSB-014',
+      'WB-GSB-015',
+      'WB-GSB-016',
+      'WB-GSB-017',
+      'WB-GSB-018',
+    ]);
+
+    for (const b of balloons) {
+      expect(Number.isFinite(b.lat)).toBe(true);
+      expect(Number.isFinite(b.lon)).toBe(true);
+      expect(Number.isFinite(b.altM)).toBe(true);
+      expect(Number.isFinite(b.speedMs)).toBe(true);
+      expect(Number.isFinite(b.headingDeg)).toBe(true);
+      expect(Number.isFinite(b.vertRateMs)).toBe(true);
+      expect(b.subSource).toBe('windborne');
+    }
+
+    // Antimeridian eastbound: 179.5° -> -179.5° (~111.195 km in 3600s = ~30.89 m/s, ~90°)
+    const eastCrossing = balloons.find((b) => b.constellationId === 'WB-GSB-014')!;
+    expect(eastCrossing.headingValid).toBe(true);
+    expect(eastCrossing.headingDeg).toBeCloseTo(90, 0);
+    expect(eastCrossing.speedMs).toBeCloseTo((haversineDistanceKm(0, 179.5, 0, -179.5) * 1000) / 3600, 3);
+    expect(eastCrossing.speedMs).toBeLessThan(35);
+    expect(eastCrossing.vertRateMs).toBeCloseTo(0.5, 3);
+    expect(eastCrossing.trail).toHaveLength(3);
+    expect(eastCrossing.trail.map((p) => p.lon)).toEqual([178.5, 179.5, -179.5]);
+
+    // Antimeridian westbound: -179.5° -> 179.5° (~270°)
+    const westCrossing = balloons.find((b) => b.constellationId === 'WB-GSB-015')!;
+    expect(westCrossing.headingValid).toBe(true);
+    expect(westCrossing.headingDeg).toBeCloseTo(270, 0);
+    expect(westCrossing.speedMs).toBeCloseTo(30.89, 1);
+
+    // >450 km hourly jump guard suppresses speed, heading, vertRate, and corrupt trail
+    const teleported = balloons.find((b) => b.constellationId === 'WB-GSB-016')!;
+    expect(teleported.speedMs).toBe(0);
+    expect(teleported.headingValid).toBe(false);
+    expect(teleported.vertRateMs).toBe(0);
+    expect(teleported.burstState).toBe('float');
+    expect(teleported.trail).toHaveLength(1);
+
+    // Valid t1 -> t0 with >450 km t2 -> t1 drops only t2
+    const t2Jump = balloons.find((b) => b.constellationId === 'WB-GSB-017')!;
+    expect(t2Jump.headingValid).toBe(true);
+    expect(t2Jump.trail).toHaveLength(2);
+
+    // Mismatched beyond t1/t2 bounds keeps t0 safely
+    const beyondT1 = balloons.find((b) => b.constellationId === 'WB-GSB-018')!;
+    expect(beyondT1.speedMs).toBe(0);
+    expect(beyondT1.headingValid).toBe(false);
+    expect(beyondT1.trail).toHaveLength(1);
+    expect(resolveSpriteForEntity(eastCrossing)).toBe('sprite-balloon-windborne');
+  });
+
+  it('[DEFECT-S3-04] fetchBalloons global scope must not mask SondeHub 503 + WindBorne cached seed behind status="live" and Date.now()', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    const seedCapturedAtMs = Date.UTC(2026, 10, 23, 18, 0, 0);
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('api.v2.sondehub.org/sondes')) {
+          return new Response('Service Unavailable', { status: 503 });
+        }
+        if (url.includes('api.v2.sondehub.org/amateur')) {
+          return new Response('{}', { status: 200 });
+        }
+        if (url.includes('data/windborne-balloons.json')) {
+          return new Response(
+            JSON.stringify({
+              capturedAtMs: seedCapturedAtMs,
+              t0: [[38.9, -77.1, 18.0]],
+              t1: [[38.8, -77.2, 17.5]],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('WindBorne unavailable', { status: 503 });
+      })
+    );
+
+    const res = await fetchBalloons(DCA, 120, undefined, {
+      scope: 'global',
+      includeWindBorne: true,
+      includeSondeHub: true,
+      force: true,
+      resetBreakers: true,
+    });
+
+    expect(res.entities).toHaveLength(1);
+    expect(res.entities[0].isCachedSeed).toBe(true);
+    expect(res.status).toBe('cached');
+    expect(res.timestampMs).toBe(seedCapturedAtMs);
+  });
+
+  it('deduplicates global /v2/mil + /v2/ladd + /v2/pia by hex and isolates globalFlightsCircuitBreaker from local flightsCircuitBreaker', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v2/mil')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'AE0170',
+                  flight: 'RCH101',
+                  t: 'C17',
+                  lat: 38.9,
+                  lon: -77.1,
+                  alt_baro: 32000,
+                  gs: 430,
+                  track: 90,
+                  dbFlags: 1,
+                },
+                {
+                  hex: 'ae0999',
+                  flight: 'ORDER66',
+                  t: 'F16',
+                  lat: 36.1,
+                  lon: -115.1,
+                  alt_baro: 25000,
+                  gs: 480,
+                  track: 180,
+                  dbFlags: 0,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v2/ladd')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'ae0170',
+                  flight: 'RCH101',
+                  t: 'C17',
+                  lat: 38.9,
+                  lon: -77.1,
+                  alt_baro: 32000,
+                  gs: 430,
+                  track: 90,
+                  dbFlags: 8,
+                },
+                {
+                  hex: 'a88001',
+                  flight: 'EXEC88',
+                  lat: 34.0,
+                  lon: -118.2,
+                  alt_baro: 41000,
+                  gs: 460,
+                  track: 270,
+                  dbFlags: 8,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v2/pia')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'ae0170',
+                  flight: 'RCH101',
+                  lat: 38.9,
+                  lon: -77.1,
+                  alt_baro: 32000,
+                  gs: 430,
+                  track: 90,
+                  dbFlags: 4,
+                },
+                {
+                  hex: 'a88001',
+                  flight: 'EXEC88',
+                  lat: 34.0,
+                  lon: -118.2,
+                  alt_baro: 41000,
+                  gs: 460,
+                  track: 270,
+                  dbFlags: 4,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const merged = await fetchGlobalSpecialFlights(DCA, undefined, { force: true });
+    expect(merged.status).toBe('live');
+    expect(merged.entities.map((e) => e.icaoHex).sort()).toEqual(['a88001', 'ae0170', 'ae0999']);
+
+    const sharedMil = merged.entities.find((e) => e.icaoHex === 'ae0170')!;
+    expect(sharedMil.isMilitary).toBe(true);
+    expect(sharedMil.isLadd).toBe(true);
+    expect(sharedMil.isPia).toBe(true);
+    expect(sharedMil.category).toBe('military');
+
+    const laddPiaCivil = merged.entities.find((e) => e.icaoHex === 'a88001')!;
+    expect(laddPiaCivil.isMilitary).toBe(false);
+    expect(laddPiaCivil.isLadd).toBe(true);
+    expect(laddPiaCivil.isPia).toBe(true);
+    expect(laddPiaCivil.category).toBe('military');
+
+    // Now prove strict circuit-breaker isolation between global /v2/{mil,ladd,pia} and local /v2/point
+    clearFlightsServiceCache();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v2/mil') || url.includes('/v2/ladd') || url.includes('/v2/pia')) {
+          return new Response('Rate limited', { status: 429 });
+        }
+        if (url.includes('/v2/point') || url.includes('opendata.adsb.fi/api/v3/')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'a12345',
+                  flight: 'DAL202',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 9500,
+                  gs: 250,
+                  track: 90,
+                  seen_pos: 2,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Service Unavailable', { status: 503 });
+      })
+    );
+
+    for (let i = 0; i < 3; i += 1) {
+      const failGlobal = await fetchGlobalSpecialFlights(DCA, undefined, { force: true });
+      expect(failGlobal.status).toBe('rate-limited');
+      expect(failGlobal.httpStatus).toBe(429);
+    }
+
+    expect(globalFlightsCircuitBreaker.getState('global-mil-relay-adsb-lol')).toBe('open');
+    expect(globalFlightsCircuitBreaker.getState('global-ladd-relay-adsb-lol')).toBe('open');
+    expect(globalFlightsCircuitBreaker.getState('global-pia-relay-adsb-lol')).toBe('open');
+    expect(flightsCircuitBreaker.getState('cors-relay-adsb-fi')).toBe('closed');
+    expect(flightsCircuitBreaker.getState('adsb.lol')).toBe('closed');
+
+    // Local /v2/point cascade remains completely unaffected and live
+    const localRes = await fetchFlightsCascade(DCA, 120, undefined, {
+      force: true,
+      resetBreakers: false,
+    });
+    expect(localRes.status).toBe('live');
+    expect(localRes.entities.map((e) => e.callsign)).toEqual(['DAL202']);
+  });
+
+  it('[DEFECT-S3-03] global /v2/mil + /v2/ladd + /v2/pia hex merge must not downgrade heavy/heli airframeClass when downstream feed omits type', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v2/mil')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'ae0170',
+                  flight: 'RCH101',
+                  t: 'C17',
+                  lat: 38.9,
+                  lon: -77.1,
+                  alt_baro: 32000,
+                  gs: 430,
+                  track: 90,
+                  dbFlags: 1,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v2/ladd')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'ae0170',
+                  flight: 'RCH101',
+                  lat: 38.9,
+                  lon: -77.1,
+                  alt_baro: 32000,
+                  gs: 430,
+                  track: 90,
+                  dbFlags: 8,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url.includes('/v2/pia')) {
+          return new Response(JSON.stringify({ ac: [] }), { status: 200 });
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const res = await fetchGlobalSpecialFlights(DCA, undefined, { force: true });
+    const c17 = res.entities.find((e) => e.icaoHex === 'ae0170');
+    expect(c17).toBeDefined();
+    expect(c17!.airframeClass).toBe('heavy');
+    expect(resolveSpriteForEntity(c17!)).toBe('sprite-heavy-military');
+  });
+
+  it('retains high-altitude alt_baro:null + alt_geom:62000, B6 military UAS, B2 LTA balloons, and gs < 5 kts hovering targets', async () => {
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    const dcAirspace: AirspaceData = {
+      uasfm: {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: { CEILING: 400, UNIT: 'FT' },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[[-77.2, 38.7], [-76.9, 38.7], [-76.9, 39.0], [-77.2, 39.0], [-77.2, 38.7]]],
+            },
+          },
+        ],
+      },
+      sua: { type: 'FeatureCollection', features: [] },
+      usCoverage: true,
+    };
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'ae5420',
+                  flight: 'FORTE10',
+                  t: 'RQ4',
+                  category: 'B6',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: null,
+                  alt_geom: 55000,
+                  gs: 320,
+                  track: 90,
+                  dbFlags: 0,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'ae5421',
+                  flight: 'REAP09',
+                  t: 'MQ9',
+                  category: 'B6',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 22000,
+                  gs: 165,
+                  track: 45,
+                  dbFlags: 0,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'a123b2',
+                  flight: 'HBAL701',
+                  t: 'BALL',
+                  category: 'B2',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: null,
+                  alt_geom: 62000,
+                  gs: 3.5,
+                  track: 110,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'a12300',
+                  flight: 'HOVER1',
+                  t: 'B407',
+                  category: 'A7',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: 1200,
+                  gs: 2.0,
+                  track: null,
+                  seen_pos: 2,
+                },
+                {
+                  hex: 'ae9999',
+                  flight: 'DRGN99',
+                  t: 'U2',
+                  lat: 38.86,
+                  lon: -77.05,
+                  alt_baro: null,
+                  alt_geom: 62000,
+                  gs: 410,
+                  track: 270,
+                  dbFlags: 1,
+                  seen_pos: 2,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Unavailable', { status: 503 });
+      })
+    );
+
+    const res = await fetchFlightsCascade(DCA, 120, undefined, {
+      force: true,
+      airspace: dcAirspace,
+    });
+    expect(res.status).toBe('live');
+
+    // HOVER1 (gs < 5 kts) & U2 (alt_baro: null, alt_geom: 62000) retained in entities
+    expect(res.entities.map((e) => e.callsign).sort()).toEqual(['DRGN99', 'HOVER1']);
+    const hover = res.entities.find((e) => e.callsign === 'HOVER1')!;
+    expect(hover.speedMs).toBeCloseTo(2.0 * 0.514444, 3);
+    expect(hover.airframeClass).toBe('heli');
+    const u2 = res.entities.find((e) => e.callsign === 'DRGN99')!;
+    expect(u2.altM).toBeCloseTo(62000 * 0.3048, 1);
+    expect(u2.isMilitary).toBe(true);
+
+    // B6 MQ-9 / RQ-4 routed to uasEntities with isMilitary: true and NO false FL550 UASFM breach
+    expect(res.uasEntities?.map((u) => u.callsign).sort()).toEqual(['FORTE10', 'REAP09']);
+    for (const uas of res.uasEntities ?? []) {
+      expect(uas.subSource).toBe('adsb-uas');
+      expect(uas.isMilitary).toBe(true);
+      expect(uas.hasOperatorLocation).toBe(false);
+      expect(uas.uaType).toBe('fixed-wing');
+      expect(uas.ceilingBreach).toBe(false);
+      expect(resolveSpriteForEntity(uas)).toBe('sprite-drone-hale');
+    }
+
+    // B2 LTA routed to balloonEntities with alt_geom: 62000 & gs: 3.5 retained
+    expect(res.balloonEntities).toHaveLength(1);
+    const lta = res.balloonEntities![0];
+    expect(lta.callsign).toBe('HBAL701');
+    expect(lta.subSource).toBe('adsb-lta');
+    expect(lta.altM).toBeCloseTo(62000 * 0.3048, 1);
+    expect(lta.speedMs).toBeCloseTo(3.5 * 0.514444, 3);
+  });
+
+  it('[DEFECT-S3-07] globalViteProxyUnavailable must not latch on secondary proxy 404, and B6 UAS compliance checks AGL rather than MSL', async () => {
+    // Part A: Secondary proxy /api-proxy/airplanes-live/v2/ladd returning 404 during primary 503 must not permanently kill primary /api-proxy/adsb-lol
+    vi.stubGlobal('window', { location: { hostname: 'localhost' } });
+    const seenProxyUrls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        seenProxyUrls.push(url);
+        if (url === '/api-proxy/adsb-lol/v2/mil') {
+          return new Response(
+            JSON.stringify({
+              ac: [{ hex: 'ae0101', flight: 'RCH1', lat: 38.9, lon: -77.1, alt_baro: 25000, gs: 400, track: 90, dbFlags: 1 }],
+            }),
+            { status: 200 }
+          );
+        }
+        if (url === '/api-proxy/adsb-lol/v2/ladd') {
+          return new Response('Transient upstream error', { status: 503 });
+        }
+        if (url === '/api-proxy/airplanes-live/v2/ladd') {
+          return new Response(JSON.stringify({ message: 'Not found' }), { status: 404 });
+        }
+        if (url.includes('/v2/pia')) {
+          return new Response(JSON.stringify({ ac: [] }), { status: 200 });
+        }
+        return new Response('Fallback', { status: 503 });
+      })
+    );
+
+    await fetchGlobalSpecialFlights(DCA, undefined, { force: true });
+    seenProxyUrls.length = 0;
+    await fetchGlobalSpecialFlights(DCA, undefined, { force: true, resetBreakers: false });
+    expect(seenProxyUrls).toContain('/api-proxy/adsb-lol/v2/mil');
+
+    // Part B: High-elevation US airport (Denver 1,655m MSL) low-AGL B6 UAS breach check
+    clearFlightsServiceCache();
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    const denver: ObserverLocation = {
+      lat: 39.8561,
+      lon: -104.6737,
+      altM: 1655,
+      label: 'KDEN',
+      source: 'manual',
+    };
+    const denverAirspace: AirspaceData = {
+      uasfm: {
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            properties: { CEILING: 400, UNIT: 'FT' },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[[-104.8, 39.7], [-104.5, 39.7], [-104.5, 40.0], [-104.8, 40.0], [-104.8, 39.7]]],
+            },
+          },
+        ],
+      },
+      sua: { type: 'FeatureCollection', features: [] },
+      usCoverage: true,
+    };
+
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith('https://r.jina.ai/https://opendata.adsb.fi/')) {
+          return new Response(
+            JSON.stringify({
+              ac: [
+                {
+                  hex: 'a77001',
+                  flight: 'SCAN01',
+                  t: 'SCAN',
+                  category: 'B6',
+                  lat: 39.86,
+                  lon: -104.68,
+                  alt_baro: null,
+                  alt_geom: 5905, // ~1800m MSL = 145m (476 ft) AGL over 1655m Denver -> exceeds 400 ft ceiling!
+                  gs: 65,
+                  track: 90,
+                  seen_pos: 1,
+                },
+              ],
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+
+    const kdenRes = await fetchFlightsCascade(denver, 120, undefined, {
+      force: true,
+      airspace: denverAirspace,
+    });
+    expect(kdenRes.uasEntities).toHaveLength(1);
+    expect(kdenRes.uasEntities![0].ceilingBreach).toBe(true);
+  });
+
+  it('maintains latency and memory hygiene under 1,000 WindBorne balloons + 500 global military flights + 2,000 satellites', async () => {
+    const fs = await loadNodeFs();
+    const seedJson = JSON.parse(
+      fs.readFileSync(repoFileUrl('public/data/windborne-balloons.json'), 'utf8')
+    ) as { count: number; t0: unknown[]; t1: unknown[] };
+    expect(seedJson.count).toBe(1000);
+    expect(seedJson.t0).toHaveLength(1000);
+    expect(seedJson.t1).toHaveLength(1000);
+
+    // 1. 1,000 WindBorne constellation balloons
+    const t2Synthetic = seedJson.t1.map((row) =>
+      Array.isArray(row) && typeof row[0] === 'number' && typeof row[1] === 'number' && typeof row[2] === 'number'
+        ? [row[0] - 0.1, normalizeLonDeg(row[1] - 0.1), row[2]]
+        : null
+    );
+    const wbStart = performance.now();
+    const wbEntities = parseWindBorneConstellation(seedJson.t0, seedJson.t1, t2Synthetic, DCA, {
+      timestampMs: Date.now(),
+    });
+    const wbElapsedMs = performance.now() - wbStart;
+    expect(wbEntities).toHaveLength(1000);
+    expect(wbElapsedMs).toBeLessThan(150);
+    for (const b of wbEntities) {
+      expect(b.trail.length).toBeLessThanOrEqual(24);
+    }
+
+    // 2. 500 global military flights
+    const milAc = Array.from({ length: 500 }, (_, i) => ({
+      hex: `ae${i.toString(16).padStart(4, '0')}`,
+      flight: `RCH${i}`,
+      t: i % 3 === 0 ? 'C17' : 'F16',
+      lat: -60 + ((i * 17) % 120),
+      lon: -175 + ((i * 29) % 350),
+      alt_baro: 31000,
+      gs: 430,
+      track: (i * 37) % 360,
+      dbFlags: 1,
+      seen_pos: 2,
+    }));
+    vi.stubGlobal('window', { location: { hostname: 'krunked-fpv.github.io' } });
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes('/v2/mil')) return new Response(JSON.stringify({ ac: milAc }), { status: 200 });
+        if (url.includes('/v2/ladd') || url.includes('/v2/pia')) {
+          return new Response(JSON.stringify({ ac: [] }), { status: 200 });
+        }
+        return new Response('Down', { status: 503 });
+      })
+    );
+    const milStart = performance.now();
+    const milRes = await fetchGlobalSpecialFlights(DCA, undefined, { force: true });
+    const milElapsedMs = performance.now() - milStart;
+    expect(milRes.entities).toHaveLength(500);
+    expect(milElapsedMs).toBeLessThan(200);
+
+    // 3. 2,000 satellites SGP4 batch
+    const records: TleRecord[] = [];
+    for (let i = 0; i < 2000; i += 1) {
+      records.push(makeSynthesizedTle(i));
+    }
+    const pool = selectSatellitePool(parseTleRecords(records), true);
+    const satStart = performance.now();
+    const { kinematics, meta } = propagateSatellites(pool, ISS_EPOCH_MS, {
+      observer: DCA,
+      radiusKm: 250,
+      orbitalScope: 'hemisphere',
+      activeGroups: { stations: true, visual: true, starlink: true },
+      fullConstellation: true,
+    });
+    const unpacked = unpackSatelliteKinematics(kinematics, meta, ISS_EPOCH_MS);
+    const satElapsedMs = performance.now() - satStart;
+    expect(satElapsedMs).toBeLessThan(100);
+    expect(unpacked.length).toBeGreaterThan(0);
+
+    // Log scale benchmark for audit report
+    console.info(
+      `[Challenge 8] scale bench: wb1000=${wbElapsedMs.toFixed(2)}ms, mil500=${milElapsedMs.toFixed(2)}ms, sat2000=${satElapsedMs.toFixed(2)}ms`
+    );
+  });
+
+  it('[DEFECT-S3-06] App.tsx must gate 60fps pushAtmospheric on active layers and prune global WindBorne balloons synchronously on GLOBAL -> LOCAL', () => {
+    const scopeEffect = appSourceRaw.slice(
+      appSourceRaw.indexOf('// React to Atmospheric Scope'),
+      appSourceRaw.indexOf('// Manual Sweep trigger')
+    );
+    expect(scopeEffect).toContain('rawGlobalFlights.clear()');
+    expect(scopeEffect).toContain('globalAdsbBalloonsRef.current.clear()');
+    expect(scopeEffect).toContain('globalAdsbDronesRef.current.clear()');
+    // Global WindBorne entries in rawBalloons must also be pruned synchronously on GLOBAL -> LOCAL
+    expect(
+      scopeEffect.includes('rawBalloons') &&
+        (scopeEffect.includes("subSource === 'windborne'") || scopeEffect.includes('groundDistKm')),
+      'App.tsx GLOBAL -> LOCAL transition must synchronously prune out-of-range / WindBorne entries from liveKinematicsRegistry.rawBalloons instead of relying on rAF or async network completion'
+    ).toBe(true);
+
+    // 60fps stepKinematics must not extrapolate 1,000 balloons or 500 military flights when their layer is disabled
+    const stepCallsSlice = appSourceRaw.slice(
+      appSourceRaw.indexOf('pushAtmospheric(liveKinematicsRegistry.rawFlights'),
+      appSourceRaw.indexOf('// Orbital satellites: smooth micro-interpolation')
+    );
+    expect(
+      stepCallsSlice.includes('st.layers.balloon') && stepCallsSlice.includes('st.layers.military'),
+      'App.tsx stepKinematics executes 60fps WGS-84 extrapolation on rawBalloons and rawGlobalFlights even when layers.balloon or layers.military is false'
+    ).toBe(true);
+  });
+
+  it('verifies sw.js krunked-skymap-v3 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
+    const fs = await loadNodeFs();
+    const vm = await loadNodeVm();
+    const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
+    const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8').replace(/\r\n/g, '\n');
+
+    expect(viteConfig).toContain("'/api-proxy/windborne': createAdsbProxyEntry('/api-proxy/windborne', 'https://a.windbornesystems.com')");
+
+    const listeners = new Map<string, (ev: unknown) => void>();
+    const mockFetch = vi.fn(async () => new Response('ok', { status: 200 }));
+    const openedCaches = new Map<string, Map<string, Response>>();
+
+    const sandboxSelf = {
+      location: {
+        origin: 'https://example.github.io',
+        href: 'https://example.github.io/krunked_skymap/sw.js',
+      },
+      addEventListener(type: string, cb: (ev: unknown) => void) {
+        listeners.set(type, cb);
+      },
+      skipWaiting: vi.fn(async () => {}),
+      clients: { claim: vi.fn(async () => {}) },
+    };
+
+    const sandboxCaches = {
+      async open(name: string) {
+        let store = openedCaches.get(name);
+        if (!store) {
+          store = new Map<string, Response>();
+          openedCaches.set(name, store);
+        }
+        return {
+          async add() {},
+          async put(req: Request | string, res: Response) {
+            store!.set(typeof req === 'string' ? req : req.url, res);
+          },
+        };
+      },
+      async keys() {
+        return ['krunked-skymap-v3'];
+      },
+      async delete() {
+        return true;
+      },
+      async match() {
+        return undefined;
+      },
+    };
+
+    vm.runInNewContext(swSource, {
+      self: sandboxSelf,
+      caches: sandboxCaches,
+      fetch: mockFetch,
+      URL,
+      Request,
+      Response,
+      Promise,
+    });
+
+    const fetchListener = listeners.get('fetch')!;
+    const s3BypassUrls = [
+      'https://example.github.io/krunked_skymap/api-proxy/windborne/treasure/00.json',
+      'https://example.github.io/krunked_skymap/data/windborne-balloons.json',
+      'https://example.github.io/krunked_skymap/api/live-odid.json',
+      'https://r.jina.ai/https://a.windbornesystems.com/treasure/00.json?_=123',
+      'https://api.adsb.lol/v2/mil',
+      'https://api.adsb.lol/v2/ladd',
+      'https://api.adsb.lol/v2/pia',
+    ];
+    for (const url of s3BypassUrls) {
+      const respondWith = vi.fn();
+      fetchListener({
+        request: { method: 'GET', cache: 'default', mode: 'same-origin', url },
+        respondWith,
+      });
+      expect(respondWith, `sw.js must bypass ${url}`).not.toHaveBeenCalled();
+    }
+
+    // manifest.json MUST still be handled by networkFirst
+    const manifestRespondWith = vi.fn();
+    fetchListener({
+      request: {
+        method: 'GET',
+        cache: 'default',
+        mode: 'same-origin',
+        url: 'https://example.github.io/krunked_skymap/manifest.json',
+      },
+      respondWith: manifestRespondWith,
+    });
+    expect(manifestRespondWith).toHaveBeenCalledTimes(1);
+    await manifestRespondWith.mock.calls[0][0];
+  });
+
+  it('[DEFECT-S3-01] Ctrl+K / ⌘K toggles Command Palette without duplicate-listener self-cancellation and / respects OpenDroneIdModal', async () => {
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+
+      await act(async () => {
+        appMount.window.dispatchEvent(
+          new appMount.window.KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true })
+        );
+      });
+      expect(
+        useSkyStore.getState().commandPaletteOpen,
+        'Ctrl+K cancelled itself out because both ControlDock and App registered toggle listeners on window'
+      ).toBe(true);
+
+      // Pressing '/' while OpenDroneIdModal is open must NOT open CommandPalette
+      await act(async () => {
+        useSkyStore.getState().setCommandPaletteOpen(false);
+        useSkyStore.getState().setOdidModalOpen(true);
+      });
+      await act(async () => {
+        appMount.window.dispatchEvent(
+          new appMount.window.KeyboardEvent('keydown', { key: '/', bubbles: true })
+        );
+      });
+      expect(
+        useSkyStore.getState().commandPaletteOpen,
+        "'/' bypassed odidModalOpen guard inside ControlDock.tsx"
+      ).toBe(false);
+    } finally {
+      await appMount.cleanup();
+    }
+  }, 15_000);
+
+  it('[DEFECT-S3-02] Escape key must dismiss strictly one top overlay layer at a time without cascading into TargetInspector', async () => {
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      const mockEntity: FlightEntity = {
+        id: 'flight:ae0170',
+        category: 'military',
+        callsign: 'RCH101',
+        subtitle: 'C17 · SQK 1234',
+        country: 'United States',
+        lat: 38.9,
+        lon: -77.1,
+        altM: 9000,
+        speedMs: 220,
+        headingDeg: 90,
+        headingValid: true,
+        vertRateMs: 0,
+        timestampMs: Date.now(),
+        topocentric: {
+          azimuthDeg: 45,
+          elevationDeg: 15,
+          slantRangeKm: 35,
+          groundDistKm: 33,
+          belowHorizon: false,
+        },
+        trail: [],
+        icaoHex: 'ae0170',
+        onGround: false,
+        isMilitary: true,
+        airframeClass: 'heavy',
+      };
+
+      // Case 1: TargetInspector + TopBar Diagnostics Popover open -> first Escape closes Diagnostics ONLY
+      await act(async () => {
+        liveKinematicsRegistry.entities.set(mockEntity.id, mockEntity);
+        useSkyStore.getState().selectEntity(mockEntity.id, true);
+        useSkyStore.getState().setSelectedEntitySnapshot(mockEntity);
+        useSkyStore.getState().setDiagnosticsOpen(true);
+      });
+      await act(async () => {
+        appMount.window.dispatchEvent(
+          new appMount.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+        );
+      });
+      expect(useSkyStore.getState().diagnosticsOpen).toBe(false);
+      expect(
+        useSkyStore.getState().inspectorOpen,
+        'Escape on Diagnostics Popover cascaded through App.tsx + TargetInspector.tsx and closed TargetInspector too'
+      ).toBe(true);
+
+      // Case 2: TargetInspector + ControlDock sub-filter tray open -> first Escape closes sub-tray ONLY
+      const orbitalChevron = appMount.container.querySelector(
+        'button[aria-label="Open ORBITAL sub-filters"]'
+      ) as HTMLButtonElement | null;
+      expect(orbitalChevron).not.toBeNull();
+      await act(async () => {
+        orbitalChevron!.click();
+      });
+      expect(appMount.container.querySelector('.dock-subtray')).not.toBeNull();
+      await act(async () => {
+        appMount.window.dispatchEvent(
+          new appMount.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+        );
+      });
+      expect(appMount.container.querySelector('.dock-subtray')).toBeNull();
+      expect(
+        useSkyStore.getState().inspectorOpen,
+        'Escape on ControlDock sub-filter tray also closed TargetInspector'
+      ).toBe(true);
+
+      // Case 3: TargetInspector + CommandPalette (focus on body, not input) -> first Escape closes CommandPalette ONLY
+      await act(async () => {
+        useSkyStore.getState().setCommandPaletteOpen(true);
+        (appMount.document.activeElement as HTMLElement | null)?.blur?.();
+      });
+      await act(async () => {
+        appMount.window.dispatchEvent(
+          new appMount.window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })
+        );
+      });
+      expect(useSkyStore.getState().commandPaletteOpen).toBe(false);
+      expect(
+        useSkyStore.getState().inspectorOpen,
+        'Escape on CommandPalette (non-input focus) also closed TargetInspector'
+      ).toBe(true);
+    } finally {
+      await appMount.cleanup();
+    }
+  });
+
+  it('[DEFECT-S3-05] TopTelemetryBar system beacon must surface flights error instead of green FEEDS LIVE when balloons are live', async () => {
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      await act(async () => {
+        useSkyStore.getState().setFeedState('flights', { status: 'error', errorMsg: 'HTTP 503' });
+        useSkyStore.getState().setFeedState('military', { status: 'idle' });
+        useSkyStore.getState().setFeedState('balloons', { status: 'live' });
+      });
+
+      const beacon = appMount.container.querySelector(
+        '[data-testid="hud-feed-diagnostics"]'
+      ) as HTMLElement | null;
+      expect(beacon).not.toBeNull();
+      expect(beacon!.className).not.toContain('topbar-beacon-pill--live');
+      expect(beacon!.textContent).not.toContain('FEEDS LIVE');
+    } finally {
+      await appMount.cleanup();
+    }
+  });
+
+  it('[DEFECT-S3-08] cockpit.css & PolarSkyDome must wrap dock-pill at tablet widths with open inspector and lift PolarSkyDome legend on mobile', () => {
+    const tabletInspectorSection = cockpitCssRaw.slice(
+      cockpitCssRaw.indexOf('@media (min-width: 768px) and (max-width: 1440px)'),
+      cockpitCssRaw.indexOf('@media (max-width: 767px)')
+    );
+    expect(
+      /\.dock-pill[\s\S]{0,240}flex-wrap:\s*wrap/.test(tabletInspectorSection),
+      'cockpit.css lacks .dock-pill flex-wrap at 768px-1120px when TargetInspector constrains .control-dock-wrap to right: 364px'
+    ).toBe(true);
+
+    expect(
+      polarDomeSourceRaw.includes('skydome-legend') && cockpitCssRaw.includes('.skydome-legend'),
+      'PolarSkyDome bottom-right legend lacks a .skydome-legend CSS hook lifted clear of the mobile ControlDock on <=767px'
+    ).toBe(true);
   });
 });
