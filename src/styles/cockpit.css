@@ -2332,7 +2332,7 @@ select {
 
   .skymap-stage .stage-dome-pane .skydome-bezel-controls,
   .skymap-stage .stage-dome-pane .skydome-legend {
-    bottom: 92px !important;
+    bottom: 122px !important;
   }
 
   .skymap-stage[data-layout='map'] .maplibregl-ctrl-bottom-right {
