@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
+  type AtmosphericScope,
+  type BalloonEntity,
   type DroneEntity,
+  type FlightEntity,
   type LayoutMode,
   type OrbitalScope,
   type SatelliteEntity,
@@ -15,7 +18,7 @@ import {
   haversineDistanceKm,
 } from './math/geodesy';
 import { AstroClient } from './workers/astroClient';
-import { fetchFlightsCascade } from './services/flightsService';
+import { fetchFlightsCascade, fetchGlobalSpecialFlights } from './services/flightsService';
 import { loadInitialTles, refreshTlesIfStale } from './services/satellitesService';
 import { fetchBalloons } from './services/balloonsService';
 import { evaluateDroneAirspaceCompliance, fetchAirspace } from './services/airspaceService';
@@ -108,6 +111,18 @@ function parseUrlHashPatch(): UrlHydrationPatch | null {
     patch.orbitalScope = scopeParam as OrbitalScope;
   }
 
+  const atmParam = params.get('atm');
+  if (atmParam === 'local' || atmParam === 'global') {
+    patch.atmosphericScope = atmParam as AtmosphericScope;
+  }
+
+  const pipParam = params.get('pip');
+  if (pipParam === '1' || pipParam === 'true') {
+    patch.skyDomePip = true;
+  } else if (pipParam === '0' || pipParam === 'false') {
+    patch.skyDomePip = false;
+  }
+
   const selectedParam = params.get('selected');
   if (selectedParam) {
     patch.selectedId = selectedParam;
@@ -129,6 +144,8 @@ function buildUrlHashString(): string {
   params.set('units', s.units);
   params.set('layout', s.layout);
   params.set('scope', s.orbitalScope);
+  params.set('atm', s.atmosphericScope);
+  params.set('pip', s.skyDomePip ? '1' : '0');
   if (s.selectedId) {
     params.set('selected', s.selectedId);
   }
@@ -140,10 +157,14 @@ export default function App() {
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const layers = useSkyStore((s) => s.layers);
   const satGroups = useSkyStore((s) => s.satGroups);
+  const balloonSublayers = useSkyStore((s) => s.balloonSublayers);
+  const droneSublayers = useSkyStore((s) => s.droneSublayers);
   const fullConstellation = useSkyStore((s) => s.fullConstellation);
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
+  const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
   const units = useSkyStore((s) => s.units);
   const layout = useSkyStore((s) => s.layout);
+  const skyDomePip = useSkyStore((s) => s.skyDomePip);
   const selectedId = useSkyStore((s) => s.selectedId);
   const workerReady = useSkyStore((s) => s.workerReady);
   const odidConfig = useSkyStore((s) => s.odidConfig);
@@ -157,21 +178,67 @@ export default function App() {
   const odidClientRef = useRef<OpenDroneIdClient | null>(null);
   const deferredInstallPromptRef = useRef<BeforeInstallPromptEvent | null>(null);
   const liveWebhookDronesRef = useRef<Map<string, DroneEntity>>(new Map());
+  const localAdsbBalloonsRef = useRef<Map<string, BalloonEntity>>(new Map());
+  const globalAdsbBalloonsRef = useRef<Map<string, BalloonEntity>>(new Map());
+  const localAdsbDronesRef = useRef<Map<string, DroneEntity>>(new Map());
+  const globalAdsbDronesRef = useRef<Map<string, DroneEntity>>(new Map());
   const simStartMsRef = useRef<number>(Date.now());
   const hydratedRef = useRef(false);
+
   const flightsInFlightRef = useRef(false);
+  const globalFlightsInFlightRef = useRef(false);
   const balloonsInFlightRef = useRef(false);
   const airspaceInFlightRef = useRef(false);
+
+  const flightsAbortRef = useRef<AbortController | null>(null);
+  const globalFlightsAbortRef = useRef<AbortController | null>(null);
+  const balloonsAbortRef = useRef<AbortController | null>(null);
+  const airspaceAbortRef = useRef<AbortController | null>(null);
+
+  const flightsSeqRef = useRef(0);
+  const globalFlightsSeqRef = useRef(0);
+  const balloonsSeqRef = useRef(0);
+  const airspaceSeqRef = useRef(0);
+
   const lastFlightsAttemptMsRef = useRef<number>(0);
   const nextFlightsDueMsRef = useRef<number>(Date.now() + 10_000);
+  const lastGlobalFlightsAttemptMsRef = useRef<number>(0);
+  const nextGlobalFlightsDueMsRef = useRef<number>(Date.now() + 18_000);
   const missingSelectedSinceRef = useRef<number | null>(null);
   const zenithNotifiedRef = useRef<Set<string>>(new Set());
   const alertNotifiedRef = useRef<Set<string>>(new Set());
   const prevSelectedIdRef = useRef<string | null>(null);
+  const prevAtmosphericScopeRef = useRef<AtmosphericScope>(atmosphericScope);
+  const prevBalloonSublayersRef = useRef(balloonSublayers);
   const lastFetchedCoordsRef = useRef<{ lat: number; lon: number }>({
     lat: observer.lat,
     lon: observer.lon,
   });
+
+  const syncAdsbSecondaryRegistries = useCallback(() => {
+    const scope = useSkyStore.getState().atmosphericScope;
+    const nextBalloons = new Map<string, BalloonEntity>();
+    if (scope === 'global') {
+      for (const [id, b] of globalAdsbBalloonsRef.current.entries()) {
+        nextBalloons.set(id, b);
+      }
+    }
+    for (const [id, b] of localAdsbBalloonsRef.current.entries()) {
+      nextBalloons.set(id, b);
+    }
+    liveKinematicsRegistry.rawAdsbBalloons = nextBalloons;
+
+    const nextDrones = new Map<string, DroneEntity>();
+    if (scope === 'global') {
+      for (const [id, d] of globalAdsbDronesRef.current.entries()) {
+        nextDrones.set(id, d);
+      }
+    }
+    for (const [id, d] of localAdsbDronesRef.current.entries()) {
+      nextDrones.set(id, d);
+    }
+    liveKinematicsRegistry.rawAdsbDrones = nextDrones;
+  }, []);
 
   // 1. Hydrate from URL permalink immediately once & honor pre-granted geolocation non-blockingly
   useEffect(() => {
@@ -290,6 +357,45 @@ export default function App() {
     };
   }, []);
 
+  // 1c. Global Cockpit Keyboard Shortcuts (`⌘K` / `Ctrl+K`, `/`, `Escape`)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const st = useSkyStore.getState();
+      const target = event.target as HTMLElement | null;
+      const isTextEntry =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        Boolean(target?.isContentEditable);
+
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        st.setCommandPaletteOpen(!st.commandPaletteOpen);
+        return;
+      }
+
+      if (event.key === '/' && !isTextEntry && !event.metaKey && !event.ctrlKey && !event.altKey) {
+        if (!st.odidModalOpen) {
+          event.preventDefault();
+          st.setCommandPaletteOpen(true);
+        }
+        return;
+      }
+
+      if (event.key === 'Escape') {
+        if (st.commandPaletteOpen || st.diagnosticsOpen || st.settingsOpen) {
+          st.closeAllPopovers();
+        } else if (st.inspectorOpen && !st.odidModalOpen) {
+          st.selectEntity(null, false);
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
   // 2. Debounced URL Hash Permalink Synchronization
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -304,7 +410,7 @@ export default function App() {
       }
     }, 400);
     return () => window.clearTimeout(timer);
-  }, [observer, radiusKm, layers, units, layout, orbitalScope, selectedId]);
+  }, [observer, radiusKm, layers, units, layout, orbitalScope, atmosphericScope, skyDomePip, selectedId]);
 
   // 3. Dedicated SGP4 Web Worker Lifecycle & TLE Bootstrap
   useEffect(() => {
@@ -457,130 +563,347 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [selectedId, observer, workerReady]);
 
-  // 4. Data Feed Runners (Flights, Balloons, FAA Airspace)
-  const runFlightsRefresh = useCallback(async (force = false, resetBreakers = false) => {
-    if (typeof document !== 'undefined' && document.hidden && !force) return;
-    if (flightsInFlightRef.current) return;
-    flightsInFlightRef.current = true;
-    const attemptNowMs = Date.now();
-    lastFlightsAttemptMsRef.current = attemptNowMs;
-    nextFlightsDueMsRef.current = attemptNowMs + 10_000;
+  // 4. Data Feed Runners (Local Point Flights, Global Mil/LADD/PIA, Balloons + WindBorne, FAA Airspace)
+  const runFlightsRefresh = useCallback(
+    async (force = false, resetBreakers = false, abortPrevious = false) => {
+      if (typeof document !== 'undefined' && document.hidden && !force) return;
+      if (abortPrevious && flightsAbortRef.current) {
+        flightsAbortRef.current.abort();
+        flightsAbortRef.current = null;
+        flightsInFlightRef.current = false;
+      }
+      if (flightsInFlightRef.current) return;
 
-    const st = useSkyStore.getState();
-    st.setFeedState('flights', { status: 'loading' });
+      flightsInFlightRef.current = true;
+      const seq = ++flightsSeqRef.current;
+      const controller = new AbortController();
+      flightsAbortRef.current = controller;
 
-    try {
-      const res = await fetchFlightsCascade(
-        st.observer,
-        st.radiusKm,
-        liveKinematicsRegistry.rawFlights,
-        { force, resetBreakers }
-      );
-      const nextMap = new Map<string, (typeof res.entities)[number]>();
-      for (const f of res.entities) {
-        if (!f.onGround) {
-          nextMap.set(f.id, f);
+      const attemptNowMs = Date.now();
+      lastFlightsAttemptMsRef.current = attemptNowMs;
+      nextFlightsDueMsRef.current = attemptNowMs + 10_000;
+
+      const st = useSkyStore.getState();
+      st.setFeedState('flights', { status: 'loading' });
+
+      try {
+        const res = await fetchFlightsCascade(
+          st.observer,
+          st.radiusKm,
+          liveKinematicsRegistry.rawFlights,
+          {
+            force,
+            resetBreakers,
+            signal: controller.signal,
+            airspace: st.airspace,
+            prevDrones: liveKinematicsRegistry.rawAdsbDrones,
+            prevBalloons: liveKinematicsRegistry.rawAdsbBalloons,
+          }
+        );
+        if (seq !== flightsSeqRef.current || controller.signal.aborted) return;
+
+        const nextMap = new Map<string, FlightEntity>();
+        for (const f of res.entities) {
+          if (!f.onGround) {
+            nextMap.set(f.id, f);
+          }
+        }
+        liveKinematicsRegistry.rawFlights = nextMap;
+
+        const nextLocalDrones = new Map<string, DroneEntity>();
+        for (const d of res.uasEntities ?? []) {
+          nextLocalDrones.set(d.id, d);
+        }
+        localAdsbDronesRef.current = nextLocalDrones;
+
+        const nextLocalBalloons = new Map<string, BalloonEntity>();
+        for (const b of res.balloonEntities ?? []) {
+          nextLocalBalloons.set(b.id, b);
+        }
+        localAdsbBalloonsRef.current = nextLocalBalloons;
+        syncAdsbSecondaryRegistries();
+
+        const latestStore = useSkyStore.getState();
+        const prevFlightsFeed = latestStore.feeds.flights;
+        const resolvedLastUpdated =
+          res.timestampMs > 0 ? res.timestampMs : prevFlightsFeed.lastUpdatedMs;
+        const checkedAtMs = Date.now();
+        nextFlightsDueMsRef.current = checkedAtMs + 10_000;
+
+        latestStore.setFeedState('flights', {
+          status: res.status,
+          provider: res.provider,
+          lastUpdatedMs: resolvedLastUpdated,
+          lastCheckedMs: checkedAtMs,
+          httpStatus: res.httpStatus,
+          nextRefreshSec: 10,
+          count: nextMap.size,
+          errorMsg: res.errorMsg,
+          sourceBreakdown: `Local Point: ${nextMap.size} AC`,
+        });
+      } catch (err) {
+        if (seq !== flightsSeqRef.current || controller.signal.aborted) return;
+        const checkedAtMs = Date.now();
+        nextFlightsDueMsRef.current = checkedAtMs + 10_000;
+        const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+        useSkyStore.getState().setFeedState('flights', {
+          status: isOffline ? 'offline' : 'error',
+          lastCheckedMs: checkedAtMs,
+          nextRefreshSec: 10,
+          errorMsg: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        if (seq === flightsSeqRef.current) {
+          flightsInFlightRef.current = false;
+          if (flightsAbortRef.current === controller) {
+            flightsAbortRef.current = null;
+          }
         }
       }
-      liveKinematicsRegistry.rawFlights = nextMap;
-      const latestStore = useSkyStore.getState();
-      const prevFlightsFeed = latestStore.feeds.flights;
-      const resolvedLastUpdated =
-        res.timestampMs > 0 ? res.timestampMs : prevFlightsFeed.lastUpdatedMs;
-      const checkedAtMs = Date.now();
-      nextFlightsDueMsRef.current = checkedAtMs + 10_000;
+    },
+    [syncAdsbSecondaryRegistries]
+  );
 
-      latestStore.setFeedState('flights', {
-        status: res.status,
-        provider: res.provider,
-        lastUpdatedMs: resolvedLastUpdated,
-        lastCheckedMs: checkedAtMs,
-        httpStatus: res.httpStatus,
-        nextRefreshSec: 10,
-        count: nextMap.size,
-        errorMsg: res.errorMsg,
-      });
-    } catch (err) {
-      const checkedAtMs = Date.now();
-      nextFlightsDueMsRef.current = checkedAtMs + 10_000;
-      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
-      useSkyStore.getState().setFeedState('flights', {
-        status: isOffline ? 'offline' : 'error',
-        lastCheckedMs: checkedAtMs,
-        nextRefreshSec: 10,
-        errorMsg: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      flightsInFlightRef.current = false;
-    }
-  }, []);
-
-  const runBalloonsRefresh = useCallback(async (force = false) => {
-    if (balloonsInFlightRef.current) return;
-    balloonsInFlightRef.current = true;
-    const st = useSkyStore.getState();
-    st.setFeedState('balloons', { status: 'loading' });
-
-    try {
-      const res = await fetchBalloons(
-        st.observer,
-        st.radiusKm,
-        liveKinematicsRegistry.rawBalloons,
-        { force }
-      );
-      const nextMap = new Map<string, (typeof res.entities)[number]>();
-      for (const b of res.entities) {
-        nextMap.set(b.id, b);
+  const runGlobalFlightsRefresh = useCallback(
+    async (force = false, resetBreakers = false, abortPrevious = false) => {
+      if (typeof document !== 'undefined' && document.hidden && !force) return;
+      const st0 = useSkyStore.getState();
+      if (st0.atmosphericScope !== 'global') return;
+      if (abortPrevious && globalFlightsAbortRef.current) {
+        globalFlightsAbortRef.current.abort();
+        globalFlightsAbortRef.current = null;
+        globalFlightsInFlightRef.current = false;
       }
-      liveKinematicsRegistry.rawBalloons = nextMap;
-      const store = useSkyStore.getState();
-      store.setNearestSondeHint(res.nearestSondeHint);
-      store.setFeedState('balloons', {
-        status: res.status,
-        provider: res.provider,
-        lastUpdatedMs: res.timestampMs,
-        nextRefreshSec: 30,
-        count: res.entities.length,
-        errorMsg: res.errorMsg,
-      });
-    } catch (err) {
-      useSkyStore.getState().setFeedState('balloons', {
-        status: 'error',
-        nextRefreshSec: 30,
-        errorMsg: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      balloonsInFlightRef.current = false;
-    }
-  }, []);
+      if (globalFlightsInFlightRef.current) return;
 
-  const runAirspaceRefresh = useCallback(async () => {
+      globalFlightsInFlightRef.current = true;
+      const seq = ++globalFlightsSeqRef.current;
+      const controller = new AbortController();
+      globalFlightsAbortRef.current = controller;
+
+      const attemptNowMs = Date.now();
+      lastGlobalFlightsAttemptMsRef.current = attemptNowMs;
+      nextGlobalFlightsDueMsRef.current = attemptNowMs + 18_000;
+
+      st0.setFeedState('military', { status: 'loading' });
+
+      try {
+        const res = await fetchGlobalSpecialFlights(
+          st0.observer,
+          liveKinematicsRegistry.rawGlobalFlights,
+          {
+            force,
+            resetBreakers,
+            signal: controller.signal,
+            airspace: st0.airspace,
+            prevDrones: liveKinematicsRegistry.rawAdsbDrones,
+            prevBalloons: liveKinematicsRegistry.rawAdsbBalloons,
+          }
+        );
+        if (seq !== globalFlightsSeqRef.current || controller.signal.aborted) return;
+
+        const latestStore = useSkyStore.getState();
+        if (latestStore.atmosphericScope !== 'global') {
+          return;
+        }
+
+        const nextMap = new Map<string, FlightEntity>();
+        for (const f of res.entities) {
+          if (!f.onGround) {
+            nextMap.set(f.id, f);
+          }
+        }
+        liveKinematicsRegistry.rawGlobalFlights = nextMap;
+
+        const nextGlobalDrones = new Map<string, DroneEntity>();
+        for (const d of res.uasEntities ?? []) {
+          nextGlobalDrones.set(d.id, d);
+        }
+        globalAdsbDronesRef.current = nextGlobalDrones;
+
+        const nextGlobalBalloons = new Map<string, BalloonEntity>();
+        for (const b of res.balloonEntities ?? []) {
+          nextGlobalBalloons.set(b.id, b);
+        }
+        globalAdsbBalloonsRef.current = nextGlobalBalloons;
+        syncAdsbSecondaryRegistries();
+
+        const prevMilFeed = latestStore.feeds.military;
+        const resolvedLastUpdated =
+          res.timestampMs > 0 ? res.timestampMs : prevMilFeed.lastUpdatedMs;
+        const checkedAtMs = Date.now();
+        nextGlobalFlightsDueMsRef.current = checkedAtMs + 18_000;
+
+        latestStore.setFeedState('military', {
+          status: res.status,
+          provider: res.provider,
+          lastUpdatedMs: resolvedLastUpdated,
+          lastCheckedMs: checkedAtMs,
+          httpStatus: res.httpStatus,
+          nextRefreshSec: 18,
+          count: nextMap.size,
+          errorMsg: res.errorMsg,
+          sourceBreakdown: `MIL: ${res.sourceCounts.mil} · LADD: ${res.sourceCounts.ladd} · PIA: ${res.sourceCounts.pia}`,
+        });
+      } catch (err) {
+        if (seq !== globalFlightsSeqRef.current || controller.signal.aborted) return;
+        const checkedAtMs = Date.now();
+        nextGlobalFlightsDueMsRef.current = checkedAtMs + 18_000;
+        const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+        useSkyStore.getState().setFeedState('military', {
+          status: isOffline ? 'offline' : 'error',
+          lastCheckedMs: checkedAtMs,
+          nextRefreshSec: 18,
+          errorMsg: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        if (seq === globalFlightsSeqRef.current) {
+          globalFlightsInFlightRef.current = false;
+          if (globalFlightsAbortRef.current === controller) {
+            globalFlightsAbortRef.current = null;
+          }
+        }
+      }
+    },
+    [syncAdsbSecondaryRegistries]
+  );
+
+  const runBalloonsRefresh = useCallback(
+    async (force = false, resetBreakers = false, abortPrevious = false) => {
+      if (abortPrevious && balloonsAbortRef.current) {
+        balloonsAbortRef.current.abort();
+        balloonsAbortRef.current = null;
+        balloonsInFlightRef.current = false;
+      }
+      if (balloonsInFlightRef.current) return;
+
+      balloonsInFlightRef.current = true;
+      const seq = ++balloonsSeqRef.current;
+      const controller = new AbortController();
+      balloonsAbortRef.current = controller;
+
+      const st = useSkyStore.getState();
+      st.setFeedState('balloons', { status: 'loading' });
+
+      try {
+        const res = await fetchBalloons(
+          st.observer,
+          st.radiusKm,
+          liveKinematicsRegistry.rawBalloons,
+          {
+            force,
+            resetBreakers,
+            scope: st.atmosphericScope,
+            includeWindBorne: st.balloonSublayers.windborne,
+            includeSondeHub: st.balloonSublayers.sondehub,
+            signal: controller.signal,
+          }
+        );
+        if (seq !== balloonsSeqRef.current || controller.signal.aborted) return;
+
+        const nextMap = new Map<string, BalloonEntity>();
+        for (const b of res.entities) {
+          nextMap.set(b.id, b);
+        }
+        liveKinematicsRegistry.rawBalloons = nextMap;
+
+        const store = useSkyStore.getState();
+        const ltaCount = liveKinematicsRegistry.rawAdsbBalloons.size;
+        const wbCount = res.sourceCounts?.windborne ?? 0;
+        const shCount = res.sourceCounts?.sondehub ?? 0;
+
+        store.setNearestSondeHint(res.nearestSondeHint);
+        store.setFeedState('balloons', {
+          status: res.status,
+          provider: res.provider,
+          lastUpdatedMs:
+            res.timestampMs > 0 ? res.timestampMs : store.feeds.balloons.lastUpdatedMs,
+          lastCheckedMs: Date.now(),
+          nextRefreshSec: 30,
+          count: res.entities.length + ltaCount,
+          errorMsg: res.errorMsg,
+          sourceBreakdown: `WindBorne: ${wbCount} · SondeHub: ${shCount} · ADS-B LTA: ${ltaCount}`,
+        });
+      } catch (err) {
+        if (seq !== balloonsSeqRef.current || controller.signal.aborted) return;
+        useSkyStore.getState().setFeedState('balloons', {
+          status: 'error',
+          lastCheckedMs: Date.now(),
+          nextRefreshSec: 30,
+          errorMsg: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        if (seq === balloonsSeqRef.current) {
+          balloonsInFlightRef.current = false;
+          if (balloonsAbortRef.current === controller) {
+            balloonsAbortRef.current = null;
+          }
+        }
+      }
+    },
+    []
+  );
+
+  const runAirspaceRefresh = useCallback(async (abortPrevious = false) => {
+    if (abortPrevious && airspaceAbortRef.current) {
+      airspaceAbortRef.current.abort();
+      airspaceAbortRef.current = null;
+      airspaceInFlightRef.current = false;
+    }
     if (airspaceInFlightRef.current) return;
+
     airspaceInFlightRef.current = true;
+    const seq = ++airspaceSeqRef.current;
+    const controller = new AbortController();
+    airspaceAbortRef.current = controller;
+
     const st = useSkyStore.getState();
     st.setFeedState('airspace', { status: 'loading' });
 
     try {
-      const res = await fetchAirspace(st.observer, st.radiusKm);
+      const res = await fetchAirspace(st.observer, st.radiusKm, {
+        signal: controller.signal,
+      });
+      if (seq !== airspaceSeqRef.current || controller.signal.aborted) return;
+
       const store = useSkyStore.getState();
       store.setAirspace(res.airspace);
       store.setFeedState('airspace', {
         status: res.status,
         provider: res.provider,
         lastUpdatedMs: res.timestampMs,
+        lastCheckedMs: Date.now(),
         nextRefreshSec: 300,
         count: res.airspace.uasfm.features.length + res.airspace.sua.features.length,
         errorMsg: res.errorMsg,
+        sourceBreakdown: `UASFM: ${res.airspace.uasfm.features.length} · SUA/TFR: ${res.airspace.sua.features.length}`,
       });
     } catch (err) {
+      if (seq !== airspaceSeqRef.current || controller.signal.aborted) return;
       useSkyStore.getState().setFeedState('airspace', {
         status: 'error',
+        lastCheckedMs: Date.now(),
         nextRefreshSec: 300,
         errorMsg: err instanceof Error ? err.message : String(err),
       });
     } finally {
-      airspaceInFlightRef.current = false;
+      if (seq === airspaceSeqRef.current) {
+        airspaceInFlightRef.current = false;
+        if (airspaceAbortRef.current === controller) {
+          airspaceAbortRef.current = null;
+        }
+      }
     }
+  }, []);
+
+  // Abort active fetch controllers cleanly on App unmount
+  useEffect(() => {
+    return () => {
+      flightsAbortRef.current?.abort();
+      globalFlightsAbortRef.current?.abort();
+      balloonsAbortRef.current?.abort();
+      airspaceAbortRef.current?.abort();
+    };
   }, []);
 
   // Refresh feeds on observer/radius change (purging distant targets immediately on >50km jumps)
@@ -595,8 +918,13 @@ export default function App() {
 
     if (jumpKm > 50) {
       liveKinematicsRegistry.rawFlights.clear();
-      liveKinematicsRegistry.rawBalloons.clear();
+      localAdsbBalloonsRef.current.clear();
+      localAdsbDronesRef.current.clear();
       liveKinematicsRegistry.rawDrones.clear();
+      if (useSkyStore.getState().atmosphericScope === 'local') {
+        liveKinematicsRegistry.rawBalloons.clear();
+      }
+      syncAdsbSecondaryRegistries();
       liveKinematicsRegistry.version += 1;
       useSkyStore.getState().setFeedState('flights', {
         lastUpdatedMs: null,
@@ -606,31 +934,95 @@ export default function App() {
         count: 0,
         errorMsg: undefined,
       });
-      void runFlightsRefresh(true, true);
-      void runBalloonsRefresh(true);
-      void runAirspaceRefresh();
+      void runFlightsRefresh(true, true, true);
+      void runBalloonsRefresh(true, true, true);
+      void runAirspaceRefresh(true);
+      if (useSkyStore.getState().atmosphericScope === 'global') {
+        void runGlobalFlightsRefresh(true, false, true);
+      }
       return undefined;
     }
 
     const timer = window.setTimeout(() => {
-      void runFlightsRefresh(true, true);
-      void runBalloonsRefresh(true);
-      void runAirspaceRefresh();
+      void runFlightsRefresh(true, true, true);
+      void runBalloonsRefresh(true, false, true);
+      void runAirspaceRefresh(true);
+      if (useSkyStore.getState().atmosphericScope === 'global') {
+        void runGlobalFlightsRefresh(false, false, false);
+      }
     }, 280);
     return () => window.clearTimeout(timer);
-  }, [observer.lat, observer.lon, radiusKm, runFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
+  }, [
+    observer.lat,
+    observer.lon,
+    radiusKm,
+    runFlightsRefresh,
+    runGlobalFlightsRefresh,
+    runBalloonsRefresh,
+    runAirspaceRefresh,
+    syncAdsbSecondaryRegistries,
+  ]);
+
+  // React to Atmospheric Scope (`LOCAL` <-> `GLOBAL`) and Balloon sub-layer toggles
+  useEffect(() => {
+    const prevScope = prevAtmosphericScopeRef.current;
+    prevAtmosphericScopeRef.current = atmosphericScope;
+
+    if (prevScope === atmosphericScope) return;
+
+    if (atmosphericScope === 'local') {
+      globalFlightsAbortRef.current?.abort();
+      globalFlightsAbortRef.current = null;
+      globalFlightsInFlightRef.current = false;
+      liveKinematicsRegistry.rawGlobalFlights.clear();
+      globalAdsbBalloonsRef.current.clear();
+      globalAdsbDronesRef.current.clear();
+      syncAdsbSecondaryRegistries();
+      liveKinematicsRegistry.version += 1;
+      useSkyStore.getState().setFeedState('military', {
+        status: 'idle',
+        count: 0,
+        sourceBreakdown: 'LOCAL SCOPE · VIA /V2/POINT',
+        errorMsg: undefined,
+      });
+      void runBalloonsRefresh(true, false, true);
+    } else {
+      void runGlobalFlightsRefresh(true, false, true);
+      void runBalloonsRefresh(true, false, true);
+    }
+  }, [atmosphericScope, runGlobalFlightsRefresh, runBalloonsRefresh, syncAdsbSecondaryRegistries]);
+
+  useEffect(() => {
+    const prev = prevBalloonSublayersRef.current;
+    prevBalloonSublayersRef.current = balloonSublayers;
+    if (
+      (!prev.windborne && balloonSublayers.windborne) ||
+      (!prev.sondehub && balloonSublayers.sondehub)
+    ) {
+      void runBalloonsRefresh(true, false, true);
+    }
+  }, [balloonSublayers, runBalloonsRefresh]);
 
   // Manual Sweep trigger
   useEffect(() => {
     if (sweepPulseCounter === 0) return;
     tacticalAudio.playSweepPulse();
     void runFlightsRefresh(true, true);
-    void runBalloonsRefresh(true);
+    void runBalloonsRefresh(true, true);
     void runAirspaceRefresh();
+    if (useSkyStore.getState().atmosphericScope === 'global') {
+      void runGlobalFlightsRefresh(true, true);
+    }
     if (astroClientRef.current && useSkyStore.getState().workerReady) {
       astroClientRef.current.tick(Date.now());
     }
-  }, [sweepPulseCounter, runFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
+  }, [
+    sweepPulseCounter,
+    runFlightsRefresh,
+    runGlobalFlightsRefresh,
+    runBalloonsRefresh,
+    runAirspaceRefresh,
+  ]);
 
   // 1Hz Wall-Clock Scheduler & Online/Offline/Visibility Recovery
   useEffect(() => {
@@ -642,10 +1034,18 @@ export default function App() {
       const feeds = useSkyStore.getState().feeds;
       if (
         (nowMs >= nextFlightsDueMsRef.current || feeds.flights.nextRefreshSec <= 0) &&
-        (store.layers.flight || store.layers.military)
+        (store.layers.flight || store.layers.military || store.layers.balloon || store.layers.drone)
       ) {
         const shouldForce = nowMs - lastFlightsAttemptMsRef.current >= 9_800;
         void runFlightsRefresh(shouldForce, false);
+      }
+      if (
+        store.atmosphericScope === 'global' &&
+        (nowMs >= nextGlobalFlightsDueMsRef.current || feeds.military.nextRefreshSec <= 0) &&
+        (store.layers.military || store.layers.balloon || store.layers.drone)
+      ) {
+        const shouldForceGlobal = nowMs - lastGlobalFlightsAttemptMsRef.current >= 17_500;
+        void runGlobalFlightsRefresh(shouldForceGlobal, false);
       }
       if (feeds.balloons.nextRefreshSec <= 0 && store.layers.balloon) {
         void runBalloonsRefresh();
@@ -667,8 +1067,15 @@ export default function App() {
       }
       if (!hasFresh) {
         liveKinematicsRegistry.rawFlights.clear();
+        liveKinematicsRegistry.rawGlobalFlights.clear();
         liveKinematicsRegistry.version += 1;
         useSkyStore.getState().setFeedState('flights', {
+          status: 'offline',
+          lastCheckedMs: nowMs,
+          count: 0,
+          errorMsg: 'Network connection offline',
+        });
+        useSkyStore.getState().setFeedState('military', {
           status: 'offline',
           lastCheckedMs: nowMs,
           count: 0,
@@ -679,11 +1086,14 @@ export default function App() {
 
     const handleOnline = () => {
       const st = useSkyStore.getState();
-      if (st.layers.flight || st.layers.military) {
+      if (st.layers.flight || st.layers.military || st.layers.balloon || st.layers.drone) {
         void runFlightsRefresh(true, true);
       }
+      if (st.atmosphericScope === 'global') {
+        void runGlobalFlightsRefresh(true, true);
+      }
       if (st.layers.balloon) {
-        void runBalloonsRefresh(true);
+        void runBalloonsRefresh(true, true);
       }
       if (st.layers.drone) {
         void runAirspaceRefresh();
@@ -702,6 +1112,13 @@ export default function App() {
       ) {
         void runFlightsRefresh(true);
       }
+      if (
+        st.atmosphericScope === 'global' &&
+        Date.now() >= nextGlobalFlightsDueMsRef.current &&
+        (st.layers.military || st.layers.balloon || st.layers.drone)
+      ) {
+        void runGlobalFlightsRefresh(true);
+      }
     };
 
     window.addEventListener('offline', handleOffline);
@@ -714,7 +1131,7 @@ export default function App() {
       window.removeEventListener('online', handleOnline);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [runFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
+  }, [runFlightsRefresh, runGlobalFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
 
   // 5. OpenDroneID Live Client & 1Hz Tactical Drone Simulator
   useEffect(() => {
@@ -761,7 +1178,7 @@ export default function App() {
       const st = useSkyStore.getState();
       const combined = new Map<string, DroneEntity>();
 
-      if (st.odidConfig.simulatorEnabled) {
+      if (st.odidConfig.simulatorEnabled && st.droneSublayers.simOdid) {
         const elapsedSec = (Date.now() - simStartMsRef.current) / 1000;
         const simDrones = stepSimulatedDrones(
           st.observer,
@@ -795,6 +1212,8 @@ export default function App() {
               : undefined;
           combined.set(id, {
             ...drone,
+            subSource: drone.subSource ?? 'odid-live',
+            hasOperatorLocation: true,
             faaCeilingFt: compliance.faaCeilingFt,
             ceilingBreach: compliance.ceilingBreach,
             tfrBreach: compliance.tfrBreach,
@@ -803,31 +1222,46 @@ export default function App() {
         }
       }
 
-      const droneActive = st.odidConfig.connected || st.odidConfig.simulatorEnabled;
+      liveKinematicsRegistry.rawDrones = combined;
+      const adsbUasCount = st.droneSublayers.liveUas
+        ? liveKinematicsRegistry.rawAdsbDrones.size
+        : 0;
+      const totalDronesCount = combined.size + adsbUasCount;
+      const droneActive =
+        st.odidConfig.connected || st.odidConfig.simulatorEnabled || adsbUasCount > 0;
       const nextStatus = st.odidConfig.connected
         ? 'live'
-        : st.odidConfig.simulatorEnabled
-          ? 'fallback'
-          : 'idle';
+        : adsbUasCount > 0
+          ? 'live'
+          : st.odidConfig.simulatorEnabled
+            ? 'fallback'
+            : 'idle';
       const nextProvider = st.odidConfig.connected
-        ? 'opendroneid-stream'
-        : st.odidConfig.simulatorEnabled
-          ? 'sim-opendroneid'
-          : 'off';
+        ? adsbUasCount > 0
+          ? 'opendroneid+adsb-uas'
+          : 'opendroneid-stream'
+        : adsbUasCount > 0
+          ? 'adsb-live-uas'
+          : st.odidConfig.simulatorEnabled
+            ? 'sim-opendroneid'
+            : 'off';
 
-      liveKinematicsRegistry.rawDrones = combined;
+      const prevFeed = st.feeds.drones;
+      const breakdown = `ATC UAS: ${adsbUasCount} · ODID: ${combined.size}`;
       if (
         droneActive ||
-        st.feeds.drones.status !== nextStatus ||
-        st.feeds.drones.provider !== nextProvider ||
-        st.feeds.drones.count !== combined.size
+        prevFeed.status !== nextStatus ||
+        prevFeed.provider !== nextProvider ||
+        prevFeed.count !== totalDronesCount ||
+        prevFeed.sourceBreakdown !== breakdown
       ) {
         st.setFeedState('drones', {
           status: nextStatus,
           provider: nextProvider,
           lastUpdatedMs: droneActive ? Date.now() : null,
           nextRefreshSec: 1,
-          count: combined.size,
+          count: totalDronesCount,
+          sourceBreakdown: breakdown,
         });
       }
     };
@@ -841,6 +1275,8 @@ export default function App() {
     airspace,
     odidConfig.simulatorEnabled,
     odidConfig.connected,
+    droneSublayers.simOdid,
+    droneSublayers.liveUas,
   ]);
 
   // 6. Target Lock Audio Feedback
@@ -908,12 +1344,86 @@ export default function App() {
         }
       };
 
+      const isSublayerVisible = (entity: SkyEntity): boolean => {
+        if (entity.category === 'balloon') {
+          if (entity.subSource === 'windborne') return st.balloonSublayers.windborne;
+          if (entity.subSource === 'adsb-lta') return st.balloonSublayers.adsbLta;
+          return st.balloonSublayers.sondehub;
+        }
+        if (entity.category === 'drone') {
+          if (entity.subSource === 'odid-sim' || entity.isSimulated) {
+            return st.droneSublayers.simOdid;
+          }
+          return st.droneSublayers.liveUas;
+        }
+        return true;
+      };
+
+      const pushExtrapolatedEntity = (entity: SkyEntity) => {
+        const prevExisting = nextEntities.get(entity.id);
+        if (prevExisting) {
+          if (
+            (prevExisting.category === 'flight' || prevExisting.category === 'military') &&
+            (entity.category === 'flight' || entity.category === 'military')
+          ) {
+            const mergedIsMil = prevExisting.isMilitary || entity.isMilitary;
+            const mergedIsLadd = Boolean(prevExisting.isLadd || entity.isLadd);
+            const mergedIsPia = Boolean(prevExisting.isPia || entity.isPia);
+            const nextCat: 'flight' | 'military' =
+              mergedIsMil || (!prevExisting.onGround && (mergedIsLadd || mergedIsPia))
+                ? 'military'
+                : prevExisting.category;
+
+            if (nextCat !== prevExisting.category) {
+              if (st.layers[prevExisting.category]) {
+                counts[prevExisting.category] = Math.max(0, counts[prevExisting.category] - 1);
+                counts.total = Math.max(0, counts.total - 1);
+                if (prevExisting.topocentric.elevationDeg >= 30) {
+                  counts.overhead = Math.max(0, counts.overhead - 1);
+                }
+              }
+              if (st.layers[nextCat]) {
+                counts[nextCat] += 1;
+                counts.total += 1;
+                if (prevExisting.topocentric.elevationDeg >= 30) {
+                  counts.overhead += 1;
+                }
+              } else {
+                nextEntities.delete(entity.id);
+                return;
+              }
+            }
+
+            nextEntities.set(entity.id, {
+              ...prevExisting,
+              category: nextCat,
+              isMilitary: mergedIsMil,
+              isLadd: mergedIsLadd || undefined,
+              isPia: mergedIsPia || undefined,
+            });
+          }
+          return;
+        }
+
+        if (!st.layers[entity.category] || !isSublayerVisible(entity)) return;
+        nextEntities.set(entity.id, entity);
+        counts[entity.category] += 1;
+        counts.total += 1;
+        if (entity.topocentric.elevationDeg >= 30) counts.overhead += 1;
+        checkAcousticEvents(entity, st.audioEnabled);
+      };
+
       // Atmospheric feeds: dead-reckoning interpolation at 60fps + real-time WGS-84 look angles
       const pushAtmospheric = <T extends SkyEntity>(
         sourceMap: Map<string, T>,
         maxDtSec: number,
         pruneStaleMs: number
       ) => {
+        const allowGlobalScope =
+          sourceMap === liveKinematicsRegistry.rawGlobalFlights ||
+          sourceMap === liveKinematicsRegistry.rawBalloons ||
+          sourceMap === liveKinematicsRegistry.rawAdsbBalloons ||
+          sourceMap === liveKinematicsRegistry.rawAdsbDrones;
         for (const [id, raw] of sourceMap.entries()) {
           if ((raw.category === 'flight' || raw.category === 'military') && raw.onGround) {
             sourceMap.delete(id);
@@ -921,12 +1431,15 @@ export default function App() {
           }
 
           const ageMs = nowMs - raw.timestampMs;
-          if (ageMs > pruneStaleMs || ageMs < -60_000) {
+          const isCachedSeedBalloon = raw.category === 'balloon' && Boolean(raw.isCachedSeed);
+          if (!isCachedSeedBalloon && (ageMs > pruneStaleMs || ageMs < -60_000)) {
             sourceMap.delete(id);
             continue;
           }
 
-          const dtSec = Math.max(0, Math.min(maxDtSec, ageMs / 1000));
+          const dtSec = isCachedSeedBalloon
+            ? 0
+            : Math.max(0, Math.min(maxDtSec, ageMs / 1000));
           const isFlight = raw.category === 'flight' || raw.category === 'military';
           const isMoving = isFlight
             ? !raw.onGround &&
@@ -953,8 +1466,16 @@ export default function App() {
             true
           );
 
+          const isLocalBalloon = raw.category === 'balloon' && (!allowGlobalScope || st.atmosphericScope === 'local');
+          const isLocalMilitary = raw.category === 'military' && (!allowGlobalScope || st.atmosphericScope === 'local');
+          const isLocalFlight = raw.category === 'flight';
+          const isLocalAdsbDrone =
+            raw.category === 'drone' &&
+            raw.subSource === 'adsb-uas' &&
+            st.atmosphericScope === 'local';
+
           if (
-            (raw.category === 'flight' || raw.category === 'military' || raw.category === 'balloon') &&
+            (isLocalFlight || isLocalMilitary || isLocalBalloon || isLocalAdsbDrone) &&
             topocentric.groundDistKm > st.radiusKm * 1.02
           ) {
             sourceMap.delete(id);
@@ -968,57 +1489,80 @@ export default function App() {
             altM: extrap.altM,
             topocentric,
           };
-          nextEntities.set(id, updated);
 
-          if (st.layers[updated.category]) {
-            counts[updated.category] += 1;
-            counts.total += 1;
-            if (topocentric.elevationDeg >= 30) counts.overhead += 1;
-            checkAcousticEvents(updated, st.audioEnabled);
+          // Upgrade category cleanly before layer check if local point hex matches global military/LADD/PIA
+          if (
+            st.atmosphericScope === 'global' &&
+            updated.category === 'flight' &&
+            liveKinematicsRegistry.rawGlobalFlights.has(id)
+          ) {
+            const globalMatch = liveKinematicsRegistry.rawGlobalFlights.get(id)!;
+            const mergedMil = updated.isMilitary || globalMatch.isMilitary;
+            const mergedLadd = Boolean(updated.isLadd || globalMatch.isLadd);
+            const mergedPia = Boolean(updated.isPia || globalMatch.isPia);
+            const resolvedFlight: FlightEntity = {
+              ...updated,
+              isMilitary: mergedMil,
+              isLadd: mergedLadd || undefined,
+              isPia: mergedPia || undefined,
+              category:
+                mergedMil || (!updated.onGround && (mergedLadd || mergedPia))
+                  ? 'military'
+                  : updated.category,
+            };
+            pushExtrapolatedEntity(resolvedFlight);
+            continue;
           }
+
+          pushExtrapolatedEntity(updated);
         }
       };
 
       pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 60_000);
+      if (st.atmosphericScope === 'global') {
+        pushAtmospheric(liveKinematicsRegistry.rawGlobalFlights, 18, 90_000);
+      }
       pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 21_600_000);
+      pushAtmospheric(liveKinematicsRegistry.rawAdsbBalloons, 20, 180_000);
       pushAtmospheric(liveKinematicsRegistry.rawDrones, 3, 60_000);
+      pushAtmospheric(liveKinematicsRegistry.rawAdsbDrones, 12, 90_000);
 
       // Orbital satellites: smooth micro-interpolation between 10Hz SGP4 Worker frames
-      for (const [id, sat] of liveKinematicsRegistry.satellites.entries()) {
-        if (!st.satGroups[sat.group]) continue;
-        const dtSec = Math.max(0, Math.min(0.25, (nowMs - sat.timestampMs) / 1000));
-        const extrap =
-          dtSec > 0.005
-            ? extrapolateDeadReckoning(
-                sat.lat,
-                sat.lon,
-                sat.speedMs,
-                sat.headingDeg,
-                dtSec,
-                sat.altM,
-                0
-              )
-            : { lat: sat.lat, lon: sat.lon, altM: sat.altM };
+      if (st.layers.satellite) {
+        for (const [id, sat] of liveKinematicsRegistry.satellites.entries()) {
+          if (!st.satGroups[sat.group]) continue;
+          const dtSec = Math.max(0, Math.min(0.25, (nowMs - sat.timestampMs) / 1000));
+          const extrap =
+            dtSec > 0.005
+              ? extrapolateDeadReckoning(
+                  sat.lat,
+                  sat.lon,
+                  sat.speedMs,
+                  sat.headingDeg,
+                  dtSec,
+                  sat.altM,
+                  0
+                )
+              : { lat: sat.lat, lon: sat.lon, altM: sat.altM };
 
-        const topocentric =
-          dtSec > 0.005
-            ? computeTopocentricLookAngles(
-                obs,
-                { lat: extrap.lat, lon: extrap.lon, altM: extrap.altM },
-                false
-              )
-            : sat.topocentric;
+          const topocentric =
+            dtSec > 0.005
+              ? computeTopocentricLookAngles(
+                  obs,
+                  { lat: extrap.lat, lon: extrap.lon, altM: extrap.altM },
+                  false
+                )
+              : sat.topocentric;
 
-        const updated: SatelliteEntity = {
-          ...sat,
-          lat: extrap.lat,
-          lon: extrap.lon,
-          altM: extrap.altM,
-          topocentric,
-        };
-        nextEntities.set(id, updated);
+          const updated: SatelliteEntity = {
+            ...sat,
+            lat: extrap.lat,
+            lon: extrap.lon,
+            altM: extrap.altM,
+            topocentric,
+          };
+          nextEntities.set(id, updated);
 
-        if (st.layers.satellite) {
           counts.satellite += 1;
           counts.total += 1;
           if (topocentric.elevationDeg >= 30) counts.overhead += 1;
@@ -1054,6 +1598,17 @@ export default function App() {
 
         if (st.feeds.flights.count !== liveKinematicsRegistry.rawFlights.size) {
           st.setFeedState('flights', { count: liveKinematicsRegistry.rawFlights.size });
+        }
+        if (
+          st.atmosphericScope === 'global' &&
+          st.feeds.military.count !== liveKinematicsRegistry.rawGlobalFlights.size
+        ) {
+          st.setFeedState('military', { count: liveKinematicsRegistry.rawGlobalFlights.size });
+        }
+        const totalBalloonPool =
+          liveKinematicsRegistry.rawBalloons.size + liveKinematicsRegistry.rawAdsbBalloons.size;
+        if (st.feeds.balloons.count !== totalBalloonPool) {
+          st.setFeedState('balloons', { count: totalBalloonPool });
         }
 
         if (st.selectedId) {
@@ -1180,6 +1735,7 @@ export default function App() {
     <div className="cockpit-shell">
       <TopTelemetryBar
         onToggleAudio={handleToggleAudio}
+        onManualSweep={handleManualSweep}
         onInstallPwa={() => void handleInstallPwa()}
         onDismissPwa={handleDismissPwa}
       />
@@ -1187,6 +1743,7 @@ export default function App() {
       <main
         className={`skymap-stage skymap-stage--${layout}`}
         data-layout={layout}
+        data-pip={layout === 'map' && skyDomePip ? 'true' : 'false'}
         aria-label="Krunked Sky-Map Dual Situational Awareness Stage"
       >
         <section className="stage-map-pane" data-pane="map" aria-label="Tactical Airspace Map">
