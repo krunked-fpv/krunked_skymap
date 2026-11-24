@@ -21,6 +21,48 @@ export type OrbitalScope = 'cylinder' | 'hemisphere';
 
 export type AtmosphericScope = 'local' | 'global';
 
+export type SkyDomeZoomMode = 'hemisphere' | 'zenith';
+
+export type TwilightState = 'day' | 'civil-twilight' | 'nautical-twilight' | 'night';
+
+export interface CelestialBodyPosition {
+  azimuthDeg: number;
+  elevationDeg: number;
+}
+
+export interface LunarPosition extends CelestialBodyPosition {
+  phaseFraction: number;
+  illuminationFraction: number;
+}
+
+export interface CelestialPositions {
+  sun: CelestialBodyPosition;
+  moon: LunarPosition;
+  twilightState: TwilightState;
+}
+
+export interface ClosestApproachPrediction {
+  isApproaching: boolean;
+  tcaSeconds: number;
+  peakElevationDeg: number;
+  minSlantRangeKm: number;
+  peakAzimuthDeg: number;
+}
+
+export interface SkyDomeProjectionPoint {
+  x: number;
+  y: number;
+  r: number;
+  normR: number;
+  visible: boolean;
+}
+
+export interface SkyDomeUnprojectionResult {
+  azimuthDeg: number;
+  elevationDeg: number;
+  inBounds: boolean;
+}
+
 export type SatelliteGroup = 'stations' | 'visual' | 'starlink';
 
 export type BalloonSubSource = 'windborne' | 'sondehub' | 'sondehub-amateur' | 'adsb-lta';

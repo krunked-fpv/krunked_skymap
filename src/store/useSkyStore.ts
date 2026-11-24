@@ -18,9 +18,11 @@ import {
   type SatelliteGroup,
   type SatelliteOrbitOverlay,
   type SkyCategory,
+  type SkyDomeZoomMode,
   type SkyEntity,
   type UnitSystem,
 } from '../types/sky-contracts';
+import { haversineDistanceKm } from '../math/geodesy';
 
 export interface SkyCounts extends Record<SkyCategory, number> {
   overhead: number;
@@ -62,6 +64,7 @@ export interface UrlHydrationPatch {
   orbitalScope?: OrbitalScope;
   atmosphericScope?: AtmosphericScope;
   skyDomePip?: boolean;
+  skyDomeZoom?: SkyDomeZoomMode;
   selectedId?: string | null;
 }
 
@@ -78,6 +81,7 @@ export interface SkyStoreState {
   units: UnitSystem;
   layout: LayoutMode;
   skyDomePip: boolean;
+  skyDomeZoom: SkyDomeZoomMode;
   audioEnabled: boolean;
   audioVolume: number;
   sweepEnabled: boolean;
@@ -123,10 +127,13 @@ export interface SkyStoreState {
   setLayout: (layout: LayoutMode) => void;
   setSkyDomePip: (enabled: boolean) => void;
   toggleSkyDomePip: () => void;
+  setSkyDomeZoom: (zoom: SkyDomeZoomMode) => void;
+  toggleSkyDomeZoom: () => void;
   setAudioEnabled: (enabled: boolean) => void;
   setAudioVolume: (volume: number) => void;
   setSweepEnabled: (enabled: boolean) => void;
   setDomeLabelsEnabled: (enabled: boolean) => void;
+  toggleDomeLabels: () => void;
   setMapLabelsEnabled: (enabled: boolean) => void;
   bumpRecenterNonce: () => void;
   setPwaInstallState: (patch: { available?: boolean; dismissed?: boolean; standalone?: boolean }) => void;
@@ -159,6 +166,127 @@ const EMPTY_FC: GeoJSON.FeatureCollection = {
   type: 'FeatureCollection',
   features: [],
 };
+
+export type RegistryPruneContext = Pick<
+  SkyStoreState,
+  'layers' | 'satGroups' | 'balloonSublayers' | 'droneSublayers' | 'atmosphericScope' | 'observer' | 'radiusKm'
+>;
+
+function isBalloonSublayerEnabled(entity: BalloonEntity, sublayers: BalloonSublayerState): boolean {
+  if (entity.subSource === 'windborne') return sublayers.windborne;
+  if (entity.subSource === 'adsb-lta') return sublayers.adsbLta;
+  return sublayers.sondehub;
+}
+
+function isDroneSublayerEnabled(entity: DroneEntity, sublayers: DroneSublayerState): boolean {
+  if (entity.subSource === 'odid-sim' || entity.isSimulated) {
+    return sublayers.simOdid;
+  }
+  return sublayers.liveUas;
+}
+
+/**
+ * Synchronously evict disabled layers, sublayers, and out-of-range entities from
+ * liveKinematicsRegistry whenever visibility toggles or LOCAL/GLOBAL scope changes.
+ */
+export function pruneLiveKinematicsRegistry(ctx: RegistryPruneContext): number {
+  let pruned = 0;
+  const maxLocalRangeKm = ctx.radiusKm * 1.02;
+
+  for (const [id, entity] of liveKinematicsRegistry.entities.entries()) {
+    let keep = ctx.layers[entity.category];
+
+    if (keep && entity.category === 'satellite') {
+      keep = ctx.satGroups[entity.group];
+    } else if (keep && entity.category === 'balloon') {
+      keep = isBalloonSublayerEnabled(entity, ctx.balloonSublayers);
+      if (keep && ctx.atmosphericScope === 'local') {
+        if (
+          entity.subSource === 'windborne' ||
+          haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, entity.lat, entity.lon) >
+            maxLocalRangeKm
+        ) {
+          keep = false;
+        }
+      }
+    } else if (keep && entity.category === 'drone') {
+      keep = isDroneSublayerEnabled(entity, ctx.droneSublayers);
+      if (keep && ctx.atmosphericScope === 'local' && entity.subSource === 'adsb-uas') {
+        if (
+          haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, entity.lat, entity.lon) >
+          maxLocalRangeKm
+        ) {
+          keep = false;
+        }
+      }
+    } else if (keep && (entity.category === 'flight' || entity.category === 'military')) {
+      if (ctx.atmosphericScope === 'local') {
+        if (
+          haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, entity.lat, entity.lon) >
+          maxLocalRangeKm
+        ) {
+          keep = false;
+        }
+      }
+    }
+
+    if (!keep) {
+      liveKinematicsRegistry.entities.delete(id);
+      pruned += 1;
+    }
+  }
+
+  if (!ctx.layers.satellite) {
+    if (liveKinematicsRegistry.satellites.size > 0) {
+      pruned += liveKinematicsRegistry.satellites.size;
+      liveKinematicsRegistry.satellites.clear();
+    }
+    if (liveKinematicsRegistry.orbitOverlay !== null) {
+      liveKinematicsRegistry.orbitOverlay = null;
+      pruned += 1;
+    }
+  }
+
+  if (ctx.atmosphericScope === 'local') {
+    if (liveKinematicsRegistry.rawGlobalFlights.size > 0) {
+      pruned += liveKinematicsRegistry.rawGlobalFlights.size;
+      liveKinematicsRegistry.rawGlobalFlights.clear();
+    }
+    for (const [bId, bEntity] of liveKinematicsRegistry.rawBalloons.entries()) {
+      if (
+        bEntity.subSource === 'windborne' ||
+        haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, bEntity.lat, bEntity.lon) >
+          maxLocalRangeKm
+      ) {
+        liveKinematicsRegistry.rawBalloons.delete(bId);
+        pruned += 1;
+      }
+    }
+    for (const [bId, bEntity] of liveKinematicsRegistry.rawAdsbBalloons.entries()) {
+      if (
+        haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, bEntity.lat, bEntity.lon) >
+        maxLocalRangeKm
+      ) {
+        liveKinematicsRegistry.rawAdsbBalloons.delete(bId);
+        pruned += 1;
+      }
+    }
+    for (const [dId, dEntity] of liveKinematicsRegistry.rawAdsbDrones.entries()) {
+      if (
+        haversineDistanceKm(ctx.observer.lat, ctx.observer.lon, dEntity.lat, dEntity.lon) >
+        maxLocalRangeKm
+      ) {
+        liveKinematicsRegistry.rawAdsbDrones.delete(dId);
+        pruned += 1;
+      }
+    }
+  }
+
+  if (pruned > 0) {
+    liveKinematicsRegistry.version += 1;
+  }
+  return pruned;
+}
 
 const createInitialFeeds = (): Record<FeedKey, FeedTelemetryState> => ({
   flights: {
@@ -248,6 +376,7 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   units: 'aviation',
   layout: 'split',
   skyDomePip: true,
+  skyDomeZoom: 'hemisphere',
   audioEnabled: false,
   audioVolume: 0.35,
   sweepEnabled: true,
@@ -298,64 +427,143 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   setRadiusKm: (radiusKm) =>
     set({ radiusKm: Math.max(10, Math.min(250, Math.round(radiusKm))) }),
   toggleLayer: (category) =>
-    set((state) => ({
-      layers: { ...state.layers, [category]: !state.layers[category] },
-    })),
+    set((state) => {
+      const nextLayers = { ...state.layers, [category]: !state.layers[category] };
+      pruneLiveKinematicsRegistry({ ...state, layers: nextLayers });
+      return {
+        layers: nextLayers,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   setLayer: (category, enabled) =>
-    set((state) => ({
-      layers: { ...state.layers, [category]: enabled },
-    })),
+    set((state) => {
+      const nextLayers = { ...state.layers, [category]: enabled };
+      pruneLiveKinematicsRegistry({ ...state, layers: nextLayers });
+      return {
+        layers: nextLayers,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   toggleSatGroup: (group) =>
-    set((state) => ({
-      satGroups: { ...state.satGroups, [group]: !state.satGroups[group] },
-    })),
+    set((state) => {
+      const nextSatGroups = { ...state.satGroups, [group]: !state.satGroups[group] };
+      pruneLiveKinematicsRegistry({ ...state, satGroups: nextSatGroups });
+      return {
+        satGroups: nextSatGroups,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   toggleBalloonSublayer: (key) =>
-    set((state) => ({
-      balloonSublayers: { ...state.balloonSublayers, [key]: !state.balloonSublayers[key] },
-    })),
+    set((state) => {
+      const nextBalloonSublayers = {
+        ...state.balloonSublayers,
+        [key]: !state.balloonSublayers[key],
+      };
+      pruneLiveKinematicsRegistry({ ...state, balloonSublayers: nextBalloonSublayers });
+      return {
+        balloonSublayers: nextBalloonSublayers,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   setBalloonSublayer: (key, enabled) =>
-    set((state) => ({
-      balloonSublayers: { ...state.balloonSublayers, [key]: enabled },
-    })),
+    set((state) => {
+      const nextBalloonSublayers = { ...state.balloonSublayers, [key]: enabled };
+      pruneLiveKinematicsRegistry({ ...state, balloonSublayers: nextBalloonSublayers });
+      return {
+        balloonSublayers: nextBalloonSublayers,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   toggleDroneSublayer: (key) =>
     set((state) => {
       const nextVal = !state.droneSublayers[key];
       const nextDroneSublayers = { ...state.droneSublayers, [key]: nextVal };
+      pruneLiveKinematicsRegistry({ ...state, droneSublayers: nextDroneSublayers });
+      const nextHoveredId =
+        state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+          ? null
+          : state.hoveredId;
       if (key === 'simOdid') {
         return {
           droneSublayers: nextDroneSublayers,
           odidConfig: { ...state.odidConfig, simulatorEnabled: nextVal },
+          hoveredId: nextHoveredId,
         };
       }
-      return { droneSublayers: nextDroneSublayers };
+      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId };
     }),
   setDroneSublayer: (key, enabled) =>
     set((state) => {
       const nextDroneSublayers = { ...state.droneSublayers, [key]: enabled };
+      pruneLiveKinematicsRegistry({ ...state, droneSublayers: nextDroneSublayers });
+      const nextHoveredId =
+        state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+          ? null
+          : state.hoveredId;
       if (key === 'simOdid') {
         return {
           droneSublayers: nextDroneSublayers,
           odidConfig: { ...state.odidConfig, simulatorEnabled: enabled },
+          hoveredId: nextHoveredId,
         };
       }
-      return { droneSublayers: nextDroneSublayers };
+      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId };
     }),
   setFullConstellation: (fullConstellation) => set({ fullConstellation }),
   setOrbitalScope: (orbitalScope) => set({ orbitalScope }),
-  setAtmosphericScope: (atmosphericScope) => set({ atmosphericScope }),
+  setAtmosphericScope: (atmosphericScope) =>
+    set((state) => {
+      pruneLiveKinematicsRegistry({ ...state, atmosphericScope });
+      return {
+        atmosphericScope,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   toggleAtmosphericScope: () =>
-    set((state) => ({
-      atmosphericScope: state.atmosphericScope === 'global' ? 'local' : 'global',
-    })),
+    set((state) => {
+      const nextScope = state.atmosphericScope === 'global' ? 'local' : 'global';
+      pruneLiveKinematicsRegistry({ ...state, atmosphericScope: nextScope });
+      return {
+        atmosphericScope: nextScope,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+      };
+    }),
   setUnits: (units) => set({ units }),
   setLayout: (layout) => set({ layout }),
   setSkyDomePip: (skyDomePip) => set({ skyDomePip }),
   toggleSkyDomePip: () => set((state) => ({ skyDomePip: !state.skyDomePip })),
+  setSkyDomeZoom: (skyDomeZoom) => set({ skyDomeZoom }),
+  toggleSkyDomeZoom: () =>
+    set((state) => ({
+      skyDomeZoom: state.skyDomeZoom === 'hemisphere' ? 'zenith' : 'hemisphere',
+    })),
   setAudioEnabled: (audioEnabled) => set({ audioEnabled }),
   setAudioVolume: (audioVolume) =>
     set({ audioVolume: Math.max(0, Math.min(1, audioVolume)) }),
   setSweepEnabled: (sweepEnabled) => set({ sweepEnabled }),
   setDomeLabelsEnabled: (domeLabelsEnabled) => set({ domeLabelsEnabled }),
+  toggleDomeLabels: () => set((state) => ({ domeLabelsEnabled: !state.domeLabelsEnabled })),
   setMapLabelsEnabled: (mapLabelsEnabled) => set({ mapLabelsEnabled }),
   bumpRecenterNonce: () =>
     set((state) => ({ recenterNonce: state.recenterNonce + 1 })),
@@ -445,23 +653,43 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     set((state) => ({ sweepPulseCounter: state.sweepPulseCounter + 1 })),
   setSelectedEntitySnapshot: (selectedEntitySnapshot) => set({ selectedEntitySnapshot }),
   hydrateFromUrlState: (patch) =>
-    set((state) => ({
-      observer: patch.observer ?? state.observer,
-      recenterNonce: patch.observer ? state.recenterNonce + 1 : state.recenterNonce,
-      radiusKm:
+    set((state) => {
+      const nextObserver = patch.observer ?? state.observer;
+      const nextRadiusKm =
         patch.radiusKm !== undefined
           ? Math.max(10, Math.min(250, Math.round(patch.radiusKm)))
-          : state.radiusKm,
-      layers: patch.layers ? { ...state.layers, ...patch.layers } : state.layers,
-      units: patch.units ?? state.units,
-      layout: patch.layout ?? state.layout,
-      orbitalScope: patch.orbitalScope ?? state.orbitalScope,
-      atmosphericScope: patch.atmosphericScope ?? state.atmosphericScope,
-      skyDomePip: patch.skyDomePip ?? state.skyDomePip,
-      selectedId: patch.selectedId !== undefined ? patch.selectedId : state.selectedId,
-      inspectorOpen:
-        patch.selectedId !== undefined && patch.selectedId !== null
-          ? true
-          : state.inspectorOpen,
-    })),
+          : state.radiusKm;
+      const nextLayers = patch.layers ? { ...state.layers, ...patch.layers } : state.layers;
+      const nextScope = patch.atmosphericScope ?? state.atmosphericScope;
+      if (patch.layers || patch.atmosphericScope !== undefined || patch.observer || patch.radiusKm !== undefined) {
+        pruneLiveKinematicsRegistry({
+          ...state,
+          observer: nextObserver,
+          radiusKm: nextRadiusKm,
+          layers: nextLayers,
+          atmosphericScope: nextScope,
+        });
+      }
+      return {
+        observer: nextObserver,
+        recenterNonce: patch.observer ? state.recenterNonce + 1 : state.recenterNonce,
+        radiusKm: nextRadiusKm,
+        layers: nextLayers,
+        units: patch.units ?? state.units,
+        layout: patch.layout ?? state.layout,
+        orbitalScope: patch.orbitalScope ?? state.orbitalScope,
+        atmosphericScope: nextScope,
+        skyDomePip: patch.skyDomePip ?? state.skyDomePip,
+        skyDomeZoom: patch.skyDomeZoom ?? state.skyDomeZoom,
+        selectedId: patch.selectedId !== undefined ? patch.selectedId : state.selectedId,
+        hoveredId:
+          state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
+            ? null
+            : state.hoveredId,
+        inspectorOpen:
+          patch.selectedId !== undefined && patch.selectedId !== null
+            ? true
+            : state.inspectorOpen,
+      };
+    }),
 }));
