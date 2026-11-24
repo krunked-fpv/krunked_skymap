@@ -54,8 +54,9 @@ Every data stream runs without user-supplied API keys, guarded by `AbortControll
 4. **FAA Drone Airspace, TFRs & OpenDroneID (`src/services/airspaceService.ts`, `src/services/openDroneIdService.ts`)**
    - Queries **FAA ArcGIS FeatureServers** for UAS Facility Map LAANC grid ceilings (`FAA_UAS_FacilityMap_Data`), `Special_Use_Airspace`, and `Boundary_Airspace` (with automatic non-US coverage detection and `./data/fallback-airspace.geojson` fallback).
    - Merges live **ATC `B6` UAS** with a configurable **OpenDroneID WebSocket / HTTP JSON webhook drawer** and opt-in **4-drone ASTM F3411 local simulator (`SIM-ODID`, off by default)** with real-time **UASFM ceiling / TFR incursion detection** (`altM <= 500` for low-altitude LAANC checks).
-5. **Location & Geocoding (`src/services/geocodingService.ts`)**
-   - Instant client-side coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), non-blocking browser geolocation, aerospace hotspot presets, and **Open-Meteo Geocoding** with **Nominatim** fallback.
+5. **Live Geographic Location & Geocoding (`src/services/locationService.ts`, `src/services/geocodingService.ts`)**
+   - Automatically acquires your current geographic location on every page load via direct browser Geolocation (`navigator.geolocation`) with coarse-accuracy retry, zero-key HTTPS CORS IP geolocation fallback (`get.geojs.io` → `ipwho.is` → `api.ip.sb` → `ipinfo.io`), and non-blocking client-side reverse geocoding — never falling back to a hardcoded default city.
+   - Instant client-side coordinate parsing (`34.9054, -117.8839` or `34.9054N 117.8839W`), optional aerospace hotspot presets in `⌘K`, and **Open-Meteo Geocoding** with **Nominatim** fallback.
 
 ---
 

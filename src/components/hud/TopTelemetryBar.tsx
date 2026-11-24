@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import {
   Activity,
+  Crosshair,
   Download,
   MapPin,
   Radar,
@@ -31,6 +32,8 @@ import { STATUS_LABEL } from './ControlDock';
 export interface TopTelemetryBarProps {
   onToggleAudio?: (enabled: boolean) => void;
   onManualSweep?: () => void;
+  onLocateCurrent?: () => void;
+  gpsBusy?: boolean;
   onInstallPwa?: () => void;
   onDismissPwa?: () => void;
 }
@@ -98,10 +101,13 @@ function resolveSystemBeacon(
 export function TopTelemetryBar({
   onToggleAudio,
   onManualSweep,
+  onLocateCurrent,
+  gpsBusy = false,
   onInstallPwa,
   onDismissPwa,
 }: TopTelemetryBarProps) {
   const observer = useSkyStore((s) => s.observer);
+  const locationStatus = useSkyStore((s) => s.locationStatus);
   const radiusKm = useSkyStore((s) => s.radiusKm);
   const counts = useSkyStore((s) => s.counts);
   const fps = useSkyStore((s) => s.fps);
@@ -218,6 +224,19 @@ export function TopTelemetryBar({
       ? 'odid-trigger-dot is-sim'
       : 'odid-trigger-dot';
 
+  const isPendingLocation = observer.source === 'pending';
+  const isLiveCurrentLocation = observer.source === 'gps' || observer.source === 'ip';
+  const stationLabel = isPendingLocation
+    ? locationStatus === 'unavailable'
+      ? 'Set Location'
+      : 'Locating…'
+    : observer.label;
+  const stationCoordsText = isPendingLocation
+    ? locationStatus === 'unavailable'
+      ? 'GPS / SEARCH'
+      : 'ACQUIRING FIX'
+    : formatCoords(observer.lat, observer.lon, 2);
+
   return (
     <header className="top-telemetry-bar" aria-label="Telemetry status and cockpit controls">
       {/* Left Zone: Wordmark + Unified Location Omnibox Trigger */}
@@ -232,18 +251,34 @@ export function TopTelemetryBar({
           className="topbar-omnibox-btn"
           data-testid="omnibox-trigger"
           onClick={() => setCommandPaletteOpen(true)}
-          title={`Change observer station (${observer.label}) — Press ⌘K or /`}
-          aria-label={`Observer location ${observer.label}, open location command palette`}
+          title={`Change observer station (${stationLabel}) — Press ⌘K or /`}
+          aria-label={`Observer location ${stationLabel}, open location command palette`}
         >
           <MapPin size={12} color="#38BDF8" aria-hidden="true" style={{ flexShrink: 0 }} />
-          <span className="topbar-omnibox-btn__label">{observer.label}</span>
+          <span className="topbar-omnibox-btn__label">{stationLabel}</span>
           <span className="topbar-omnibox-btn__coords tabular">
-            {formatCoords(observer.lat, observer.lon, 2)}
+            {stationCoordsText}
           </span>
           <kbd className="topbar-keycap" aria-hidden="true">
             ⌘K
           </kbd>
         </button>
+
+        {onLocateCurrent && (
+          <button
+            type="button"
+            className={`topbar-action-btn topbar-action-btn--icon topbar-locate-btn${
+              isLiveCurrentLocation ? ' is-active' : ''
+            }`}
+            data-testid="topbar-locate-btn"
+            onClick={onLocateCurrent}
+            disabled={gpsBusy}
+            title="Center on my current geographic location"
+            aria-label="Center on my current geographic location"
+          >
+            <Crosshair size={13} aria-hidden="true" />
+          </button>
+        )}
       </div>
 
       {/* Center Zone: Segmented View Switcher (MAP / SPLIT / DOME + PIP) & Scope Toggle */}

@@ -1,6 +1,5 @@
 import * as satellite from 'satellite.js';
 import {
-  AEROSPACE_PRESETS,
   SAT_KINEMATICS_STRIDE,
   type ObserverLocation,
   type OrbitalScope,
@@ -505,20 +504,19 @@ export function computeSatelliteOrbitOverlay(
 
 /** Stateful worker engine decoupled from Web Worker globals for clean unit testing. */
 export function createAstroWorkerEngine() {
-  const defaultPreset = AEROSPACE_PRESETS[0];
   let allParsed: ParsedSatellite[] = [];
   let activePool: ParsedSatellite[] = [];
   let byNorad = new Map<number, ParsedSatellite>();
 
   const config: AstroWorkerConfig = {
     observer: {
-      lat: defaultPreset.lat,
-      lon: defaultPreset.lon,
-      altM: defaultPreset.altM,
-      label: defaultPreset.name,
-      source: 'default',
+      lat: 0,
+      lon: 0,
+      altM: 0,
+      label: 'Locating…',
+      source: 'pending',
     },
-    radiusKm: defaultPreset.defaultRadiusKm,
+    radiusKm: 120,
     orbitalScope: 'hemisphere',
     activeGroups: {
       stations: true,
