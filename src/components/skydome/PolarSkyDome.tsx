@@ -19,8 +19,12 @@ import {
 } from '../../types/sky-contracts';
 import { liveKinematicsRegistry, useSkyStore } from '../../store/useSkyStore';
 import { tacticalAudio } from '../../audio/tacticalAudio';
-import { computeTopocentricLookAngles, greatCircleDestination } from '../../math/geodesy';
-import { formatAltitude } from '../../math/units';
+import {
+  computeTopocentricLookAngles,
+  greatCircleDestination,
+  normalizeAzimuthDeg,
+} from '../../math/geodesy';
+import { formatAltitude, formatDistance } from '../../math/units';
 
 export interface PolarSkyDomeProps {
   className?: string;
@@ -248,36 +252,120 @@ function drawGlyph(
       break;
     }
     case 'balloon': {
-      ctx.beginPath();
-      ctx.arc(0, -1.2, 3.6, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
-      ctx.strokeStyle = '#ECFDF5';
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
+      if (entity.subSource === 'windborne') {
+        // WindBorne Systems superpressure tear-drop stratospheric sounding envelope
+        ctx.beginPath();
+        ctx.moveTo(0, 2.8);
+        ctx.bezierCurveTo(-4.1, 0.2, -4.1, -5.4, 0, -5.6);
+        ctx.bezierCurveTo(4.1, -5.4, 4.1, 0.2, 0, 2.8);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = '#A7F3D0';
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
 
-      ctx.beginPath();
-      ctx.moveTo(0, 2.4);
-      ctx.lineTo(0, 6.4);
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.1;
-      ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(-1.1, -2.5, 1.4, Math.PI * 1.05, Math.PI * 1.65);
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.78)';
+        ctx.lineWidth = 0.85;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(0, 2.8);
+        ctx.lineTo(0, 4.7);
+        ctx.strokeStyle = '#D1FAE5';
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ECFDF5';
+        ctx.fillRect(-1.3, 4.6, 2.6, 1.9);
+      } else {
+        // SondeHub / ADS-B LTA spherical balloon envelope + radiosonde diamond payload
+        ctx.beginPath();
+        ctx.arc(0, -1.4, 3.4, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = '#ECFDF5';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(0, 2.0);
+        ctx.lineTo(0, 4.8);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.05;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(0, 4.6);
+        ctx.lineTo(1.4, 6.0);
+        ctx.lineTo(0, 7.2);
+        ctx.lineTo(-1.4, 6.0);
+        ctx.closePath();
+        ctx.fillStyle = '#ECFDF5';
+        ctx.fill();
+      }
       break;
     }
     case 'drone': {
-      ctx.strokeStyle = color;
-      ctx.lineWidth = 1.45;
-      ctx.beginPath();
-      ctx.moveTo(-4, -4);
-      ctx.lineTo(4, 4);
-      ctx.moveTo(-4, 4);
-      ctx.lineTo(4, -4);
-      ctx.stroke();
+      if (entity.subSource === 'adsb-uas' || entity.uaType === 'fixed-wing') {
+        // High-aspect-ratio swept-wing / V-tail HALE fixed-wing UAV
+        ctx.rotate(headingAngle);
+        ctx.beginPath();
+        ctx.moveTo(6.4, 0);
+        ctx.lineTo(3.2, -1.1);
+        ctx.lineTo(1.1, -1.1);
+        ctx.lineTo(-1.0, -7.2);
+        ctx.lineTo(-2.3, -7.2);
+        ctx.lineTo(-1.4, -1.0);
+        ctx.lineTo(-4.4, -0.7);
+        ctx.lineTo(-6.1, -2.9);
+        ctx.lineTo(-6.7, -2.4);
+        ctx.lineTo(-5.2, 0);
+        ctx.lineTo(-6.7, 2.4);
+        ctx.lineTo(-6.1, 2.9);
+        ctx.lineTo(-4.4, 0.7);
+        ctx.lineTo(-1.4, 1.0);
+        ctx.lineTo(-2.3, 7.2);
+        ctx.lineTo(-1.0, 7.2);
+        ctx.lineTo(1.1, 1.1);
+        ctx.lineTo(3.2, 1.1);
+        ctx.closePath();
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.strokeStyle = entity.isMilitary ? '#F59E0B' : '#ECFCCB';
+        ctx.lineWidth = 0.85;
+        ctx.stroke();
+      } else {
+        // Quadrotor X-frame multirotor UAV
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.35;
+        ctx.beginPath();
+        ctx.moveTo(-3.8, -3.8);
+        ctx.lineTo(3.8, 3.8);
+        ctx.moveTo(-3.8, 3.8);
+        ctx.lineTo(3.8, -3.8);
+        ctx.stroke();
 
-      ctx.beginPath();
-      ctx.arc(0, 0, 2.1, 0, Math.PI * 2);
-      ctx.fillStyle = color;
-      ctx.fill();
+        const rotors: Array<[number, number]> = [
+          [-3.8, -3.8],
+          [3.8, -3.8],
+          [-3.8, 3.8],
+          [3.8, 3.8],
+        ];
+        ctx.lineWidth = 0.9;
+        for (const [rx, ry] of rotors) {
+          ctx.beginPath();
+          ctx.arc(rx, ry, 1.35, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        ctx.beginPath();
+        ctx.arc(0, 0, 2.0, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
       break;
     }
   }
@@ -529,7 +617,10 @@ function drawRadarGrid(
   const el30R = elToRadius(30, outerRadius);
   const el60R = elToRadius(60, outerRadius);
   const innerSpokeR = elToRadius(78, outerRadius);
-  const compact = Math.min(width, height) < 360;
+  const minDim = Math.min(width, height);
+  const isPipGrid = minDim <= 260;
+  const compact = minDim < 360;
+  const dishBoundaryR = isPipGrid ? horizonR : outerRadius;
 
   // Outer backdrop wash
   const bgGrad = ctx.createRadialGradient(cx, cy, 4, cx, cy, outerRadius * 1.08);
@@ -539,14 +630,16 @@ function drawRadarGrid(
   ctx.fillStyle = bgGrad;
   ctx.fillRect(0, 0, width, height);
 
-  // Over-The-Horizon (-5 deg to 0 deg) annular skirt shading
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
-  ctx.arc(cx, cy, horizonR, 0, Math.PI * 2, true);
-  ctx.fillStyle = 'rgba(245, 158, 11, 0.04)';
-  ctx.fill();
-  ctx.restore();
+  // Over-The-Horizon (-5 deg to 0 deg) annular skirt shading (omitted in compact PIP to avoid edge clutter)
+  if (!isPipGrid) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
+    ctx.arc(cx, cy, horizonR, 0, Math.PI * 2, true);
+    ctx.fillStyle = 'rgba(245, 158, 11, 0.04)';
+    ctx.fill();
+    ctx.restore();
+  }
 
   // Above-horizon inner dome fill
   ctx.save();
@@ -564,7 +657,7 @@ function drawRadarGrid(
   if (sweepEnabled) {
     ctx.save();
     ctx.beginPath();
-    ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
+    ctx.arc(cx, cy, dishBoundaryR, 0, Math.PI * 2);
     ctx.clip();
 
     const beamAngleRad = ((sweepAzDeg - 90) * Math.PI) / 180;
@@ -615,7 +708,7 @@ function drawRadarGrid(
     const elapsed = nowMs - pulseWaveStartMs;
     if (elapsed >= 0 && elapsed < PULSE_WAVE_DURATION_MS) {
       const progress = elapsed / PULSE_WAVE_DURATION_MS;
-      const waveR = progress * outerRadius;
+      const waveR = progress * dishBoundaryR;
       const alpha = (1 - progress) * 0.75;
       ctx.save();
       ctx.beginPath();
@@ -636,7 +729,7 @@ function drawRadarGrid(
 
     ctx.beginPath();
     ctx.moveTo(cx + startR * Math.cos(theta), cy + startR * Math.sin(theta));
-    ctx.lineTo(cx + outerRadius * Math.cos(theta), cy + outerRadius * Math.sin(theta));
+    ctx.lineTo(cx + dishBoundaryR * Math.cos(theta), cy + dishBoundaryR * Math.sin(theta));
     ctx.strokeStyle = isCardinal
       ? 'rgba(56, 189, 248, 0.24)'
       : isIntercardinal
@@ -646,10 +739,11 @@ function drawRadarGrid(
     ctx.stroke();
   }
 
-  // 5° perimeter bezel ticks on 0° Horizon ring
+  // 5° perimeter bezel ticks on 0° Horizon ring (major 15° ticks only in compact PIP)
   for (let az = 0; az < 360; az += 5) {
-    const theta = ((az - 90) * Math.PI) / 180;
     const major = az % 15 === 0;
+    if (isPipGrid && !major) continue;
+    const theta = ((az - 90) * Math.PI) / 180;
     const tIn = horizonR - (major ? 4.5 : 2.2);
     const tOut = horizonR;
     ctx.beginPath();
@@ -688,14 +782,16 @@ function drawRadarGrid(
   ctx.restore();
 
   // -5° Over-The-Horizon outer skirt boundary
-  ctx.save();
-  ctx.setLineDash([2, 4]);
-  ctx.beginPath();
-  ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.restore();
+  if (!isPipGrid) {
+    ctx.save();
+    ctx.setLineDash([2, 4]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, outerRadius, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.34)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.restore();
+  }
 
   // Zenith 90° precision center crosshair
   ctx.save();
@@ -719,12 +815,12 @@ function drawRadarGrid(
     { text: '30°', r: el30R, color: 'rgba(148, 163, 184, 0.78)' },
     { text: '0°', r: horizonR, color: 'rgba(34, 211, 238, 0.9)' },
   ];
-  if (!compact) {
+  if (!compact && !isPipGrid) {
     ringLabels.push({ text: '-5°', r: outerRadius, color: 'rgba(245, 158, 11, 0.72)' });
   }
 
   ctx.save();
-  ctx.font = `600 ${compact ? 8.5 : 9.5}px ${MONO_FONT}`;
+  ctx.font = `600 ${isPipGrid ? 8 : compact ? 8.5 : 9.5}px ${MONO_FONT}`;
   ctx.textAlign = 'left';
   ctx.textBaseline = 'middle';
   const labelTheta = ((-90 + 8) * Math.PI) / 180;
@@ -732,24 +828,25 @@ function drawRadarGrid(
     const lx = cx + item.r * Math.cos(labelTheta);
     const ly = cy + item.r * Math.sin(labelTheta);
     ctx.fillStyle = 'rgba(6, 11, 20, 0.78)';
-    ctx.fillRect(lx - 2, ly - 5, 20, 10);
+    ctx.fillRect(lx - 2, ly - 5, isPipGrid ? 16 : 20, 10);
     ctx.fillStyle = item.color;
     ctx.fillText(item.text, lx, ly);
   }
   ctx.restore();
 
-  // Cardinal and intercardinal compass labels outside outerRadius
+  // Cardinal and intercardinal compass labels outside dish perimeter
   ctx.save();
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const labelDist = outerRadius + (compact ? 11 : 14);
+  const labelDist = dishBoundaryR + (isPipGrid ? 9.5 : compact ? 11 : 14);
   for (const beacon of COMPASS_BEACONS) {
+    if (isPipGrid && !beacon.cardinal) continue;
     const theta = ((beacon.azDeg - 90) * Math.PI) / 180;
     const bx = cx + labelDist * Math.cos(theta);
     const by = cy + labelDist * Math.sin(theta);
 
     if (beacon.cardinal) {
-      ctx.font = `700 ${compact ? 10 : 11.5}px ${MONO_FONT}`;
+      ctx.font = `700 ${isPipGrid ? 9 : compact ? 10 : 11.5}px ${MONO_FONT}`;
       ctx.fillStyle = beacon.azDeg === 0 ? '#22D3EE' : '#CBD5E1';
     } else {
       ctx.font = `600 ${compact ? 8 : 9}px ${MONO_FONT}`;
@@ -811,6 +908,81 @@ function resolveLabelBox(
   return mustShow ? candidates[0] : null;
 }
 
+const DEFAULT_CURSOR_READOUT = 'AZ ---.-° · EL --.-° · RNG ---';
+
+function findNearestHitInList(
+  hits: RenderedTargetHit[],
+  px: number,
+  py: number,
+  radiusPx: number
+): string | null {
+  let bestId: string | null = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let i = 0; i < hits.length; i += 1) {
+    const hit = hits[i];
+    const dist = Math.hypot(px - hit.x, py - hit.y);
+    if (dist <= radiusPx) {
+      // Prefer closer hit, slightly biasing higher priority targets when right on top of each other
+      const score = dist - hit.priority * 0.025;
+      if (score < bestScore) {
+        bestScore = score;
+        bestId = hit.id;
+      }
+    }
+  }
+  return bestId;
+}
+
+function formatReadoutAngles(azDeg: number, elDeg: number): { azStr: string; elStr: string } {
+  const az = normalizeAzimuthDeg(azDeg);
+  const azRounded = Number(az.toFixed(1)) >= 360 ? 0 : az;
+  const azStr = azRounded.toFixed(1).padStart(5, '0');
+  const clampedEl = Math.max(-90, Math.min(90, elDeg));
+  const cleanEl = Math.abs(clampedEl) < 0.05 ? 0 : clampedEl;
+  const elSign = cleanEl >= 0 ? '+' : '';
+  const elStr = `${elSign}${cleanEl.toFixed(1)}°`;
+  return { azStr, elStr };
+}
+
+function formatCursorReadoutText(
+  px: number,
+  py: number,
+  metrics: CanvasMetrics,
+  hitId: string | null,
+  units: UnitSystem
+): string {
+  if (hitId) {
+    const entity = liveKinematicsRegistry.entities.get(hitId);
+    if (entity) {
+      const { azStr, elStr } = formatReadoutAngles(
+        entity.topocentric.azimuthDeg,
+        entity.topocentric.elevationDeg
+      );
+      const rngStr = formatDistance(entity.topocentric.slantRangeKm, units);
+      return `AZ ${azStr}° · EL ${elStr} · RNG ${rngStr}`;
+    }
+  }
+
+  if (metrics.outerRadius <= 0) {
+    return DEFAULT_CURSOR_READOUT;
+  }
+
+  const { azDeg, elDeg, inBounds } = canvasToAzEl(
+    px,
+    py,
+    metrics.cx,
+    metrics.cy,
+    metrics.outerRadius
+  );
+  if (inBounds) {
+    const { azStr, elStr } = formatReadoutAngles(azDeg, elDeg);
+    return `AZ ${azStr}° · EL ${elStr} · RNG ---`;
+  }
+
+  return DEFAULT_CURSOR_READOUT;
+}
+
 export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -830,6 +1002,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const lastTrailSampleRef = useRef<Map<string, number>>(new Map());
   const lastObserverKeyRef = useRef<string>('');
   const pointerInsideRef = useRef<boolean>(false);
+  const lastPointerRef = useRef<{ px: number; py: number } | null>(null);
   const touchStartRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const lastTouchEndMsRef = useRef<number>(-Infinity);
   const sweepAzRef = useRef<number>(0);
@@ -839,6 +1012,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const [isCompact, setIsCompact] = useState(false);
 
   const layout = useSkyStore((s) => s.layout);
+  const setLayout = useSkyStore((s) => s.setLayout);
+  const skyDomePip = useSkyStore((s) => s.skyDomePip);
+  const setSkyDomePip = useSkyStore((s) => s.setSkyDomePip);
   const units = useSkyStore((s) => s.units);
   const sweepEnabled = useSkyStore((s) => s.sweepEnabled);
   const setSweepEnabled = useSkyStore((s) => s.setSweepEnabled);
@@ -846,6 +1022,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const setDomeLabelsEnabled = useSkyStore((s) => s.setDomeLabelsEnabled);
   const orbitalScope = useSkyStore((s) => s.orbitalScope);
   const sweepPulseCounter = useSkyStore((s) => s.sweepPulseCounter);
+
+  const isPip = layout === 'map' && skyDomePip;
 
   const unitsRef = useRef<UnitSystem>(units);
   unitsRef.current = units;
@@ -867,7 +1045,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       canvas.height = targetH;
     }
     const minDim = Math.min(width, height);
-    const padding = Math.max(24, Math.min(44, minDim * 0.1));
+    const padding = minDim <= 260 ? 16 : Math.max(24, Math.min(44, minDim * 0.1));
     const outerRadius = Math.max(36, minDim / 2 - padding);
     metricsRef.current = {
       width,
@@ -899,7 +1077,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     syncLayoutSize();
     const rafId = requestAnimationFrame(syncLayoutSize);
     return () => cancelAnimationFrame(rafId);
-  }, [layout, updateCanvasSize]);
+  }, [layout, skyDomePip, updateCanvasSize]);
+
+  useEffect(() => {
+    if (layout === 'map' && !skyDomePip && pointerInsideRef.current) {
+      pointerInsideRef.current = false;
+      lastPointerRef.current = null;
+      if (cursorReadoutRef.current) {
+        cursorReadoutRef.current.textContent = DEFAULT_CURSOR_READOUT;
+      }
+      const st = useSkyStore.getState();
+      if (st.hoveredId !== null) {
+        st.setHoveredId(null);
+      }
+    }
+  }, [layout, skyDomePip]);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -946,7 +1138,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       lastFrameMsRef.current = nowMs;
 
       const state = useSkyStore.getState();
-      if (state.layout === 'map') return;
+      if (state.layout === 'map' && !state.skyDomePip) return;
 
       const currentDpr = Math.max(1, window.devicePixelRatio || 1);
       if (metrics.dpr !== currentDpr) {
@@ -1267,7 +1459,20 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
       renderedHitsRef.current = nextHits;
 
-      if (
+      const activeUnits = state.units ?? unitsRef.current;
+
+      if (pointerInsideRef.current && lastPointerRef.current) {
+        const pt = lastPointerRef.current;
+        const liveHitId = findNearestHitInList(nextHits, pt.px, pt.py, HIT_RADIUS_PX);
+        if (state.hoveredId !== liveHitId) {
+          canvas.style.cursor = liveHitId ? 'pointer' : 'crosshair';
+          state.setHoveredId(liveHitId);
+        }
+        const nextText = formatCursorReadoutText(pt.px, pt.py, metrics, liveHitId, activeUnits);
+        if (cursorReadoutRef.current && cursorReadoutRef.current.textContent !== nextText) {
+          cursorReadoutRef.current.textContent = nextText;
+        }
+      } else if (
         pointerInsideRef.current &&
         state.hoveredId !== null &&
         !nextHits.some((h) => h.id === state.hoveredId)
@@ -1283,9 +1488,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       ctx.textBaseline = 'middle';
 
       let labelsDrawn = 0;
+      const isPipFrame = state.layout === 'map' && state.skyDomePip;
       const compactDome = metrics.width < 420 || metrics.height < 360;
-      const maxAutoLabels = metrics.width < 420 ? 12 : 26;
-      const activeUnits = state.units ?? unitsRef.current;
+      const maxAutoLabels = isPipFrame ? 0 : metrics.width < 420 ? 12 : 26;
 
       for (let i = visible.length - 1; i >= 0; i -= 1) {
         const item = visible[i];
@@ -1327,12 +1532,12 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         placedLabels.push(box);
         if (!mustShow) labelsDrawn += 1;
 
-        ctx.fillStyle = mustShow ? 'rgba(9, 15, 28, 0.94)' : 'rgba(6, 11, 20, 0.84)';
+        ctx.fillStyle = mustShow ? 'rgba(7, 10, 17, 0.92)' : 'rgba(7, 10, 17, 0.84)';
         ctx.strokeStyle = mustShow
           ? item.color
           : isHighPriority
-          ? 'rgba(148, 163, 184, 0.36)'
-          : 'rgba(120, 190, 255, 0.24)';
+          ? 'rgba(255, 255, 255, 0.16)'
+          : 'rgba(255, 255, 255, 0.10)';
         ctx.lineWidth = mustShow ? 1.1 : 0.75;
         ctx.beginPath();
         traceRoundedRect(ctx, box.x, box.y, box.w, box.h, 3);
@@ -1360,25 +1565,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     };
   }, [updateCanvasSize]);
 
-  const findNearestHit = (px: number, py: number, radiusPx = HIT_RADIUS_PX): string | null => {
-    const hits = renderedHitsRef.current;
-    let bestId: string | null = null;
-    let bestScore = Number.POSITIVE_INFINITY;
-
-    for (let i = 0; i < hits.length; i += 1) {
-      const hit = hits[i];
-      const dist = Math.hypot(px - hit.x, py - hit.y);
-      if (dist <= radiusPx) {
-        // Prefer closer hit, slightly biasing higher priority targets when right on top of each other
-        const score = dist - hit.priority * 0.025;
-        if (score < bestScore) {
-          bestScore = score;
-          bestId = hit.id;
-        }
-      }
-    }
-    return bestId;
-  };
+  const findNearestHit = (px: number, py: number, radiusPx = HIT_RADIUS_PX): string | null =>
+    findNearestHitInList(renderedHitsRef.current, px, py, radiusPx);
 
   const getClientCanvasPoint = (
     clientX: number,
@@ -1393,22 +1581,12 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     };
   };
 
-  const updateCursorReadout = (px: number, py: number) => {
-    const metrics = metricsRef.current;
-    if (!cursorReadoutRef.current || metrics.outerRadius <= 0) return;
-    const { azDeg, elDeg, inBounds } = canvasToAzEl(
-      px,
-      py,
-      metrics.cx,
-      metrics.cy,
-      metrics.outerRadius
-    );
-    if (inBounds) {
-      const azStr = azDeg.toFixed(1).padStart(5, '0');
-      const elStr = `${elDeg >= 0 ? ' ' : ''}${elDeg.toFixed(1)}°`;
-      cursorReadoutRef.current.textContent = `AZ ${azStr}° · EL ${elStr}`;
-    } else {
-      cursorReadoutRef.current.textContent = 'AZ ---.-° · EL --.-°';
+  const updateCursorReadout = (px: number, py: number, hitId: string | null) => {
+    if (!cursorReadoutRef.current) return;
+    const activeUnits = useSkyStore.getState().units ?? unitsRef.current;
+    const nextText = formatCursorReadoutText(px, py, metricsRef.current, hitId, activeUnits);
+    if (cursorReadoutRef.current.textContent !== nextText) {
+      cursorReadoutRef.current.textContent = nextText;
     }
   };
 
@@ -1416,10 +1594,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     const pt = getClientCanvasPoint(e.clientX, e.clientY);
     if (!pt) return;
 
-    updateCursorReadout(pt.px, pt.py);
-
     pointerInsideRef.current = true;
+    lastPointerRef.current = pt;
     const hitId = findNearestHit(pt.px, pt.py, HIT_RADIUS_PX);
+    updateCursorReadout(pt.px, pt.py, hitId);
+
     const canvas = canvasRef.current;
     if (canvas) {
       canvas.style.cursor = hitId ? 'pointer' : 'crosshair';
@@ -1457,7 +1636,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     touchStartRef.current = { x: touch.clientX, y: touch.clientY, moved: false };
     const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
     if (pt) {
-      updateCursorReadout(pt.px, pt.py);
+      const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
+      updateCursorReadout(pt.px, pt.py, hitId);
     }
   };
 
@@ -1478,7 +1658,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     }
     const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
     if (pt) {
-      updateCursorReadout(pt.px, pt.py);
+      const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
+      updateCursorReadout(pt.px, pt.py, hitId);
     }
   };
 
@@ -1497,8 +1678,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     const pt = getClientCanvasPoint(touch.clientX, touch.clientY);
     if (!pt) return;
 
-    updateCursorReadout(pt.px, pt.py);
     const hitId = findNearestHit(pt.px, pt.py, TOUCH_HIT_RADIUS_PX);
+    updateCursorReadout(pt.px, pt.py, hitId);
     if (!hitId) return;
 
     const store = useSkyStore.getState();
@@ -1514,8 +1695,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const handleMouseLeave = () => {
     pointerInsideRef.current = false;
+    lastPointerRef.current = null;
     if (cursorReadoutRef.current) {
-      cursorReadoutRef.current.textContent = 'AZ ---.-° · EL --.-°';
+      cursorReadoutRef.current.textContent = DEFAULT_CURSOR_READOUT;
     }
     const canvas = canvasRef.current;
     if (canvas) {
@@ -1529,6 +1711,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const rootStyle: CSSProperties = {
     position: 'relative',
+    display: 'flex',
+    flexDirection: 'column',
     width: '100%',
     height: '100%',
     overflow: 'hidden',
@@ -1537,19 +1721,59 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     fontFamily: MONO_FONT,
   };
 
+  const canvasStageStyle: CSSProperties = {
+    position: 'relative',
+    flex: '1 1 auto',
+    minHeight: 0,
+    width: '100%',
+    overflow: 'hidden',
+  };
+
+  const pipHeaderStyle: CSSProperties = {
+    flexShrink: 0,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 2,
+    padding: '5px 7px 4px',
+    backgroundColor: 'rgba(7, 10, 17, 0.9)',
+    borderBottom: '1px solid rgba(255, 255, 255, 0.08)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
+    boxShadow: 'inset 0 1px 0 rgba(255, 255, 255, 0.08)',
+    zIndex: 12,
+  };
+
+  const pipActionBtnStyle: CSSProperties = {
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 20,
+    height: 20,
+    padding: 0,
+    borderRadius: 4,
+    border: '1px solid rgba(255, 255, 255, 0.12)',
+    backgroundColor: 'rgba(15, 23, 42, 0.72)',
+    color: '#CBD5E1',
+    cursor: 'pointer',
+    touchAction: 'manipulation',
+    outline: 'none',
+    flexShrink: 0,
+  };
+
   const cornerTitleStyle: CSSProperties = {
     position: 'absolute',
-    top: layout === 'dome' && isCompact ? 46 : isCompact ? 8 : 12,
-    left: layout === 'dome' && !isCompact ? 340 : isCompact ? 8 : 12,
+    top: isCompact ? 8 : 12,
+    left: isCompact ? 8 : 12,
     pointerEvents: 'none',
     display: 'flex',
     flexDirection: 'column',
     gap: 2,
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
-    backgroundColor: 'rgba(11, 17, 30, 0.76)',
-    border: '1px solid rgba(120, 190, 255, 0.14)',
-    backdropFilter: 'blur(8px)',
+    backgroundColor: 'rgba(7, 10, 17, 0.84)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
   };
 
   const readoutStyle: CSSProperties = {
@@ -1559,24 +1783,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     pointerEvents: 'none',
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
-    backgroundColor: 'rgba(11, 17, 30, 0.78)',
-    border: '1px solid rgba(120, 190, 255, 0.14)',
-    backdropFilter: 'blur(8px)',
+    backgroundColor: 'rgba(7, 10, 17, 0.84)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
     color: '#94A3B8',
     fontSize: isCompact ? 9.5 : 10.5,
     fontVariantNumeric: 'tabular-nums',
     letterSpacing: '0.04em',
+    whiteSpace: 'nowrap',
   };
 
   const bezelControlsStyle: CSSProperties = {
     position: 'absolute',
     bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
-    left:
-      layout === 'dome' && !isCompact
-        ? 340
-        : isCompact
-          ? 'max(8px, env(safe-area-inset-left))'
-          : 'max(12px, env(safe-area-inset-left))',
+    left: isCompact ? 'max(8px, env(safe-area-inset-left))' : 'max(12px, env(safe-area-inset-left))',
     display: 'flex',
     alignItems: 'center',
     gap: 6,
@@ -1594,9 +1815,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     gap: isCompact ? 6 : 9,
     padding: isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
-    backgroundColor: 'rgba(11, 17, 30, 0.76)',
-    border: '1px solid rgba(120, 190, 255, 0.14)',
-    backdropFilter: 'blur(8px)',
+    backgroundColor: 'rgba(7, 10, 17, 0.84)',
+    border: '1px solid rgba(255, 255, 255, 0.08)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
     fontSize: isCompact ? 8.5 : 9.5,
     color: '#94A3B8',
     fontVariantNumeric: 'tabular-nums',
@@ -1611,9 +1833,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     padding: isCompact ? '4px 9px' : '5px 10px',
     borderRadius: 6,
     border: active
-      ? '1px solid rgba(34, 211, 238, 0.5)'
-      : '1px solid rgba(120, 190, 255, 0.16)',
-    backgroundColor: active ? 'rgba(34, 211, 238, 0.12)' : 'rgba(11, 17, 30, 0.82)',
+      ? '1px solid rgba(34, 211, 238, 0.48)'
+      : '1px solid rgba(255, 255, 255, 0.08)',
+    backgroundColor: active ? 'rgba(34, 211, 238, 0.14)' : 'rgba(7, 10, 17, 0.84)',
     color: active ? '#E0F2FE' : '#94A3B8',
     fontFamily: MONO_FONT,
     fontSize: isCompact ? 9.5 : 10,
@@ -1621,7 +1843,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     letterSpacing: '0.06em',
     cursor: 'pointer',
     touchAction: 'manipulation',
-    backdropFilter: 'blur(8px)',
+    backdropFilter: 'blur(16px)',
+    WebkitBackdropFilter: 'blur(16px)',
     outline: 'none',
   });
 
@@ -1635,110 +1858,216 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   });
 
   return (
-    <div ref={containerRef} className={className ? `skydome-root ${className}` : 'skydome-root'} style={rootStyle}>
-      <canvas
-        ref={canvasRef}
-        aria-label="Polar Sky-Dome Topocentric Hemisphere Radar"
-        onMouseMove={handleMouseMove}
-        onClick={handleClick}
-        onMouseLeave={handleMouseLeave}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        onTouchCancel={handleTouchCancel}
-        style={{ display: 'block', width: '100%', height: '100%', touchAction: 'none' }}
-      />
-
-      {/* Top-Left Scope Header */}
-      <div style={cornerTitleStyle}>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            fontSize: isCompact ? 9.5 : 10.5,
-            fontWeight: 700,
-            letterSpacing: '0.08em',
-            color: '#E2E8F0',
-          }}
-        >
-          <span style={ledStyle(true, '#22D3EE')} />
-          <span>POLAR SKY-DOME</span>
-        </div>
-        {!isCompact && (
+    <div
+      className={className ? `skydome-root ${className}` : 'skydome-root'}
+      style={rootStyle}
+      data-pip={isPip ? 'true' : 'false'}
+    >
+      {isPip && (
+        <div className="skydome-pip-header" style={pipHeaderStyle}>
           <div
             style={{
-              fontSize: 9,
-              color: '#64748B',
-              letterSpacing: '0.05em',
-              fontVariantNumeric: 'tabular-nums',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 6,
+              minWidth: 0,
             }}
           >
-            90° ZEN · 0° HRZ · {orbitalScope === 'cylinder' ? 'CYLINDER' : 'HEMISPHERE'}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 5, minWidth: 0 }}>
+              <span style={ledStyle(true, '#22D3EE')} />
+              <span
+                style={{
+                  fontSize: 9,
+                  fontWeight: 700,
+                  letterSpacing: '0.08em',
+                  color: '#E2E8F0',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                SKY-DOME PIP
+              </span>
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 4, flexShrink: 0 }}>
+              <button
+                type="button"
+                data-testid="skydome-pip-expand"
+                title="Expand to Split View"
+                aria-label="Expand to Split View"
+                style={pipActionBtnStyle}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setLayout('split');
+                }}
+              >
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <path d="M7.5 1.5h3v3M10.5 1.5L6.8 5.2M4.5 10.5h-3v-3M1.5 10.5l3.7-3.7" />
+                </svg>
+              </button>
+              <button
+                type="button"
+                data-testid="skydome-pip-close"
+                title="Hide Sky-Dome PIP"
+                aria-label="Hide Sky-Dome PIP"
+                style={pipActionBtnStyle}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSkyDomePip(false);
+                }}
+              >
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  aria-hidden="true"
+                >
+                  <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
+                </svg>
+              </button>
+            </div>
           </div>
-        )}
-      </div>
-
-      {/* Top-Right Live Cursor AZ / EL Readout */}
-      <div style={readoutStyle}>
-        <span ref={cursorReadoutRef}>AZ ---.-° · EL --.-°</span>
-      </div>
-
-      {/* Bottom-Left Bezel Micro-Controls */}
-      <div className="skydome-bezel-controls" style={bezelControlsStyle}>
-        <button
-          type="button"
-          aria-pressed={sweepEnabled}
-          style={bezelButtonStyle(sweepEnabled)}
-          onClick={(e) => {
-            e.stopPropagation();
-            setSweepEnabled(!sweepEnabled);
-          }}
-        >
-          <span style={ledStyle(sweepEnabled, '#22D3EE')} />
-          <span>SWEEP</span>
-        </button>
-        <button
-          type="button"
-          aria-pressed={domeLabelsEnabled}
-          style={bezelButtonStyle(domeLabelsEnabled)}
-          onClick={(e) => {
-            e.stopPropagation();
-            setDomeLabelsEnabled(!domeLabelsEnabled);
-          }}
-        >
-          <span style={ledStyle(domeLabelsEnabled, '#38BDF8')} />
-          <span>LABELS</span>
-        </button>
-      </div>
-
-      {/* Bottom-Right Horizon & Orbital Legend */}
-      <div style={legendStyle}>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-          <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
-          <span>0° HRZ</span>
-        </span>
-        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
           <span
+            ref={cursorReadoutRef}
             style={{
-              width: 8,
-              height: 2,
-              borderTop: '1px dashed rgba(245, 158, 11, 0.75)',
-              display: 'inline-block',
+              display: 'block',
+              fontSize: 8.5,
+              lineHeight: 1.2,
+              color: '#94A3B8',
+              fontVariantNumeric: 'tabular-nums',
+              letterSpacing: '0.02em',
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
             }}
-          />
-          <span>-5° OTH</span>
-        </span>
-        {!isCompact && (
+          >
+            {DEFAULT_CURSOR_READOUT}
+          </span>
+        </div>
+      )}
+
+      <div key="skydome-canvas-stage" ref={containerRef} style={canvasStageStyle}>
+        <canvas
+          ref={canvasRef}
+          aria-label="Polar Sky-Dome Topocentric Hemisphere Radar"
+          onMouseMove={handleMouseMove}
+          onClick={handleClick}
+          onMouseLeave={handleMouseLeave}
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          onTouchCancel={handleTouchCancel}
+          style={{ display: 'block', width: '100%', height: '100%', touchAction: 'none' }}
+        />
+
+        {!isPip && (
           <>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={ledStyle(true, SATELLITE_SUNLIT_COLOR)} />
-              <span>SUNLIT</span>
-            </span>
-            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-              <span style={ledStyle(true, SATELLITE_ECLIPSED_COLOR)} />
-              <span>ECLIPSED</span>
-            </span>
+            {/* Top-Left Scope Header */}
+            <div style={cornerTitleStyle}>
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  fontSize: isCompact ? 9.5 : 10.5,
+                  fontWeight: 700,
+                  letterSpacing: '0.08em',
+                  color: '#E2E8F0',
+                }}
+              >
+                <span style={ledStyle(true, '#22D3EE')} />
+                <span>POLAR SKY-DOME</span>
+              </div>
+              {!isCompact && (
+                <div
+                  style={{
+                    fontSize: 9,
+                    color: '#64748B',
+                    letterSpacing: '0.05em',
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  90° ZEN · 0° HRZ · {orbitalScope === 'cylinder' ? 'CYLINDER' : 'HEMISPHERE'}
+                </div>
+              )}
+            </div>
+
+            {/* Top-Right Live Cursor AZ / EL / RNG Readout */}
+            <div style={readoutStyle}>
+              <span ref={cursorReadoutRef}>{DEFAULT_CURSOR_READOUT}</span>
+            </div>
+
+            {/* Bottom-Left Bezel Micro-Controls */}
+            <div className="skydome-bezel-controls" style={bezelControlsStyle}>
+              <button
+                type="button"
+                aria-pressed={sweepEnabled}
+                style={bezelButtonStyle(sweepEnabled)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setSweepEnabled(!sweepEnabled);
+                }}
+              >
+                <span style={ledStyle(sweepEnabled, '#22D3EE')} />
+                <span>SWEEP</span>
+              </button>
+              <button
+                type="button"
+                aria-pressed={domeLabelsEnabled}
+                style={bezelButtonStyle(domeLabelsEnabled)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setDomeLabelsEnabled(!domeLabelsEnabled);
+                }}
+              >
+                <span style={ledStyle(domeLabelsEnabled, '#38BDF8')} />
+                <span>LABELS</span>
+              </button>
+            </div>
+
+            {/* Bottom-Right Horizon & Orbital Legend */}
+            <div style={legendStyle}>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
+                <span>0° HRZ</span>
+              </span>
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span
+                  style={{
+                    width: 8,
+                    height: 2,
+                    borderTop: '1px dashed rgba(245, 158, 11, 0.75)',
+                    display: 'inline-block',
+                  }}
+                />
+                <span>-5° OTH</span>
+              </span>
+              {!isCompact && (
+                <>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <span style={ledStyle(true, SATELLITE_SUNLIT_COLOR)} />
+                    <span>SUNLIT</span>
+                  </span>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <span style={ledStyle(true, SATELLITE_ECLIPSED_COLOR)} />
+                    <span>ECLIPSED</span>
+                  </span>
+                </>
+              )}
+            </div>
           </>
         )}
       </div>
