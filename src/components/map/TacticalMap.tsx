@@ -7,6 +7,7 @@ import {
   EMERGENCY_COLOR,
   SATELLITE_ECLIPSED_COLOR,
   SATELLITE_SUNLIT_COLOR,
+  type LayoutMode,
   type SkyEntity,
   type UnitSystem,
 } from '../../types/sky-contracts';
@@ -291,6 +292,66 @@ function zoomForRadiusKm(radiusKm: number, latDeg = 38): number {
   const cosLat = Math.max(0.25, Math.cos(Math.min(80, Math.abs(latDeg)) * DEG_TO_RAD));
   const rawZoom = Math.log2((19568 * cosLat) / clampedRadius);
   return Math.max(4.5, Math.min(12.5, rawZoom));
+}
+
+const ZERO_CAMERA_PADDING: maplibregl.PaddingOptions = {
+  top: 0,
+  bottom: 0,
+  left: 0,
+  right: 0,
+};
+
+export function computeLayoutCameraPadding(
+  layout: LayoutMode,
+  containerWidth: number,
+  containerHeight: number
+): maplibregl.PaddingOptions {
+  if (layout !== 'split') {
+    return ZERO_CAMERA_PADDING;
+  }
+
+  const width =
+    Number.isFinite(containerWidth) && containerWidth > 0
+      ? containerWidth
+      : typeof window !== 'undefined' && Number.isFinite(window.innerWidth) && window.innerWidth > 0
+        ? window.innerWidth
+        : 1280;
+  const height =
+    Number.isFinite(containerHeight) && containerHeight > 0
+      ? containerHeight
+      : typeof window !== 'undefined' && Number.isFinite(window.innerHeight) && window.innerHeight > 0
+        ? window.innerHeight
+        : 720;
+
+  const isMobile = width <= 767;
+  const domeRect =
+    typeof document !== 'undefined'
+      ? document.querySelector('[data-pane="dome"]')?.getBoundingClientRect()
+      : undefined;
+
+  if (isMobile) {
+    const fallbackH = Math.round(height * 0.48);
+    const measuredH =
+      domeRect &&
+      Number.isFinite(domeRect.height) &&
+      domeRect.height > 0 &&
+      domeRect.height < height * 0.85
+        ? Math.round(domeRect.height)
+        : fallbackH;
+    const domeH = Math.max(0, Math.min(Math.round(height * 0.85), measuredH));
+    return { top: 0, bottom: domeH, left: 0, right: 0 };
+  }
+
+  const fallbackW = Math.round(Math.min(680, Math.max(340, width * 0.42)));
+  const measuredW =
+    domeRect &&
+    Number.isFinite(domeRect.width) &&
+    domeRect.width > 0 &&
+    domeRect.width < width * 0.85
+      ? Math.round(domeRect.width)
+      : fallbackW;
+  const domeW = Math.max(0, Math.min(Math.round(width * 0.85), measuredW));
+  return { top: 0, bottom: 0, left: 0, right: domeW };
 }
 
 function resolveEntityColor(entity: SkyEntity): string {
@@ -1291,6 +1352,15 @@ export function TacticalMap({ className }: TacticalMapProps) {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const scaleControlRef = useRef<maplibregl.ScaleControl | null>(null);
   const drawMapLabelsRef = useRef<(() => void) | null>(null);
+  const syncCameraPaddingRef = useRef<
+    ((targetLayout: LayoutMode, animate: boolean, force?: boolean) => void) | null
+  >(null);
+  const appliedPaddingRef = useRef<maplibregl.PaddingOptions>({
+    top: 0,
+    bottom: 0,
+    left: 0,
+    right: 0,
+  });
   const mapLoadedRef = useRef(false);
   const isPointerDownRef = useRef(false);
   const lastEaseMsRef = useRef(0);
@@ -1328,6 +1398,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
   const prevRadiusRef = useRef<number>(radiusKm);
   const prevRecenterNonceRef = useRef<number>(recenterNonce);
   const prevScopeRef = useRef(atmosphericScope);
+  const prevLayoutEffectRef = useRef<LayoutMode>(layout);
 
   // Initialize MapLibre once
   useEffect(() => {
@@ -1387,6 +1458,53 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
     map.addControl(new maplibregl.NavigationControl({ showCompass: true, showZoom: true }), 'bottom-right');
     map.addControl(scaleControl, 'bottom-right');
+
+    const applyCameraPadding = (
+      targetMap: maplibregl.Map,
+      targetLayout: LayoutMode,
+      animate: boolean,
+      force = false
+    ) => {
+      const rect = container.getBoundingClientRect();
+      const next = computeLayoutCameraPadding(targetLayout, rect.width, rect.height);
+      const prev = appliedPaddingRef.current;
+      if (
+        !force &&
+        prev.top === next.top &&
+        prev.bottom === next.bottom &&
+        prev.left === next.left &&
+        prev.right === next.right
+      ) {
+        return;
+      }
+      appliedPaddingRef.current = next;
+      try {
+        if (animate && typeof targetMap.easeTo === 'function') {
+          lastEaseMsRef.current = performance.now();
+          targetMap.easeTo({
+            padding: next,
+            duration: 220,
+            essential: true,
+          });
+        } else if (typeof targetMap.setPadding === 'function') {
+          targetMap.setPadding(next);
+        }
+      } catch {
+        // Ignore transient padding errors during map initialization or teardown
+      }
+    };
+
+    syncCameraPaddingRef.current = (
+      targetLayout: LayoutMode,
+      animate: boolean,
+      force = false
+    ) => {
+      if (mapRef.current) {
+        applyCameraPadding(mapRef.current, targetLayout, animate, force);
+      }
+    };
+
+    applyCameraPadding(map, initialState.layout, false, true);
 
     const syncLabelCanvasSize = (w: number, h: number) => {
       const labelCanvas = labelCanvasRef.current;
@@ -1489,9 +1607,20 @@ export function TacticalMap({ className }: TacticalMapProps) {
         !mapLoadedRef.current ||
         state.layout === 'dome' ||
         (typeof document !== 'undefined' && document.hidden) ||
+        !Number.isFinite(width) ||
+        !Number.isFinite(height) ||
         width <= 0 ||
         height <= 0
       ) {
+        return;
+      }
+
+      const activePad = appliedPaddingRef.current;
+      const exposedWidth =
+        state.layout === 'split' ? Math.max(0, width - activePad.right) : width;
+      const exposedHeight =
+        state.layout === 'split' ? Math.max(0, height - activePad.bottom) : height;
+      if (exposedWidth <= 0 || exposedHeight <= 0) {
         return;
       }
 
@@ -1519,9 +1648,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
           !Number.isFinite(pt.x) ||
           !Number.isFinite(pt.y) ||
           pt.x < 0 ||
-          pt.x > width ||
+          pt.x > exposedWidth ||
           pt.y < 0 ||
-          pt.y > height
+          pt.y > exposedHeight
         ) {
           continue;
         }
@@ -1626,8 +1755,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
         let chosenSlot = findAvailableLabelSlot(
           slotCandidates,
-          width,
-          height,
+          exposedWidth,
+          exposedHeight,
           spriteBoxes,
           placedLabelBoxes,
           true
@@ -1636,8 +1765,8 @@ export function TacticalMap({ className }: TacticalMapProps) {
         if (!chosenSlot && item.isAlert && !mustShow) {
           chosenSlot = findAvailableLabelSlot(
             slotCandidates,
-            width,
-            height,
+            exposedWidth,
+            exposedHeight,
             spriteBoxes,
             placedLabelBoxes,
             false
@@ -1651,12 +1780,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
           ly = chosenSlot.y;
         } else {
           if (!mustShow) continue;
-          const preferLeft = item.px + offset + boxW > width - 6;
+          const preferLeft = item.px + offset + boxW > exposedWidth - 6;
+          const maxLx = Math.max(6, exposedWidth - boxW - 6);
+          const maxLy = Math.max(6, exposedHeight - boxH - 6);
           lx = Math.max(
             6,
-            Math.min(width - boxW - 6, preferLeft ? item.px - offset - boxW : item.px + offset)
+            Math.min(maxLx, preferLeft ? item.px - offset - boxW : item.px + offset)
           );
-          ly = Math.max(6, Math.min(height - boxH - 6, item.py - boxH / 2));
+          ly = Math.max(6, Math.min(maxLy, item.py - boxH / 2));
         }
 
         const placedBox = acquirePooledBox(placedBoxPool, placedIdx);
@@ -1714,11 +1845,12 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const handleMouseMove = (
       ev: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
     ) => {
+      const store = useSkyStore.getState();
+      if (store.layout === 'dome') return;
       const feat = ev.features?.[0];
       const id = feat?.properties?.id;
       if (typeof id !== 'string' || !id) return;
       map.getCanvas().style.cursor = 'pointer';
-      const store = useSkyStore.getState();
       if (store.hoveredId !== id) {
         store.setHoveredId(id);
       }
@@ -1787,6 +1919,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       contextLostListenerAttached = true;
 
       const st = useSkyStore.getState();
+      applyCameraPadding(map, st.layout, false, true);
       const isPending = st.observer.source === 'pending';
       const shiftFromMountKm = haversineDistanceKm(
         mountObserver.lat,
@@ -1868,6 +2001,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         } catch {
           // Ignore transient resize errors during teardown
         }
+        applyCameraPadding(mapRef.current, useSkyStore.getState().layout, false);
       }
       drawMapLabels();
     });
@@ -1876,6 +2010,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const handleWindowResize = () => {
       const rect = container.getBoundingClientRect();
       syncLabelCanvasSize(rect.width, rect.height);
+      if (mapRef.current) {
+        applyCameraPadding(mapRef.current, useSkyStore.getState().layout, false);
+      }
       drawMapLabels();
     };
     window.addEventListener('resize', handleWindowResize);
@@ -1906,18 +2043,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
       if (!activeMap || !mapLoadedRef.current) return;
 
       const state = useSkyStore.getState();
-      if (state.layout === 'dome') {
-        lastEntityVersion = -1;
-        if (lastLayout !== 'dome') {
-          lastLayout = 'dome';
-          drawMapLabels();
-        }
-        if (hoverCoordsRef.current !== null) {
-          hoverCoordsRef.current = null;
-          setHoverTip(null);
-          activeMap.getCanvas().style.cursor = '';
-        }
-        return;
+      if (state.layout === 'dome' && hoverCoordsRef.current !== null) {
+        hoverCoordsRef.current = null;
+        setHoverTip(null);
+        activeMap.getCanvas().style.cursor = '';
       }
 
       const layoutChanged = state.layout !== lastLayout;
@@ -1978,7 +2107,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
       if (versionChanged || stateChanged || labelsChanged || unitsChanged || layoutChanged) {
         lastMapLabelsEnabled = state.mapLabelsEnabled;
         lastUnits = state.units;
-        drawMapLabels();
+        if (state.layout !== 'dome' || layoutChanged) {
+          drawMapLabels();
+        }
       }
 
       // Orbit overlay update (on overlay change, layer toggle, or every ~120ms for moving footprint)
@@ -2042,6 +2173,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
       resizeObserver.disconnect();
       window.removeEventListener('resize', handleWindowResize);
       drawMapLabelsRef.current = null;
+      syncCameraPaddingRef.current = null;
       mapLoadedRef.current = false;
       scaleControlRef.current = null;
       try {
@@ -2224,13 +2356,42 @@ export function TacticalMap({ className }: TacticalMapProps) {
     }
   }, [followSelected, selectedId]);
 
-  // Resize MapLibre canvas when layout mode switches (e.g. dome -> split/map)
+  // Sync MapLibre camera padding and canvas dimensions when layout mode switches
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-    const timer = window.setTimeout(() => {
+    if (layout === 'dome') {
+      if (hoverCoordsRef.current !== null) {
+        hoverCoordsRef.current = null;
+        setHoverTip(null);
+      }
+      try {
+        map.getCanvas().style.cursor = '';
+      } catch {
+        // Ignore if canvas unavailable
+      }
+    }
+    const layoutChanged = prevLayoutEffectRef.current !== layout;
+    prevLayoutEffectRef.current = layout;
+    if (layoutChanged) {
       try {
         map.resize();
+      } catch {
+        // Ignore transient resize errors
+      }
+      syncCameraPaddingRef.current?.(layout, true);
+    }
+    const timer = window.setTimeout(() => {
+      try {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (
+          rect &&
+          (Math.abs(rect.width - labelMetricsRef.current.width) > 0.5 ||
+            Math.abs(rect.height - labelMetricsRef.current.height) > 0.5)
+        ) {
+          map.resize();
+        }
+        syncCameraPaddingRef.current?.(layout, false);
         drawMapLabelsRef.current?.();
       } catch {
         // Ignore if unmounted
@@ -2252,6 +2413,15 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
   const containerWidth = containerRef.current?.clientWidth ?? 800;
   const containerHeight = containerRef.current?.clientHeight ?? 600;
+  const activePad = appliedPaddingRef.current;
+  const exposedTooltipWidth =
+    layout === 'split' && activePad.right > 0
+      ? Math.max(240, containerWidth - activePad.right)
+      : containerWidth;
+  const exposedTooltipHeight =
+    layout === 'split' && activePad.bottom > 0
+      ? Math.max(120, containerHeight - activePad.bottom)
+      : containerHeight;
 
   return (
     <div
@@ -2287,16 +2457,17 @@ export function TacticalMap({ className }: TacticalMapProps) {
         }}
       />
 
-      {!webglError && (
+      {!webglError && layout !== 'dome' && (
         <button
           type="button"
+          data-testid="map-labels-toggle"
           aria-pressed={mapLabelsEnabled}
           aria-label="Toggle map callsign labels"
           onClick={() => setMapLabelsEnabled(!mapLabelsEnabled)}
           style={{
             position: 'absolute',
             top: 10,
-            right: 'max(10px, env(safe-area-inset-right))',
+            left: 'max(10px, env(safe-area-inset-left))',
             zIndex: 15,
             display: 'inline-flex',
             alignItems: 'center',
@@ -2393,12 +2564,12 @@ export function TacticalMap({ className }: TacticalMapProps) {
         </div>
       )}
 
-      {!webglError && hoverTip && (
+      {!webglError && layout !== 'dome' && hoverTip && (
         <div
           style={{
             position: 'absolute',
-            left: Math.max(8, Math.min(hoverTip.x + 14, containerWidth - 232)),
-            top: Math.max(8, Math.min(hoverTip.y + 14, containerHeight - 96)),
+            left: Math.max(8, Math.min(hoverTip.x + 14, exposedTooltipWidth - 232)),
+            top: Math.max(8, Math.min(hoverTip.y + 14, exposedTooltipHeight - 96)),
             width: 220,
             maxWidth: 'calc(100% - 16px)',
             pointerEvents: 'none',
