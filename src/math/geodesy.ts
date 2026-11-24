@@ -51,13 +51,15 @@ export function normalizeAzimuthDeg(deg: number): number {
 }
 
 /**
- * Signed shortest-arc angular delta from `fromDeg` to `toDeg` in degrees within [-180, 180].
+ * Signed shortest-arc angular delta from `fromDeg` to `toDeg` in degrees within (-180, 180].
  * Positive means clockwise rotation; negative means counter-clockwise.
  */
 export function shortestAngleDeltaDeg(fromDeg: number, toDeg: number): number {
   if (!Number.isFinite(fromDeg) || !Number.isFinite(toDeg)) return 0;
-  const diffRad = (toDeg - fromDeg) * DEG_TO_RAD;
-  const delta = Math.atan2(Math.sin(diffRad), Math.cos(diffRad)) * RAD_TO_DEG;
+  let delta = normalizeAzimuthDeg(toDeg) - normalizeAzimuthDeg(fromDeg);
+  if (delta > 180) delta -= 360;
+  else if (delta < -180) delta += 360;
+  if (delta === -180) delta = 180;
   return delta === 0 ? 0 : delta;
 }
 
@@ -72,8 +74,60 @@ export function smoothCompassHeadingDeg(
   if (!Number.isFinite(targetDeg)) return normalizeAzimuthDeg(currentDeg);
   if (!Number.isFinite(currentDeg)) return normalizeAzimuthDeg(targetDeg);
   const clampedAlpha = Number.isFinite(alpha) ? Math.max(0, Math.min(1, alpha)) : 0.18;
-  const delta = shortestAngleDeltaDeg(currentDeg, targetDeg);
-  return normalizeAzimuthDeg(currentDeg + delta * clampedAlpha);
+  const base = normalizeAzimuthDeg(currentDeg);
+  const delta = shortestAngleDeltaDeg(base, targetDeg);
+  return normalizeAzimuthDeg(base + delta * clampedAlpha);
+}
+
+/**
+ * Convert a W3C DeviceOrientation `alpha` angle (counter-clockwise yaw from North) and
+ * screen orientation angle (e.g. 0, 90, 180, 270, or -90) into a clockwise compass heading in [0, 360).
+ */
+export function computeScreenCompensatedHeadingDeg(
+  alphaDeg: number | null | undefined,
+  screenOrientationDeg = 0
+): number | null {
+  if (typeof alphaDeg !== 'number' || !Number.isFinite(alphaDeg)) return null;
+  const safeScreenDeg =
+    typeof screenOrientationDeg === 'number' && Number.isFinite(screenOrientationDeg)
+      ? screenOrientationDeg
+      : 0;
+  return normalizeAzimuthDeg(360 - alphaDeg + safeScreenDeg);
+}
+
+/**
+ * Derive a clockwise compass heading in [0, 360) from browser DeviceOrientation fields,
+ * preferring iOS `webkitCompassHeading` when valid and falling back to screen-compensated
+ * absolute `alpha` (Android `deviceorientationabsolute`). Returns `null` if no absolute heading is available.
+ */
+export function deriveCompassHeadingDeg(
+  reading:
+    | {
+        webkitCompassHeading?: number | null;
+        alpha?: number | null;
+        absolute?: boolean;
+        screenAngle?: number;
+        screenOrientationDeg?: number;
+      }
+    | null
+    | undefined
+): number | null {
+  if (!reading) return null;
+  if (
+    typeof reading.webkitCompassHeading === 'number' &&
+    Number.isFinite(reading.webkitCompassHeading) &&
+    reading.webkitCompassHeading >= 0
+  ) {
+    return normalizeAzimuthDeg(reading.webkitCompassHeading);
+  }
+  if (reading.absolute === true) {
+    const rawScreenAngle =
+      typeof reading.screenOrientationDeg === 'number' && Number.isFinite(reading.screenOrientationDeg)
+        ? reading.screenOrientationDeg
+        : reading.screenAngle;
+    return computeScreenCompensatedHeadingDeg(reading.alpha, rawScreenAngle);
+  }
+  return null;
 }
 
 /** Convert WGS-84 geodetic coordinates (deg, deg, m) into ECEF coordinates in meters. */
@@ -754,8 +808,8 @@ export function projectToSkyDome(
   const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
   const normR = elevationToVaultNormR(elDeg, zoomMode);
   const r = normR * radius;
-  const displayAzDeg = normalizeAzimuthDeg(azDeg - safeRot);
-  const theta = ((displayAzDeg - 90) * Math.PI) / 180;
+  const displayAzDeg = normalizeAzimuthDeg(normalizeAzimuthDeg(azDeg) - safeRot);
+  const theta = (displayAzDeg - 90) * DEG_TO_RAD;
   return {
     x: cx + r * Math.cos(theta),
     y: cy + r * Math.sin(theta),
@@ -891,12 +945,12 @@ export function projectEnuToSkyDome(
   const fMin = vaultCurveValue(minEl);
   const k = (radius / fMin) * scale;
 
-  const dx0 = k * e;
-  const dy0 = -k * n;
+  const dx0 = e === 0 ? 0 : k * e;
+  const dy0 = n === 0 ? 0 : -k * n;
   const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
   let dx = dx0;
   let dy = dy0;
-  if (safeRot !== 0) {
+  if (safeRot !== 0 && (dx0 !== 0 || dy0 !== 0)) {
     const phi = safeRot * DEG_TO_RAD;
     const cosPhi = Math.cos(phi);
     const sinPhi = Math.sin(phi);
@@ -1007,9 +1061,11 @@ export function computeSkyDomeTrajectoryTangent(
   zoomMode: SkyDomeZoomMode = 'hemisphere',
   rotationDeg = 0
 ): number {
-  const safeHeading = Number.isFinite(target.headingDeg) ? (target.headingDeg as number) : 0;
+  const safeHeading = Number.isFinite(target.headingDeg)
+    ? normalizeAzimuthDeg(target.headingDeg as number)
+    : 0;
   const safeRot = Number.isFinite(rotationDeg) ? normalizeAzimuthDeg(rotationDeg) : 0;
-  const fallbackRaw = ((safeHeading - safeRot - 90) * Math.PI) / 180;
+  const fallbackRaw = (safeHeading - safeRot - 90) * DEG_TO_RAD;
   const fallbackAngle = Math.atan2(Math.sin(fallbackRaw), Math.cos(fallbackRaw));
 
   let state = computeTargetEnuState(observer, target);
