@@ -19,7 +19,7 @@ const COMPASS_POINTS = [
   'NNW',
 ] as const;
 
-export function compassCardinal(deg: number): string {
+function compassCardinal(deg: number): string {
   if (!Number.isFinite(deg)) return '—';
   const normalized = ((deg % 360) + 360) % 360;
   const idx = Math.round(normalized / 22.5) % 16;
@@ -191,6 +191,13 @@ export function formatRelativeAge(
 /**
  * Formats a countdown duration in seconds into compact `Xs`, `Xm`, or `Xh` form.
  */
+export function formatTcaCountdown(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '—';
+  const total = Math.round(seconds);
+  if (total < 60) return `T-${total}s`;
+  return `T-${Math.floor(total / 60)}m ${total % 60}s`;
+}
+
 export function formatCountdownShort(sec: number): string {
   if (!Number.isFinite(sec) || sec <= 0) return '0s';
   if (sec >= 3600) return `${Math.ceil(sec / 3600)}h`;

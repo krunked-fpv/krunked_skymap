@@ -111,6 +111,8 @@ export function TopTelemetryBar({
   const layout = useSkyStore((s) => s.layout);
   const setLayout = useSkyStore((s) => s.setLayout);
   const skyDomePip = useSkyStore((s) => s.skyDomePip);
+  const skyDomeZoom = useSkyStore((s) => s.skyDomeZoom);
+  const setSkyDomeZoom = useSkyStore((s) => s.setSkyDomeZoom);
   const setSkyDomePip = useSkyStore((s) => s.setSkyDomePip);
   const toggleSkyDomePip = useSkyStore((s) => s.toggleSkyDomePip);
   const atmosphericScope = useSkyStore((s) => s.atmosphericScope);
@@ -255,6 +257,7 @@ export function TopTelemetryBar({
               type="button"
               className={`segmented-btn${layout === opt.value ? ' is-active' : ''}`}
               aria-pressed={layout === opt.value}
+              title={`${opt.label} view (${opt.value === 'map' ? 'M' : opt.value === 'split' ? 'S' : 'D'})`}
               onClick={() => setLayout(opt.value)}
             >
               {opt.label}
@@ -266,7 +269,7 @@ export function TopTelemetryBar({
             data-testid="topbar-pip-btn"
             aria-pressed={layout === 'map' && skyDomePip}
             onClick={handlePipClick}
-            title="Toggle corner Polar Sky-Dome radar PIP in Map view"
+            title="Toggle corner Polar Sky-Dome radar PIP in Map view (P)"
           >
             PIP
           </button>
@@ -555,6 +558,32 @@ export function TopTelemetryBar({
                   </button>
                 ))}
               </div>
+            </div>
+
+            <div className="settings-group">
+              <span className="settings-group__label">Sky-Dome Vault</span>
+              <div className="settings-segment" role="group" aria-label="Sky-dome vault zoom">
+                <button
+                  type="button"
+                  className={`settings-segment__btn${skyDomeZoom === 'hemisphere' ? ' is-active' : ''}`}
+                  aria-pressed={skyDomeZoom === 'hemisphere'}
+                  onClick={() => setSkyDomeZoom('hemisphere')}
+                >
+                  HEMISPHERE 0°
+                </button>
+                <button
+                  type="button"
+                  className={`settings-segment__btn${skyDomeZoom === 'zenith' ? ' is-active' : ''}`}
+                  aria-pressed={skyDomeZoom === 'zenith'}
+                  onClick={() => setSkyDomeZoom('zenith')}
+                >
+                  ZENITH 30°+
+                </button>
+              </div>
+            </div>
+
+            <div className="settings-hotkeys-strip" data-testid="settings-hotkeys-strip">
+              M Map · S Split · D Dome · P PIP · L Labels · ⌘K Search · Esc Close
             </div>
 
             <div className="settings-group">
