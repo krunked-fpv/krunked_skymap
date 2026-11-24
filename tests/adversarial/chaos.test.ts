@@ -1371,7 +1371,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
 
-    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v3'");
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v4'");
     expect(swSource).toContain("addEventListener('install'");
     expect(swSource).toContain("addEventListener('activate'");
     expect(swSource).toContain("addEventListener('fetch'");
@@ -1417,7 +1417,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
         };
       },
       async keys() {
-        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3'];
+        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3', 'krunked-skymap-v4'];
       },
       async delete(key: string) {
         deletedCaches.push(key);
@@ -1438,7 +1438,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       Promise,
     });
 
-    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v3)
+    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v4)
     const activateTasks: Array<Promise<unknown>> = [];
     listeners.get('activate')?.({
       waitUntil(p: Promise<unknown>) {
@@ -1446,8 +1446,8 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       },
     });
     await Promise.all(activateTasks);
-    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2']);
-    expect(deletedCaches).not.toContain('krunked-skymap-v3');
+    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3']);
+    expect(deletedCaches).not.toContain('krunked-skymap-v4');
 
     // Telemetry, CORS relays (r.jina.ai), and /api-proxy/ URLs MUST bypass respondWith()
     const fetchListener = listeners.get('fetch')!;
@@ -2789,7 +2789,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
     ).toBe(true);
   });
 
-  it('verifies sw.js krunked-skymap-v3 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
+  it('verifies sw.js krunked-skymap-v4 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
     const fs = await loadNodeFs();
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
@@ -2828,7 +2828,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
         };
       },
       async keys() {
-        return ['krunked-skymap-v3'];
+        return ['krunked-skymap-v4'];
       },
       async delete() {
         return true;
