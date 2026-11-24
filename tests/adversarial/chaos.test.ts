@@ -71,6 +71,7 @@ import {
   type FlightEntity,
   type ObserverLocation,
   type SatelliteEntity,
+  type SkyEntity,
   type TleRecord,
   type WorkerRequestMessage,
   type WorkerResponseMessage,
