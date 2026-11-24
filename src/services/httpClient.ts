@@ -360,3 +360,169 @@ export class CircuitBreaker {
     }
   }
 }
+
+const PRIVATE_OR_CGNAT_IP_REGEX =
+  /^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[0-1])\.|100\.(?:6[4-9]|[7-9]\d|1[0-1]\d|12[0-7])\.)/;
+
+/**
+ * Determine whether the app is running on localhost, .local, single-label host, or private/CGNAT
+ * LAN IP (where Vite dev/preview proxy endpoints may exist) vs a public static host.
+ */
+export function isLocalDevOrLanRuntime(): boolean {
+  const metaEnv =
+    typeof import.meta !== 'undefined'
+      ? (import.meta as { env?: Record<string, unknown> }).env
+      : undefined;
+  const isTestRuntime = Boolean(metaEnv?.VITEST || metaEnv?.MODE === 'test');
+  if (!isTestRuntime && metaEnv?.DEV === true) {
+    return true;
+  }
+
+  if (typeof window === 'undefined' || !window.location?.hostname) {
+    return false;
+  }
+
+  const rawHost = window.location.hostname.trim().toLowerCase();
+  const host = rawHost.replace(/^\[|\]$/g, '');
+  if (!host) {
+    return false;
+  }
+
+  if (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '::1' ||
+    host.endsWith('.local') ||
+    !host.includes('.')
+  ) {
+    return true;
+  }
+
+  return PRIVATE_OR_CGNAT_IP_REGEX.test(host);
+}
+
+/**
+ * Check whether a text payload looks like an HTML document or error page.
+ */
+export function isHtmlPayload(raw: string): boolean {
+  const trimmed = raw.trim();
+  const lowerPrefix = trimmed.slice(0, 32).toLowerCase();
+  return (
+    lowerPrefix.startsWith('<!doctype') ||
+    lowerPrefix.startsWith('<html') ||
+    trimmed.startsWith('<')
+  );
+}
+
+/**
+ * Throw an Error if an upstream JSON object carries a truthy/non-empty `Error` field.
+ */
+export function throwIfUpstreamErrorField(
+  data: Record<string, unknown>,
+  providerLabel: string
+): void {
+  const hasErrorField =
+    (typeof data.Error === 'string' && data.Error.trim().length > 0) ||
+    (data.Error !== undefined &&
+      data.Error !== null &&
+      typeof data.Error !== 'string' &&
+      Boolean(data.Error));
+  if (hasErrorField) {
+    throw new Error(
+      typeof data.Error === 'string'
+        ? data.Error.trim()
+        : `Upstream error from ${providerLabel}`
+    );
+  }
+}
+
+function parsePublishedTimeMs(raw: unknown): number | undefined {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  if (typeof raw === 'string') {
+    const s = raw.trim();
+    if (!s) return undefined;
+    const ms = Date.parse(s);
+    if (Number.isFinite(ms)) {
+      return ms;
+    }
+  }
+  return undefined;
+}
+
+export interface RelayedJsonResult {
+  value: unknown;
+  publishedTimeMs?: number;
+}
+
+/**
+ * Extract a JSON object or array from direct responses, Jina `{ data: { content, publishedTime } }`
+ * envelopes, or Jina `Markdown Content:` text payloads while rejecting HTML, empty/truncated text,
+ * and upstream `{ Error }` payloads.
+ */
+export function extractRelayedJsonValue(
+  rawText: string,
+  providerLabel: string
+): RelayedJsonResult {
+  const trimmed = typeof rawText === 'string' ? rawText.trim() : '';
+  if (!trimmed || isHtmlPayload(trimmed)) {
+    throw new Error(`Invalid payload from ${providerLabel}`);
+  }
+
+  let value: unknown;
+  let publishedTimeMs: number | undefined;
+
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    const topLevel = JSON.parse(trimmed) as unknown;
+    if (topLevel && typeof topLevel === 'object' && !Array.isArray(topLevel)) {
+      const topObj = topLevel as Record<string, unknown>;
+      throwIfUpstreamErrorField(topObj, providerLabel);
+      const nestedData = topObj.data;
+      if (
+        nestedData &&
+        typeof nestedData === 'object' &&
+        !Array.isArray(nestedData) &&
+        typeof (nestedData as Record<string, unknown>).content === 'string'
+      ) {
+        const nestedObj = nestedData as Record<string, unknown>;
+        publishedTimeMs = parsePublishedTimeMs(nestedObj.publishedTime ?? topObj.publishedTime);
+        const innerContent = (nestedObj.content as string).trim();
+        if (!innerContent || isHtmlPayload(innerContent)) {
+          throw new Error(`Invalid payload from ${providerLabel}`);
+        }
+        value = JSON.parse(innerContent);
+      } else {
+        publishedTimeMs = parsePublishedTimeMs(topObj.publishedTime);
+        value = topLevel;
+      }
+    } else {
+      value = topLevel;
+    }
+  } else {
+    const match = /(?:^|\r?\n)Markdown Content:\s*/.exec(trimmed);
+    if (!match) {
+      throw new Error(`Invalid payload from ${providerLabel}`);
+    }
+    const headerSection = trimmed.slice(0, match.index);
+    const pubMatch = /(?:^|\r?\n)Published Time:[ \t]*([^\r\n]+)/i.exec(headerSection);
+    if (pubMatch) {
+      publishedTimeMs = parsePublishedTimeMs(pubMatch[1]);
+    }
+    const content = trimmed.slice(match.index + match[0].length).trim();
+    if (!content || isHtmlPayload(content)) {
+      throw new Error(`Invalid payload from ${providerLabel}`);
+    }
+    value = JSON.parse(content);
+  }
+
+  if (value === null || typeof value !== 'object') {
+    throw new Error(`Invalid payload from ${providerLabel}`);
+  }
+
+  if (!Array.isArray(value)) {
+    throwIfUpstreamErrorField(value as Record<string, unknown>, providerLabel);
+  }
+
+  return publishedTimeMs !== undefined ? { value, publishedTimeMs } : { value };
+}
