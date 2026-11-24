@@ -127,20 +127,10 @@ export function TargetInspector() {
     const timer = window.setInterval(() => {
       setClockTick((t) => (t + 1) % 1_000_000);
     }, 1000);
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      const st = useSkyStore.getState();
-      if (st.commandPaletteOpen || st.odidModalOpen || st.diagnosticsOpen || st.settingsOpen) {
-        return;
-      }
-      selectEntity(null, false);
-    };
-    window.addEventListener('keydown', handleKeyDown);
     return () => {
       window.clearInterval(timer);
-      window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [isOpen, selectEntity]);
+  }, [isOpen]);
 
   const handleCopyPermalink = async () => {
     if (!entity || typeof window === 'undefined') return;

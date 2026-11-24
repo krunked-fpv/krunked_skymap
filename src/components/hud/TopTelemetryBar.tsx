@@ -68,6 +68,9 @@ function resolveSystemBeacon(
   if (flights === 'offline' || (typeof navigator !== 'undefined' && navigator.onLine === false)) {
     return { status: 'offline', label: 'OFFLINE' };
   }
+  if (flights === 'error' || military === 'error') {
+    return { status: 'error', label: 'FEED ERROR' };
+  }
   if (flights === 'rate-limited' || military === 'rate-limited') {
     return { status: 'rate-limited', label: 'RATE-LIMITED' };
   }
@@ -77,7 +80,7 @@ function resolveSystemBeacon(
   if (flights === 'live' || military === 'live' || balloons === 'live') {
     return { status: 'live', label: 'FEEDS LIVE' };
   }
-  if (flights === 'error') {
+  if (balloons === 'error') {
     return { status: 'error', label: 'FEED ERROR' };
   }
   if (flights === 'loading') {
@@ -168,18 +171,9 @@ export function TopTelemetryBar({
       }
     };
 
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        if (diagnosticsOpen) setDiagnosticsOpen(false);
-        if (settingsOpen) setSettingsOpen(false);
-      }
-    };
-
     document.addEventListener('mousedown', handleMouseDown);
-    window.addEventListener('keydown', handleKeyDown);
     return () => {
       document.removeEventListener('mousedown', handleMouseDown);
-      window.removeEventListener('keydown', handleKeyDown);
     };
   }, [diagnosticsOpen, settingsOpen, setDiagnosticsOpen, setSettingsOpen]);
 

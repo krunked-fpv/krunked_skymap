@@ -18,7 +18,11 @@ import {
   haversineDistanceKm,
 } from './math/geodesy';
 import { AstroClient } from './workers/astroClient';
-import { fetchFlightsCascade, fetchGlobalSpecialFlights } from './services/flightsService';
+import {
+  fetchFlightsCascade,
+  fetchGlobalSpecialFlights,
+  pickRicherAirframeClass,
+} from './services/flightsService';
 import { loadInitialTles, refreshTlesIfStale } from './services/satellitesService';
 import { fetchBalloons } from './services/balloonsService';
 import { evaluateDroneAirspaceCompliance, fetchAirspace } from './services/airspaceService';
@@ -224,7 +228,19 @@ export default function App() {
       }
     }
     for (const [id, b] of localAdsbBalloonsRef.current.entries()) {
-      nextBalloons.set(id, b);
+      const existing = nextBalloons.get(id);
+      nextBalloons.set(
+        id,
+        existing
+          ? {
+              ...b,
+              icaoHex: b.icaoHex ?? existing.icaoHex,
+              registration: b.registration ?? existing.registration,
+              squawk: b.squawk ?? existing.squawk,
+              emergencyFlag: b.emergencyFlag ?? existing.emergencyFlag,
+            }
+          : b
+      );
     }
     liveKinematicsRegistry.rawAdsbBalloons = nextBalloons;
 
@@ -235,7 +251,25 @@ export default function App() {
       }
     }
     for (const [id, d] of localAdsbDronesRef.current.entries()) {
-      nextDrones.set(id, d);
+      const existing = nextDrones.get(id);
+      if (!existing) {
+        nextDrones.set(id, d);
+      } else {
+        const mergedIsMil = Boolean(existing.isMilitary || d.isMilitary);
+        const mergedIsLadd = Boolean(existing.isLadd || d.isLadd);
+        const mergedIsPia = Boolean(existing.isPia || d.isPia);
+        nextDrones.set(id, {
+          ...d,
+          aircraftType: d.aircraftType ?? existing.aircraftType,
+          registration: d.registration ?? existing.registration,
+          squawk: d.squawk ?? existing.squawk,
+          emergencyFlag: d.emergencyFlag ?? existing.emergencyFlag,
+          isMilitary: mergedIsMil,
+          isLadd: mergedIsLadd || undefined,
+          isPia: mergedIsPia || undefined,
+          missionDesc: mergedIsMil ? 'LIVE ATC UAS · MILITARY' : d.missionDesc,
+        });
+      }
     }
     liveKinematicsRegistry.rawAdsbDrones = nextDrones;
   }, []);
@@ -370,7 +404,9 @@ export default function App() {
         Boolean(target?.isContentEditable);
 
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        if (st.odidModalOpen) return;
         event.preventDefault();
+        event.stopImmediatePropagation();
         st.setCommandPaletteOpen(!st.commandPaletteOpen);
         return;
       }
@@ -378,15 +414,41 @@ export default function App() {
       if (event.key === '/' && !isTextEntry && !event.metaKey && !event.ctrlKey && !event.altKey) {
         if (!st.odidModalOpen) {
           event.preventDefault();
+          event.stopImmediatePropagation();
           st.setCommandPaletteOpen(true);
         }
         return;
       }
 
       if (event.key === 'Escape') {
-        if (st.commandPaletteOpen || st.diagnosticsOpen || st.settingsOpen) {
-          st.closeAllPopovers();
-        } else if (st.inspectorOpen && !st.odidModalOpen) {
+        if (st.odidModalOpen) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          st.setOdidModalOpen(false);
+          return;
+        }
+        if (st.commandPaletteOpen) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          st.setCommandPaletteOpen(false);
+          return;
+        }
+        if (st.diagnosticsOpen || st.settingsOpen) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          st.setDiagnosticsOpen(false);
+          st.setSettingsOpen(false);
+          return;
+        }
+        if (st.activeDockTray !== null) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          st.setActiveDockTray(null);
+          return;
+        }
+        if (st.inspectorOpen) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
           st.selectEntity(null, false);
         }
       }
@@ -975,6 +1037,16 @@ export default function App() {
       globalFlightsAbortRef.current = null;
       globalFlightsInFlightRef.current = false;
       liveKinematicsRegistry.rawGlobalFlights.clear();
+      const stNow = useSkyStore.getState();
+      for (const [bId, bEntity] of liveKinematicsRegistry.rawBalloons.entries()) {
+        if (
+          bEntity.subSource === 'windborne' ||
+          haversineDistanceKm(stNow.observer.lat, stNow.observer.lon, bEntity.lat, bEntity.lon) >
+            stNow.radiusKm * 1.02
+        ) {
+          liveKinematicsRegistry.rawBalloons.delete(bId);
+        }
+      }
       globalAdsbBalloonsRef.current.clear();
       globalAdsbDronesRef.current.clear();
       syncAdsbSecondaryRegistries();
@@ -1397,6 +1469,11 @@ export default function App() {
             nextEntities.set(entity.id, {
               ...prevExisting,
               category: nextCat,
+              airframeClass: pickRicherAirframeClass(prevExisting.airframeClass, entity.airframeClass),
+              aircraftType: prevExisting.aircraftType ?? entity.aircraftType,
+              registration: prevExisting.registration ?? entity.registration,
+              squawk: prevExisting.squawk ?? entity.squawk,
+              emergencyFlag: prevExisting.emergencyFlag ?? entity.emergencyFlag,
               isMilitary: mergedIsMil,
               isLadd: mergedIsLadd || undefined,
               isPia: mergedIsPia || undefined,
@@ -1502,6 +1579,11 @@ export default function App() {
             const mergedPia = Boolean(updated.isPia || globalMatch.isPia);
             const resolvedFlight: FlightEntity = {
               ...updated,
+              airframeClass: pickRicherAirframeClass(updated.airframeClass, globalMatch.airframeClass),
+              aircraftType: updated.aircraftType ?? globalMatch.aircraftType,
+              registration: updated.registration ?? globalMatch.registration,
+              squawk: updated.squawk ?? globalMatch.squawk,
+              emergencyFlag: updated.emergencyFlag ?? globalMatch.emergencyFlag,
               isMilitary: mergedMil,
               isLadd: mergedLadd || undefined,
               isPia: mergedPia || undefined,
@@ -1518,14 +1600,20 @@ export default function App() {
         }
       };
 
-      pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 60_000);
-      if (st.atmosphericScope === 'global') {
+      if (st.layers.flight || st.layers.military) {
+        pushAtmospheric(liveKinematicsRegistry.rawFlights, 12, 60_000);
+      }
+      if (st.atmosphericScope === 'global' && st.layers.military) {
         pushAtmospheric(liveKinematicsRegistry.rawGlobalFlights, 18, 90_000);
       }
-      pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 21_600_000);
-      pushAtmospheric(liveKinematicsRegistry.rawAdsbBalloons, 20, 180_000);
-      pushAtmospheric(liveKinematicsRegistry.rawDrones, 3, 60_000);
-      pushAtmospheric(liveKinematicsRegistry.rawAdsbDrones, 12, 90_000);
+      if (st.layers.balloon) {
+        pushAtmospheric(liveKinematicsRegistry.rawBalloons, 35, 21_600_000);
+        pushAtmospheric(liveKinematicsRegistry.rawAdsbBalloons, 20, 180_000);
+      }
+      if (st.layers.drone) {
+        pushAtmospheric(liveKinematicsRegistry.rawDrones, 3, 60_000);
+        pushAtmospheric(liveKinematicsRegistry.rawAdsbDrones, 12, 90_000);
+      }
 
       // Orbital satellites: smooth micro-interpolation between 10Hz SGP4 Worker frames
       if (st.layers.satellite) {

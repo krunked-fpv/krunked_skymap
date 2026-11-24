@@ -51,17 +51,6 @@ export function OpenDroneIdModal() {
     }
   }, [odidModalOpen, odidConfig.endpointUrl]);
 
-  useEffect(() => {
-    if (!odidModalOpen) return;
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        setOdidModalOpen(false);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [odidModalOpen, setOdidModalOpen]);
-
   if (!odidModalOpen) {
     return null;
   }

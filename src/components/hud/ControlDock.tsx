@@ -200,8 +200,9 @@ export function ControlDock({
   const nearestSondeHint = useSkyStore((s) => s.nearestSondeHint);
   const commandPaletteOpen = useSkyStore((s) => s.commandPaletteOpen);
   const setCommandPaletteOpen = useSkyStore((s) => s.setCommandPaletteOpen);
+  const activeTrayCategory = useSkyStore((s) => s.activeDockTray);
+  const setActiveTrayCategory = useSkyStore((s) => s.setActiveDockTray);
 
-  const [activeTrayCategory, setActiveTrayCategory] = useState<ExpandableCategory | null>(null);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<LocationSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
@@ -214,41 +215,6 @@ export function ControlDock({
   const abortRef = useRef<AbortController | null>(null);
   const requestSeqRef = useRef(0);
   const suppressNextSearchRef = useRef<string | null>(null);
-
-  // Global ⌘K / Ctrl+K / `/` Command Palette shortcut + Escape handler
-  useEffect(() => {
-    const handleGlobalKeyDown = (event: globalThis.KeyboardEvent) => {
-      const target = event.target as HTMLElement | null;
-      const isEditable =
-        target instanceof HTMLInputElement ||
-        target instanceof HTMLTextAreaElement ||
-        target instanceof HTMLSelectElement ||
-        Boolean(target?.isContentEditable);
-
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
-        event.preventDefault();
-        setCommandPaletteOpen(!useSkyStore.getState().commandPaletteOpen);
-        return;
-      }
-
-      if (event.key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey && !isEditable) {
-        event.preventDefault();
-        setCommandPaletteOpen(true);
-        return;
-      }
-
-      if (event.key === 'Escape') {
-        if (useSkyStore.getState().commandPaletteOpen) {
-          setCommandPaletteOpen(false);
-        } else if (activeTrayCategory !== null) {
-          setActiveTrayCategory(null);
-        }
-      }
-    };
-
-    window.addEventListener('keydown', handleGlobalKeyDown);
-    return () => window.removeEventListener('keydown', handleGlobalKeyDown);
-  }, [activeTrayCategory, setCommandPaletteOpen]);
 
   // Dismiss sub-filter tray on outside click
   useEffect(() => {
@@ -264,7 +230,7 @@ export function ControlDock({
     };
     document.addEventListener('mousedown', handleOutsideClick);
     return () => document.removeEventListener('mousedown', handleOutsideClick);
-  }, [activeTrayCategory]);
+  }, [activeTrayCategory, setActiveTrayCategory]);
 
   // Auto-focus search input when Command Palette opens
   useEffect(() => {
@@ -598,7 +564,7 @@ export function ControlDock({
                     aria-label={`${isTrayOpen ? 'Close' : 'Open'} ${shortLabel} sub-filters`}
                     title={`${shortLabel} sub-filters`}
                     onClick={() =>
-                      setActiveTrayCategory((prev) => (prev === expandable ? null : expandable))
+                      setActiveTrayCategory(activeTrayCategory === expandable ? null : expandable)
                     }
                   >
                     <ChevronUp

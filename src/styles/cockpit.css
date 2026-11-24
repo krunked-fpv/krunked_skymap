@@ -1759,6 +1759,11 @@ select {
   .skymap-stage:has(.target-inspector.is-open) .control-dock-wrap {
     right: 364px;
   }
+
+  .skymap-stage:has(.target-inspector.is-open) .dock-pill {
+    flex-wrap: wrap;
+    justify-content: center;
+  }
 }
 
 .target-inspector__grab-bar {
@@ -2357,7 +2362,8 @@ select {
     bottom: 8px;
   }
 
-  .skymap-stage .stage-dome-pane .skydome-bezel-controls {
+  .skymap-stage .stage-dome-pane .skydome-bezel-controls,
+  .skymap-stage .stage-dome-pane .skydome-legend {
     bottom: 92px !important;
   }
 

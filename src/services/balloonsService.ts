@@ -1121,29 +1121,27 @@ export async function fetchBalloons(
     ...(windborneRes?.errorMsg ? [windborneRes.errorMsg] : []),
   ];
 
-  const sondeOk = includeSondeHub && !sondeAllRejected;
+  const sondeLiveDelivered =
+    includeSondeHub && (sondesRes.status === 'fulfilled' || sondehubCount > 0);
+  const sondeOk = sondeLiveDelivered;
   const wbStatus = windborneRes?.status;
   const wbOk = wbStatus === 'live' || wbStatus === 'cached';
 
   let overallStatus: FeedHealthStatus;
   if (includeWindBorne && includeSondeHub) {
-    if (sondeOk && (sondesRes.status === 'fulfilled' || amateurRes.status === 'fulfilled')) {
-      overallStatus =
-        sondesRes.status === 'rejected' && sondehubCount === 0 && !wbOk
-          ? 'error'
-          : wbStatus === 'live' || sondeOk
-            ? 'live'
-            : 'cached';
-    } else if (wbOk) {
-      overallStatus = wbStatus!;
+    if (wbStatus === 'live' || (sondeLiveDelivered && sondehubCount > 0)) {
+      overallStatus = 'live';
+    } else if (wbStatus === 'cached') {
+      overallStatus = 'cached';
+    } else if (sondeLiveDelivered) {
+      overallStatus = 'live';
     } else {
       overallStatus = 'error';
     }
   } else if (includeWindBorne) {
     overallStatus = wbStatus ?? 'error';
   } else {
-    overallStatus =
-      sondesRes.status === 'rejected' && sondehubCount === 0 ? 'error' : 'live';
+    overallStatus = sondeLiveDelivered ? 'live' : 'error';
   }
 
   const providerParts: string[] = [];
@@ -1157,7 +1155,7 @@ export async function fetchBalloons(
         : 'sondehub-v2';
 
   const timestampMs =
-    wbStatus === 'cached' && !sondeOk && windborneRes && windborneRes.timestampMs > 0
+    overallStatus === 'cached' && windborneRes && windborneRes.timestampMs > 0
       ? windborneRes.timestampMs
       : windborneRes?.timestampMs && !sondeOk
         ? windborneRes.timestampMs

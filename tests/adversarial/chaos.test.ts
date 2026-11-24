@@ -5,7 +5,6 @@ import visualTleRaw from '../../public/data/tle/visual.tle?raw';
 import starlinkTleRaw from '../../public/data/tle/starlink.tle?raw';
 import appSourceRaw from '../../src/App.tsx?raw';
 import balloonsSourceRaw from '../../src/services/balloonsService.ts?raw';
-import cockpitCssRaw from '../../src/styles/cockpit.css?raw';
 import controlDockSourceRaw from '../../src/components/hud/ControlDock.tsx?raw';
 import polarDomeSourceRaw from '../../src/components/skydome/PolarSkyDome.tsx?raw';
 import tacticalMapSourceRaw from '../../src/components/map/TacticalMap.tsx?raw';
@@ -3029,7 +3028,9 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
     }
   });
 
-  it('[DEFECT-S3-08] cockpit.css & PolarSkyDome must wrap dock-pill at tablet widths with open inspector and lift PolarSkyDome legend on mobile', () => {
+  it('[DEFECT-S3-08] cockpit.css & PolarSkyDome must wrap dock-pill at tablet widths with open inspector and lift PolarSkyDome legend on mobile', async () => {
+    const fs = await loadNodeFs();
+    const cockpitCssRaw = fs.readFileSync(repoFileUrl('src/styles/cockpit.css'), 'utf8');
     const tabletInspectorSection = cockpitCssRaw.slice(
       cockpitCssRaw.indexOf('@media (min-width: 768px) and (max-width: 1440px)'),
       cockpitCssRaw.indexOf('@media (max-width: 767px)')

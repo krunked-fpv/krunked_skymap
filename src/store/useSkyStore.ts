@@ -95,6 +95,7 @@ export interface SkyStoreState {
   commandPaletteOpen: boolean;
   diagnosticsOpen: boolean;
   settingsOpen: boolean;
+  activeDockTray: 'satellite' | 'balloon' | 'drone' | null;
   odidConfig: OpenDroneIdConfig;
   feeds: Record<FeedKey, FeedTelemetryState>;
   airspace: AirspaceData;
@@ -137,6 +138,7 @@ export interface SkyStoreState {
   setCommandPaletteOpen: (open: boolean) => void;
   setDiagnosticsOpen: (open: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
+  setActiveDockTray: (tray: 'satellite' | 'balloon' | 'drone' | null) => void;
   closeAllPopovers: () => void;
   updateOdidConfig: (patch: Partial<OpenDroneIdConfig>) => void;
   setFeedState: (feed: FeedKey, patch: Partial<FeedTelemetryState>) => void;
@@ -263,6 +265,7 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   commandPaletteOpen: false,
   diagnosticsOpen: false,
   settingsOpen: false,
+  activeDockTray: null,
   odidConfig: {
     simulatorEnabled: false,
     endpointUrl: '',
@@ -395,6 +398,7 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
       commandPaletteOpen: settingsOpen ? false : state.commandPaletteOpen,
       diagnosticsOpen: settingsOpen ? false : state.diagnosticsOpen,
     })),
+  setActiveDockTray: (activeDockTray) => set({ activeDockTray }),
   closeAllPopovers: () =>
     set({
       commandPaletteOpen: false,

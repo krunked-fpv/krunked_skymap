@@ -2039,7 +2039,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             </div>
 
             {/* Bottom-Right Horizon & Orbital Legend */}
-            <div style={legendStyle}>
+            <div className="skydome-legend" style={legendStyle}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
                 <span>0° HRZ</span>

@@ -414,3 +414,14 @@ npx vitest run --pool=vmThreads
   - `tests/adversarial/chaos.test.ts` -> **32 / 40 PASS** (`Challenge 1`–`Challenge 7`: `27 / 27 PASS`; `Challenge 8`: `5 / 13 PASS`, `8 / 8 [DEFECT-S3-*]` FAIL as expected before remediation)
   - Scale timings observed: `Challenge 3` 2,000-sat median `45.40ms` (`visible=96`); `Challenge 8` `wb1000=19.90ms`, `mil500=6.85ms`, `sat2000=47.69ms`.
 
+### Sprint 03 Round 2 Remediation & Verification
+
+- **Status:** **ALL 8 / 8 DEFECTS REMEDIATED (`0 Critical / 0 High / 0 Medium / 0 Low` OPEN)**
+  - `[DEFECT-S3-01]` & `[DEFECT-S3-02]` Fixed: Centralized `Ctrl+K` / `⌘K`, `/`, and 5-tier single-layer `Escape` handling (`odidModalOpen` -> `commandPaletteOpen` -> `diagnosticsOpen || settingsOpen` -> `activeDockTray` -> `inspectorOpen`) inside `App.tsx` with `stopImmediatePropagation()`, backed by store `activeDockTray`. Removed duplicate window listeners from `ControlDock.tsx`, `TopTelemetryBar.tsx`, `TargetInspector.tsx`, and `OpenDroneIdModal.tsx`.
+  - `[DEFECT-S3-03]` Fixed: Exported `pickRicherAirframeClass` in `flightsService.ts` and preserved richer `airframeClass` (`heli`/`heavy` > `fast-mil` > `prop` > `jet`) plus `aircraftType`, `registration`, `squawk`, and `emergencyFlag` across `/v2/{mil,ladd,pia}`, local/global flight merges, and `syncAdsbSecondaryRegistries`.
+  - `[DEFECT-S3-04]` Fixed: Updated `fetchBalloons` in `balloonsService.ts` to report `status: 'cached'` and preserve `windborneRes.timestampMs` when SondeHub contributes zero live records alongside a cached WindBorne seed.
+  - `[DEFECT-S3-05]` Fixed: Reordered `resolveSystemBeacon` in `TopTelemetryBar.tsx` to check `flights === 'error' || military === 'error'` ahead of green `'live'` status.
+  - `[DEFECT-S3-06]` Fixed: Gated 60fps `pushAtmospheric` calls in `App.tsx` on active `st.layers.*` toggles and synchronously pruned `subSource === 'windborne'` and out-of-range `rawBalloons` entries on `GLOBAL -> LOCAL`.
+  - `[DEFECT-S3-07]` Fixed: Scoped Vite proxy unavailability latching strictly to primary proxy `404`/`405` or static HTML fallback responses in `flightsService.ts`, and evaluated `B6` UAS compliance against observer-relative AGL (`altM - observer.altM`) rather than MSL.
+  - `[DEFECT-S3-08]` Fixed: Wrapped `.dock-pill` when `.target-inspector.is-open` at `@media (min-width: 768px) and (max-width: 1440px)` in `cockpit.css`, and added `.skydome-legend` in `PolarSkyDome.tsx` lifted clear above mobile dock under `@media (max-width: 767px)`.
+

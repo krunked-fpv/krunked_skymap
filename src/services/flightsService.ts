@@ -419,6 +419,21 @@ export function classifyMilitary(
   return false;
 }
 
+const AIRFRAME_SPECIFICITY_RANK: Record<FlightEntity['airframeClass'], number> = {
+  heli: 5,
+  heavy: 4,
+  'fast-mil': 3,
+  prop: 2,
+  jet: 1,
+};
+
+export function pickRicherAirframeClass(
+  a: FlightEntity['airframeClass'],
+  b: FlightEntity['airframeClass']
+): FlightEntity['airframeClass'] {
+  return (AIRFRAME_SPECIFICITY_RANK[a] ?? 0) >= (AIRFRAME_SPECIFICITY_RANK[b] ?? 0) ? a : b;
+}
+
 function classifyAirframeClass(
   aircraftType: string | undefined,
   emitterCategory: string | undefined,
@@ -807,15 +822,10 @@ function classifyAndNormalizeAdsbxTarget(
     const uaType: DroneEntity['uaType'] =
       FIXED_WING_UAS_TYPES.has(t) || cat === 'B6' ? 'fixed-wing' : 'vtol';
     const missionDesc = core.isMilitary ? 'LIVE ATC UAS · MILITARY' : 'LIVE ATC UAS · ADS-B';
-    const altAglM = Math.max(0, core.altM);
+    const altAglM = Math.max(0, core.altM - (observer.altM ?? 0));
     const compliance =
-      airspace && core.altM <= 500
-        ? evaluateDroneAirspaceCompliance(
-            core.safeLat,
-            core.normLon,
-            Math.max(0, core.altM - (observer.altM ?? 0)),
-            airspace
-          )
+      airspace && altAglM <= 500
+        ? evaluateDroneAirspaceCompliance(core.safeLat, core.normLon, altAglM, airspace)
         : { faaCeilingFt: null, ceilingBreach: false, tfrBreach: false };
 
     const emergencyFlag =
@@ -1438,7 +1448,9 @@ export async function fetchFlightsCascade(
         (err instanceof StaticProxyUnavailableError ||
           (err instanceof HttpError && (err.status === 404 || err.status === 405)))
       ) {
-        viteProxyUnavailable = true;
+        if (err instanceof StaticProxyUnavailableError || url.startsWith('/api-proxy/adsb-fi/')) {
+          viteProxyUnavailable = true;
+        }
         flightsCircuitBreaker.reset(breakerKey);
         return { result: null, proxyUnavailable: true, error: err };
       }
@@ -1857,7 +1869,12 @@ export async function fetchGlobalSpecialFlights(
           (err instanceof StaticProxyUnavailableError ||
             (err instanceof HttpError && (err.status === 404 || err.status === 405)))
         ) {
-          globalViteProxyUnavailable = true;
+          if (
+            err instanceof StaticProxyUnavailableError ||
+            ep.url.startsWith('/api-proxy/adsb-lol/')
+          ) {
+            globalViteProxyUnavailable = true;
+          }
           globalFlightsCircuitBreaker.reset(ep.breakerKey);
           continue;
         }
@@ -1920,12 +1937,15 @@ export async function fetchGlobalSpecialFlights(
             isMilitary: mergedIsMil,
             isLadd: mergedIsLadd || undefined,
             isPia: mergedIsPia || undefined,
+            aircraftType: existing.aircraftType ?? f.aircraftType,
+            registration: existing.registration ?? f.registration,
+            squawk: existing.squawk ?? f.squawk,
+            emergencyFlag: existing.emergencyFlag ?? f.emergencyFlag,
             category:
               mergedIsMil || (!existing.onGround && (mergedIsLadd || mergedIsPia))
                 ? 'military'
                 : existing.category,
-            airframeClass:
-              existing.airframeClass === 'fast-mil' ? existing.airframeClass : f.airframeClass,
+            airframeClass: pickRicherAirframeClass(existing.airframeClass, f.airframeClass),
           });
         }
       }
@@ -1944,6 +1964,10 @@ export async function fetchGlobalSpecialFlights(
             isMilitary: mergedIsMil,
             isLadd: mergedIsLadd || undefined,
             isPia: mergedIsPia || undefined,
+            aircraftType: existing.aircraftType ?? d.aircraftType,
+            registration: existing.registration ?? d.registration,
+            squawk: existing.squawk ?? d.squawk,
+            emergencyFlag: existing.emergencyFlag ?? d.emergencyFlag,
             missionDesc: mergedIsMil ? 'LIVE ATC UAS · MILITARY' : existing.missionDesc,
           });
         }
