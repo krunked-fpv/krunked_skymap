@@ -1,4 +1,12 @@
-import type { TopocentricCoords } from '../types/sky-contracts';
+import type {
+  CelestialPositions,
+  ClosestApproachPrediction,
+  SkyDomeProjectionPoint,
+  SkyDomeUnprojectionResult,
+  SkyDomeZoomMode,
+  TopocentricCoords,
+  TwilightState,
+} from '../types/sky-contracts';
 
 /** WGS-84 equatorial semi-major axis in meters. */
 export const WGS84_A = 6378137.0;
@@ -100,6 +108,19 @@ export function ecefToEnu(
   };
 }
 
+/** Apply Bennett atmospheric refraction with a smooth ramp across [-2.0, -0.5] deg near the horizon. */
+function applyBennettRefraction(elevationDeg: number): number {
+  if (elevationDeg > -2.0 && elevationDeg < 89.8) {
+    const ramp = elevationDeg >= -0.5 ? 1 : Math.max(0, Math.min(1, (elevationDeg + 2.0) / 1.5));
+    const argDeg = elevationDeg + 7.31 / (elevationDeg + 4.4);
+    const refractionDeg = (1 / Math.tan(argDeg * DEG_TO_RAD) / 60) * ramp;
+    if (Number.isFinite(refractionDeg) && refractionDeg > 0) {
+      return Math.min(90, elevationDeg + refractionDeg);
+    }
+  }
+  return elevationDeg;
+}
+
 /**
  * Compute exact WGS-84 topocentric look angles (azimuth, elevation, slant range, ground distance)
  * from an observer to a target, with optional Bennett atmospheric refraction near the horizon.
@@ -153,14 +174,8 @@ export function computeTopocentricLookAngles(
   let elevationDeg = Math.atan2(u, horizM) * RAD_TO_DEG;
   const azimuthDeg = horizM < 1e-9 ? 0 : normalizeAzimuthDeg(Math.atan2(e, n) * RAD_TO_DEG);
 
-  // Apply Bennett atmospheric refraction with a smooth ramp across [-2.0, -0.5] deg near the horizon.
-  if (applyRefraction && elevationDeg > -2.0 && elevationDeg < 89.8) {
-    const ramp = elevationDeg >= -0.5 ? 1 : Math.max(0, Math.min(1, (elevationDeg + 2.0) / 1.5));
-    const argDeg = elevationDeg + 7.31 / (elevationDeg + 4.4);
-    const refractionDeg = (1 / Math.tan(argDeg * DEG_TO_RAD) / 60) * ramp;
-    if (Number.isFinite(refractionDeg) && refractionDeg > 0) {
-      elevationDeg = Math.min(90, elevationDeg + refractionDeg);
-    }
+  if (applyRefraction) {
+    elevationDeg = applyBennettRefraction(elevationDeg);
   }
 
   elevationDeg = Math.max(-90, Math.min(90, elevationDeg));
@@ -654,5 +669,523 @@ export function extrapolateDeadReckoning(
     lat: dest.lat,
     lon: dest.lon,
     altM: nextAltM,
+  };
+}
+
+const VAULT_SPHERICAL_WEIGHT = 0.55;
+const VAULT_LINEAR_WEIGHT = 0.45;
+const EARTH_EQUATORIAL_RADIUS_KM = 6378.137;
+
+function skyDomeMinElevation(zoomMode: SkyDomeZoomMode): number {
+  return zoomMode === 'zenith' ? 30 : 0;
+}
+
+function vaultCurveValue(elDeg: number): number {
+  return VAULT_SPHERICAL_WEIGHT * Math.cos(elDeg * DEG_TO_RAD) + VAULT_LINEAR_WEIGHT * ((90 - elDeg) / 90);
+}
+
+/**
+ * Map elevation in degrees to normalized 3D spherical/stereographic sky-dome radius [0, 1]
+ * (0 at 90 deg Zenith, 1 at minEl rim: 0 deg in hemisphere mode, 30 deg in zenith mode).
+ */
+export function elevationToVaultNormR(elDeg: number, zoomMode: SkyDomeZoomMode = 'hemisphere'): number {
+  const minEl = skyDomeMinElevation(zoomMode);
+  if (!Number.isFinite(elDeg)) return 1;
+  const clamped = Math.max(minEl, Math.min(90, elDeg));
+  if (clamped >= 90) return 0;
+  if (clamped <= minEl) return 1;
+  return vaultCurveValue(clamped) / vaultCurveValue(minEl);
+}
+
+/**
+ * Project topocentric (azDeg, elDeg) onto the circular sky-dome canvas with strict horizon/minEl culling.
+ */
+export function projectToSkyDome(
+  azDeg: number,
+  elDeg: number,
+  cx: number,
+  cy: number,
+  radius: number,
+  zoomMode: SkyDomeZoomMode = 'hemisphere'
+): SkyDomeProjectionPoint {
+  const safeCx = Number.isFinite(cx) ? cx : 0;
+  const safeCy = Number.isFinite(cy) ? cy : 0;
+  const minEl = skyDomeMinElevation(zoomMode);
+  if (
+    !Number.isFinite(azDeg) ||
+    !Number.isFinite(elDeg) ||
+    !Number.isFinite(cx) ||
+    !Number.isFinite(cy) ||
+    !Number.isFinite(radius) ||
+    radius <= 0 ||
+    elDeg < minEl
+  ) {
+    return { x: safeCx, y: safeCy, r: 0, normR: 0, visible: false };
+  }
+
+  const normR = elevationToVaultNormR(elDeg, zoomMode);
+  const r = normR * radius;
+  const theta = ((normalizeAzimuthDeg(azDeg) - 90) * Math.PI) / 180;
+  return {
+    x: cx + r * Math.cos(theta),
+    y: cy + r * Math.sin(theta),
+    r,
+    normR,
+    visible: true,
+  };
+}
+
+/**
+ * Invert sky-dome canvas coordinates back to (azimuthDeg, elevationDeg) via safeguarded Newton-Raphson.
+ */
+export function unprojectFromSkyDome(
+  px: number,
+  py: number,
+  cx: number,
+  cy: number,
+  radius: number,
+  zoomMode: SkyDomeZoomMode = 'hemisphere'
+): SkyDomeUnprojectionResult {
+  const minEl = skyDomeMinElevation(zoomMode);
+  if (
+    !Number.isFinite(px) ||
+    !Number.isFinite(py) ||
+    !Number.isFinite(cx) ||
+    !Number.isFinite(cy) ||
+    !Number.isFinite(radius) ||
+    radius <= 0
+  ) {
+    return { azimuthDeg: 0, elevationDeg: minEl, inBounds: false };
+  }
+
+  const dx = px - cx;
+  const dy = py - cy;
+  const dist = Math.hypot(dx, dy);
+  const azimuthDeg = dist < 1e-12 ? 0 : normalizeAzimuthDeg(Math.atan2(dy, dx) * RAD_TO_DEG + 90);
+  const inBounds = dist <= radius + 1e-6;
+  const normR = Math.max(0, Math.min(1, dist / radius));
+
+  if (normR <= 0) {
+    return { azimuthDeg, elevationDeg: 90, inBounds };
+  }
+  if (normR >= 1) {
+    return { azimuthDeg, elevationDeg: minEl, inBounds };
+  }
+
+  const target = normR * vaultCurveValue(minEl);
+  let lo = minEl;
+  let hi = 90;
+  let el = 90 - normR * (90 - minEl);
+
+  for (let i = 0; i < 32; i++) {
+    const val = vaultCurveValue(el) - target;
+    if (Math.abs(val) < 1e-14) break;
+    if (val > 0) {
+      lo = el;
+    } else {
+      hi = el;
+    }
+    const deriv = -VAULT_SPHERICAL_WEIGHT * DEG_TO_RAD * Math.sin(el * DEG_TO_RAD) - VAULT_LINEAR_WEIGHT / 90;
+    const next = el - val / deriv;
+    if (Number.isFinite(next) && next > lo && next < hi) {
+      const step = Math.abs(next - el);
+      el = next;
+      if (step < 1e-13) break;
+    } else {
+      const mid = 0.5 * (lo + hi);
+      if (Math.abs(mid - el) < 1e-13) {
+        el = mid;
+        break;
+      }
+      el = mid;
+    }
+  }
+
+  return {
+    azimuthDeg,
+    elevationDeg: Math.max(minEl, Math.min(90, el)),
+    inBounds,
+  };
+}
+
+/**
+ * Singularity-free direct ENU projection onto the sky dome, remaining C1 smooth right through Zenith.
+ */
+export function projectEnuToSkyDome(
+  e: number,
+  n: number,
+  u: number,
+  cx: number,
+  cy: number,
+  radius: number,
+  zoomMode: SkyDomeZoomMode = 'hemisphere',
+  allowBelowMinEl = false
+): SkyDomeProjectionPoint {
+  const safeCx = Number.isFinite(cx) ? cx : 0;
+  const safeCy = Number.isFinite(cy) ? cy : 0;
+  if (
+    !Number.isFinite(e) ||
+    !Number.isFinite(n) ||
+    !Number.isFinite(u) ||
+    !Number.isFinite(cx) ||
+    !Number.isFinite(cy) ||
+    !Number.isFinite(radius) ||
+    radius <= 0
+  ) {
+    return { x: safeCx, y: safeCy, r: 0, normR: 0, visible: false };
+  }
+
+  const rho = Math.hypot(e, n, u);
+  if (rho < 1e-9) {
+    return { x: cx, y: cy, r: 0, normR: 0, visible: false };
+  }
+
+  const h = Math.hypot(e, n);
+  const elDeg = Math.atan2(u, h) * RAD_TO_DEG;
+  const minEl = skyDomeMinElevation(zoomMode);
+  const visible = elDeg >= minEl;
+  if (!visible && !allowBelowMinEl) {
+    return { x: cx, y: cy, r: 0, normR: 0, visible: false };
+  }
+
+  const thetaZen = Math.atan2(h, u);
+  // Use the analytical limit theta/h -> 1/rho near Zenith to avoid 0/0 cancellation.
+  const thetaOverH =
+    u >= 0 ? (h > 1e-6 * rho ? thetaZen / h : 1 / rho) : h > 1e-12 * rho ? thetaZen / h : 0;
+  const scale = VAULT_SPHERICAL_WEIGHT / rho + (VAULT_LINEAR_WEIGHT / (Math.PI / 2)) * thetaOverH;
+  const fMin = vaultCurveValue(minEl);
+  const k = (radius / fMin) * scale;
+
+  const dx = k * e;
+  const dy = -k * n;
+  const r = Math.hypot(dx, dy);
+
+  return {
+    x: cx + dx,
+    y: cy + dy,
+    r,
+    normR: radius > 0 ? r / radius : 0,
+    visible,
+  };
+}
+
+/**
+ * Compute exact WGS-84 ENU position, velocity vector (m/s), and slant range (m) of a target
+ * relative to an observer, preserving Earth curvature and meridian convergence.
+ */
+export function computeTargetEnuState(
+  observer: { lat: number; lon: number; altM?: number },
+  target: {
+    lat: number;
+    lon: number;
+    altM?: number;
+    speedMs?: number;
+    headingDeg?: number;
+    headingValid?: boolean;
+    vertRateMs?: number;
+  }
+): { e: number; n: number; u: number; ve: number; vn: number; vu: number; slantRangeM: number } {
+  if (
+    !Number.isFinite(observer.lat) ||
+    !Number.isFinite(observer.lon) ||
+    !Number.isFinite(target.lat) ||
+    !Number.isFinite(target.lon)
+  ) {
+    return { e: 0, n: 0, u: 0, ve: 0, vn: 0, vu: 0, slantRangeM: 0 };
+  }
+
+  const obsAltM = Number.isFinite(observer.altM) ? (observer.altM as number) : 0;
+  const tgtAltM = Number.isFinite(target.altM) ? (target.altM as number) : 0;
+
+  const obsEcef = geodeticToEcef(observer.lat, observer.lon, obsAltM);
+  const tgtEcef = geodeticToEcef(target.lat, target.lon, tgtAltM);
+  const { e, n, u } = ecefToEnu(
+    tgtEcef.x - obsEcef.x,
+    tgtEcef.y - obsEcef.y,
+    tgtEcef.z - obsEcef.z,
+    observer.lat,
+    observer.lon
+  );
+  const slantRangeM = Math.hypot(e, n, u);
+
+  if (
+    target.headingValid === false ||
+    !Number.isFinite(target.speedMs) ||
+    (target.speedMs === 0 && !Number.isFinite(target.vertRateMs))
+  ) {
+    return { e, n, u, ve: 0, vn: 0, vu: 0, slantRangeM };
+  }
+
+  const safeSpeed = target.speedMs as number;
+  const safeHeading = Number.isFinite(target.headingDeg) ? (target.headingDeg as number) : 0;
+  const safeVertRate = Number.isFinite(target.vertRateMs) ? (target.vertRateMs as number) : 0;
+
+  const nextPos = extrapolateDeadReckoning(target.lat, target.lon, safeSpeed, safeHeading, 1, tgtAltM, safeVertRate);
+  const nextEcef = geodeticToEcef(nextPos.lat, nextPos.lon, nextPos.altM);
+  const nextEnu = ecefToEnu(
+    nextEcef.x - obsEcef.x,
+    nextEcef.y - obsEcef.y,
+    nextEcef.z - obsEcef.z,
+    observer.lat,
+    observer.lon
+  );
+
+  return {
+    e,
+    n,
+    u,
+    ve: nextEnu.e - e,
+    vn: nextEnu.n - n,
+    vu: nextEnu.u - u,
+    slantRangeM,
+  };
+}
+
+/**
+ * Compute smooth sky-dome canvas rotation angle (radians, 0 = +X East, -pi/2 = -Y North)
+ * via centered ENU finite difference without singularities across Zenith or Antimeridian.
+ */
+export function computeSkyDomeTrajectoryTangent(
+  observer: { lat: number; lon: number; altM?: number },
+  target: {
+    lat: number;
+    lon: number;
+    altM?: number;
+    speedMs?: number;
+    headingDeg?: number;
+    headingValid?: boolean;
+    vertRateMs?: number;
+  },
+  cx: number,
+  cy: number,
+  radius: number,
+  zoomMode: SkyDomeZoomMode = 'hemisphere'
+): number {
+  const safeHeading = Number.isFinite(target.headingDeg) ? (target.headingDeg as number) : 0;
+  const fallbackAngle = ((safeHeading - 90) * Math.PI) / 180;
+
+  let state = computeTargetEnuState(observer, target);
+  if (target.headingValid !== false && Math.hypot(state.ve, state.vn, state.vu) <= 0.1) {
+    state = computeTargetEnuState(observer, { ...target, speedMs: 10, vertRateMs: 0 });
+  }
+
+  const { e, n, u, ve, vn, vu, slantRangeM } = state;
+  const vMag = Math.hypot(ve, vn, vu);
+  if (vMag < 1e-9 || slantRangeM < 1e-9 || !Number.isFinite(radius) || radius <= 0) {
+    return fallbackAngle;
+  }
+
+  const dt = Math.max(0.25, Math.min(10, (0.005 * Math.max(100, slantRangeM)) / Math.max(1, vMag)));
+  const half = 0.5 * dt;
+
+  const pMinus = projectEnuToSkyDome(e - ve * half, n - vn * half, u - vu * half, cx, cy, radius, zoomMode, true);
+  const pPlus = projectEnuToSkyDome(e + ve * half, n + vn * half, u + vu * half, cx, cy, radius, zoomMode, true);
+
+  const dx = pPlus.x - pMinus.x;
+  const dy = pPlus.y - pMinus.y;
+  if (Number.isFinite(dx) && Number.isFinite(dy) && Math.hypot(dx, dy) >= 1e-9) {
+    return Math.atan2(dy, dx);
+  }
+  return fallbackAngle;
+}
+
+/**
+ * Compute zero-dependency analytical Sun & Moon topocentric (Az, El) with GMST rotation,
+ * lunar horizontal parallax, Bennett atmospheric refraction, lunar illumination/phase, and twilight state.
+ */
+export function computeSolarLunarTopocentric(
+  observer: { lat: number; lon: number; altM?: number },
+  timestampMs: number
+): CelestialPositions {
+  const safeLat = Number.isFinite(observer.lat) ? Math.max(-89.9999, Math.min(89.9999, observer.lat)) : 0;
+  const safeLon = normalizeLonDeg(observer.lon);
+  const safeTsMs = Number.isFinite(timestampMs) ? timestampMs : 0;
+
+  const jd = safeTsMs / 86_400_000 + 2440587.5;
+  const d = jd - 2451545.0;
+  const t = d / 36525.0;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const t4 = t2 * t2;
+
+  const gmstDeg = normalizeAzimuthDeg(280.46061837 + 360.98564736629 * d + 0.000387933 * t2 - t3 / 38710000);
+  const gmstRad = gmstDeg * DEG_TO_RAD;
+
+  // Solar ephemeris (Meeus Ch. 25 / USNO, ~0.01 deg accuracy).
+  const sunMeanAnom = (357.52911 + 35999.05029 * t - 0.0001537 * t2) * DEG_TO_RAD;
+  const sunMeanLon = 280.46646 + 36000.76983 * t + 0.0003032 * t2;
+  const sunCenter =
+    (1.914602 - 0.004817 * t - 0.000014 * t2) * Math.sin(sunMeanAnom) +
+    (0.019993 - 0.000101 * t) * Math.sin(2 * sunMeanAnom) +
+    0.000289 * Math.sin(3 * sunMeanAnom);
+  const nodeOmega = (125.04 - 1934.136 * t) * DEG_TO_RAD;
+  const lambdaSunDeg = normalizeAzimuthDeg(sunMeanLon + sunCenter - 0.00569 - 0.00478 * Math.sin(nodeOmega));
+  const lambdaSunRad = lambdaSunDeg * DEG_TO_RAD;
+
+  const eps0 = 23.43929111 - 0.013004167 * t - 1.6389e-7 * t2 + 5.036e-7 * t3;
+  const epsRad = (eps0 + 0.00256 * Math.cos(nodeOmega)) * DEG_TO_RAD;
+
+  const raSun = Math.atan2(Math.cos(epsRad) * Math.sin(lambdaSunRad), Math.cos(lambdaSunRad));
+  const decSun = Math.asin(Math.max(-1, Math.min(1, Math.sin(epsRad) * Math.sin(lambdaSunRad))));
+
+  // Lunar ephemeris (Meeus Ch. 47 6-term analytical series, ~0.2 deg accuracy).
+  const moonMeanLon = 218.3164477 + 481267.88123421 * t - 0.0015786 * t2 + t3 / 538841 - t4 / 65194000;
+  const moonElongD = (297.8501921 + 445267.1114034 * t - 0.0018819 * t2 + t3 / 545868) * DEG_TO_RAD;
+  const sunAnomMs = (357.5291092 + 35999.0502909 * t - 0.0001536 * t2) * DEG_TO_RAD;
+  const moonAnomMm = (134.9633964 + 477198.8675055 * t + 0.0087414 * t2 + t3 / 69699) * DEG_TO_RAD;
+  const moonArgLatF = (93.272095 + 483202.0175233 * t - 0.0036539 * t2) * DEG_TO_RAD;
+
+  const dLonMoon =
+    6.288774 * Math.sin(moonAnomMm) +
+    1.274027 * Math.sin(2 * moonElongD - moonAnomMm) +
+    0.658314 * Math.sin(2 * moonElongD) +
+    0.213618 * Math.sin(2 * moonAnomMm) -
+    0.185116 * Math.sin(sunAnomMs) -
+    0.114332 * Math.sin(2 * moonArgLatF);
+  const dLatMoon =
+    5.128122 * Math.sin(moonArgLatF) +
+    0.280602 * Math.sin(moonAnomMm + moonArgLatF) +
+    0.277693 * Math.sin(moonAnomMm - moonArgLatF) +
+    0.173237 * Math.sin(2 * moonElongD - moonArgLatF);
+  const rMoonKm =
+    385000.56 -
+    20905.355 * Math.cos(moonAnomMm) -
+    3699.111 * Math.cos(2 * moonElongD - moonAnomMm) -
+    2955.968 * Math.cos(2 * moonElongD) -
+    569.925 * Math.cos(2 * moonAnomMm);
+
+  const lambdaMoonDeg = normalizeAzimuthDeg(moonMeanLon + dLonMoon);
+  const lambdaMoonRad = lambdaMoonDeg * DEG_TO_RAD;
+  const betaMoonRad = dLatMoon * DEG_TO_RAD;
+
+  const cosBeta = Math.cos(betaMoonRad);
+  const sinBeta = Math.sin(betaMoonRad);
+  const cosEps = Math.cos(epsRad);
+  const sinEps = Math.sin(epsRad);
+
+  const xEqMoon = cosBeta * Math.cos(lambdaMoonRad);
+  const yEqMoon = cosEps * cosBeta * Math.sin(lambdaMoonRad) - sinEps * sinBeta;
+  const zEqMoon = sinEps * cosBeta * Math.sin(lambdaMoonRad) + cosEps * sinBeta;
+  const raMoon = Math.atan2(yEqMoon, xEqMoon);
+  const decMoon = Math.asin(Math.max(-1, Math.min(1, zEqMoon)));
+
+  const latRad = safeLat * DEG_TO_RAD;
+  const lonRad = safeLon * DEG_TO_RAD;
+  const sinLat = Math.sin(latRad);
+  const cosLat = Math.cos(latRad);
+
+  const equatorialToTopocentric = (ra: number, dec: number, moonDistKm?: number) => {
+    const ha = gmstRad + lonRad - ra;
+    const sinDec = Math.sin(dec);
+    const cosDec = Math.cos(dec);
+    const east = -cosDec * Math.sin(ha);
+    const north = cosLat * sinDec - sinLat * cosDec * Math.cos(ha);
+    const up = sinLat * sinDec + cosLat * cosDec * Math.cos(ha);
+
+    const horiz = Math.hypot(east, north);
+    let elRad = Math.asin(Math.max(-1, Math.min(1, up)));
+    if (moonDistKm !== undefined && moonDistKm > EARTH_EQUATORIAL_RADIUS_KM) {
+      elRad -= Math.asin(EARTH_EQUATORIAL_RADIUS_KM / moonDistKm) * Math.cos(elRad);
+    }
+    const elDeg = Math.max(-90, Math.min(90, applyBennettRefraction(elRad * RAD_TO_DEG)));
+    const azDeg = horiz < 1e-12 ? 0 : normalizeAzimuthDeg(Math.atan2(east, north) * RAD_TO_DEG);
+    return { azimuthDeg: azDeg, elevationDeg: elDeg };
+  };
+
+  const sun = equatorialToTopocentric(raSun, decSun);
+  const moonHoriz = equatorialToTopocentric(raMoon, decMoon, rMoonKm);
+
+  const cosPsi = Math.max(
+    -1,
+    Math.min(1, Math.sin(decSun) * Math.sin(decMoon) + Math.cos(decSun) * Math.cos(decMoon) * Math.cos(raSun - raMoon))
+  );
+  const illuminationFraction = Math.max(0, Math.min(1, (1 - cosPsi) / 2));
+  const phaseFraction = Math.max(0, Math.min(1, normalizeAzimuthDeg(lambdaMoonDeg - lambdaSunDeg) / 360));
+
+  const twilightState: TwilightState =
+    sun.elevationDeg >= 0
+      ? 'day'
+      : sun.elevationDeg >= -6
+        ? 'civil-twilight'
+        : sun.elevationDeg >= -12
+          ? 'nautical-twilight'
+          : 'night';
+
+  return {
+    sun,
+    moon: {
+      ...moonHoriz,
+      phaseFraction,
+      illuminationFraction,
+    },
+    twilightState,
+  };
+}
+
+/**
+ * Predict Time of Closest Approach (TCA) and peak topocentric elevation for a moving target
+ * inside maxWindowSec using WGS-84 ENU state and dead-reckoned re-evaluation.
+ */
+export function computeClosestApproach(
+  observer: { lat: number; lon: number; altM?: number },
+  target: {
+    lat: number;
+    lon: number;
+    altM?: number;
+    speedMs?: number;
+    headingDeg?: number;
+    headingValid?: boolean;
+    vertRateMs?: number;
+  },
+  maxWindowSec = 600
+): ClosestApproachPrediction {
+  const obsAltM = Number.isFinite(observer.altM) ? (observer.altM as number) : 0;
+  const tgtAltM = Number.isFinite(target.altM) ? (target.altM as number) : 0;
+  const lookNow = computeTopocentricLookAngles(
+    { lat: observer.lat, lon: observer.lon, altM: obsAltM },
+    { lat: target.lat, lon: target.lon, altM: tgtAltM },
+    true
+  );
+
+  const nonApproaching: ClosestApproachPrediction = {
+    isApproaching: false,
+    tcaSeconds: 0,
+    peakElevationDeg: lookNow.elevationDeg,
+    minSlantRangeKm: lookNow.slantRangeKm,
+    peakAzimuthDeg: lookNow.azimuthDeg,
+  };
+
+  const { e, n, u, ve, vn, vu, slantRangeM } = computeTargetEnuState(observer, target);
+  const v2 = ve * ve + vn * vn + vu * vu;
+
+  if (target.headingValid === false || !Number.isFinite(target.speedMs) || v2 < 1.0 || slantRangeM < 1e-3) {
+    return nonApproaching;
+  }
+
+  const tauRaw = -(e * ve + n * vn + u * vu) / v2;
+  if (!Number.isFinite(tauRaw) || tauRaw <= 0.5) {
+    return nonApproaching;
+  }
+
+  const safeWindowSec = Number.isFinite(maxWindowSec) ? Math.max(0, maxWindowSec) : 0;
+  const tcaSeconds = Math.min(safeWindowSec, tauRaw);
+  const pred = extrapolateDeadReckoning(
+    target.lat,
+    target.lon,
+    target.speedMs ?? 0,
+    Number.isFinite(target.headingDeg) ? (target.headingDeg as number) : 0,
+    tcaSeconds,
+    tgtAltM,
+    Number.isFinite(target.vertRateMs) ? (target.vertRateMs as number) : 0
+  );
+  const predLook = computeTopocentricLookAngles({ lat: observer.lat, lon: observer.lon, altM: obsAltM }, pred, true);
+  const minSlantRangeKm = Math.min(lookNow.slantRangeKm, predLook.slantRangeKm);
+
+  return {
+    isApproaching: tcaSeconds > 0.5 && minSlantRangeKm < lookNow.slantRangeKm - 1e-6,
+    tcaSeconds,
+    peakElevationDeg: predLook.elevationDeg,
+    minSlantRangeKm,
+    peakAzimuthDeg: predLook.azimuthDeg,
   };
 }

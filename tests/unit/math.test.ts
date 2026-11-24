@@ -4,8 +4,13 @@ import {
   WGS84_E2,
   WGS84_F,
   computeBearingDeg,
+  computeClosestApproach,
+  computeSkyDomeTrajectoryTangent,
+  computeSolarLunarTopocentric,
+  computeTargetEnuState,
   computeTopocentricLookAngles,
   ecefToEnu,
+  elevationToVaultNormR,
   extrapolateDeadReckoning,
   geodesicCirclePolygon,
   geodeticToEcef,
@@ -14,7 +19,10 @@ import {
   normalizeLonDeg,
   pointInGeoJsonFeature,
   pointInGeoJsonPolygon,
+  projectEnuToSkyDome,
+  projectToSkyDome,
   splitAntimeridianLine,
+  unprojectFromSkyDome,
 } from '../../src/math/geodesy';
 import {
   formatAltitude,
@@ -305,6 +313,347 @@ describe('WGS-84 geodesy & coordinate transformations', () => {
 
     const grounded = extrapolateDeadReckoning(38.85, -77.04, 10, 0, 10, 20, -5);
     expect(grounded.altM).toBe(0);
+  });
+});
+
+describe('3D Sky-Dome vault projection, ENU tangents, celestial ephemeris & TCA', () => {
+  it('maps elevations cleanly via elevationToVaultNormR and culls below minEl without rim clamping', () => {
+    expect(elevationToVaultNormR(90, 'hemisphere')).toBe(0);
+    expect(elevationToVaultNormR(0, 'hemisphere')).toBe(1);
+    expect(elevationToVaultNormR(-10, 'hemisphere')).toBe(1);
+    expect(elevationToVaultNormR(Number.NaN, 'hemisphere')).toBe(1);
+
+    expect(elevationToVaultNormR(90, 'zenith')).toBe(0);
+    expect(elevationToVaultNormR(30, 'zenith')).toBe(1);
+    expect(elevationToVaultNormR(15, 'zenith')).toBe(1);
+    expect(elevationToVaultNormR(Number.POSITIVE_INFINITY, 'zenith')).toBe(1);
+
+    // Monotonic decrease from minEl to 90 deg
+    expect(elevationToVaultNormR(45, 'hemisphere')).toBeGreaterThan(elevationToVaultNormR(60, 'hemisphere'));
+    expect(elevationToVaultNormR(45, 'zenith')).toBeGreaterThan(elevationToVaultNormR(60, 'zenith'));
+
+    // Strict culling for el < 0 (hemisphere) and el < 30 (zenith)
+    const culledHemi = projectToSkyDome(120, -0.001, 200, 200, 150, 'hemisphere');
+    expect(culledHemi).toEqual({ x: 200, y: 200, r: 0, normR: 0, visible: false });
+
+    const culledZenith = projectToSkyDome(120, 29.999, 200, 200, 150, 'zenith');
+    expect(culledZenith).toEqual({ x: 200, y: 200, r: 0, normR: 0, visible: false });
+
+    // Exact boundary el === minEl is visible on the rim (normR = 1)
+    const rimHemi = projectToSkyDome(90, 0, 200, 200, 150, 'hemisphere');
+    expect(rimHemi.visible).toBe(true);
+    expect(rimHemi.normR).toBeCloseTo(1, 12);
+    expect(rimHemi.x).toBeCloseTo(350, 9);
+    expect(rimHemi.y).toBeCloseTo(200, 9);
+
+    const rimZenith = projectToSkyDome(0, 30, 200, 200, 150, 'zenith');
+    expect(rimZenith.visible).toBe(true);
+    expect(rimZenith.normR).toBeCloseTo(1, 12);
+    expect(rimZenith.x).toBeCloseTo(200, 9);
+    expect(rimZenith.y).toBeCloseTo(50, 9);
+
+    // Invalid radius / NaN guards
+    expect(projectToSkyDome(0, 45, 200, 200, 0, 'hemisphere').visible).toBe(false);
+    expect(projectToSkyDome(Number.NaN, 45, 200, 200, 150, 'hemisphere').visible).toBe(false);
+  });
+
+  it('round-trips projectToSkyDome <-> unprojectFromSkyDome (< 0.01 deg error) in hemisphere and zenith modes', () => {
+    const cx = 320;
+    const cy = 240;
+    const radius = 180;
+    const azimuths = [0, 22.5, 90, 135, 180, 247.3, 315, 359.9];
+
+    for (const mode of ['hemisphere', 'zenith'] as const) {
+      const minEl = mode === 'zenith' ? 30 : 0;
+      const elevations = mode === 'zenith' ? [30, 35, 45, 60, 75, 88, 89.99] : [0, 5, 15, 30, 45, 65, 85, 89.99];
+
+      for (const el of elevations) {
+        for (const az of azimuths) {
+          const pt = projectToSkyDome(az, el, cx, cy, radius, mode);
+          expect(pt.visible).toBe(true);
+          const back = unprojectFromSkyDome(pt.x, pt.y, cx, cy, radius, mode);
+          expect(back.inBounds).toBe(true);
+          expect(Math.abs(back.elevationDeg - el)).toBeLessThan(1e-9);
+          const azDiff = Math.abs((((back.azimuthDeg - az) % 360) + 540) % 360 - 180);
+          expect(azDiff).toBeLessThan(0.01);
+        }
+      }
+
+      // Exact center -> 90 deg Zenith, exact rim -> minEl, outside rim -> inBounds: false & clamped finite el
+      const centerUnproj = unprojectFromSkyDome(cx, cy, cx, cy, radius, mode);
+      expect(centerUnproj.inBounds).toBe(true);
+      expect(centerUnproj.elevationDeg).toBeCloseTo(90, 11);
+
+      const rimUnproj = unprojectFromSkyDome(cx + radius, cy, cx, cy, radius, mode);
+      expect(rimUnproj.inBounds).toBe(true);
+      expect(rimUnproj.azimuthDeg).toBeCloseTo(90, 9);
+      expect(rimUnproj.elevationDeg).toBeCloseTo(minEl, 11);
+
+      const outUnproj = unprojectFromSkyDome(cx + radius * 1.5, cy, cx, cy, radius, mode);
+      expect(outUnproj.inBounds).toBe(false);
+      expect(outUnproj.elevationDeg).toBeCloseTo(minEl, 11);
+
+      const badUnproj = unprojectFromSkyDome(Number.NaN, cy, cx, cy, -10, mode);
+      expect(badUnproj.inBounds).toBe(false);
+      expect(Number.isFinite(badUnproj.elevationDeg)).toBe(true);
+    }
+  });
+
+  it('projects ENU vectors smoothly through Zenith and matches projectToSkyDome', () => {
+    const cx = 250;
+    const cy = 250;
+    const radius = 200;
+
+    // Away from Zenith: matches az/el projection exactly
+    const e = 8000;
+    const n = 5000;
+    const u = 12000;
+    const enuPt = projectEnuToSkyDome(e, n, u, cx, cy, radius, 'hemisphere');
+    const azDeg = Math.atan2(e, n) * (180 / Math.PI);
+    const elDeg = Math.atan2(u, Math.hypot(e, n)) * (180 / Math.PI);
+    const azElPt = projectToSkyDome(azDeg, elDeg, cx, cy, radius, 'hemisphere');
+    expect(enuPt.visible).toBe(true);
+    expect(enuPt.x).toBeCloseTo(azElPt.x, 9);
+    expect(enuPt.y).toBeCloseTo(azElPt.y, 9);
+    expect(enuPt.normR).toBeCloseTo(azElPt.normR, 12);
+
+    // Exact Zenith and sub-micrometer Zenith neighborhood: zero NaN, smooth continuity
+    const exactZenith = projectEnuToSkyDome(0, 0, 10000, cx, cy, radius, 'zenith');
+    expect(exactZenith.visible).toBe(true);
+    expect(exactZenith.x).toBe(cx);
+    expect(exactZenith.y).toBe(cy);
+    expect(exactZenith.normR).toBe(0);
+
+    const tinyNorth = projectEnuToSkyDome(0, 1e-8, 10000, cx, cy, radius, 'hemisphere');
+    const tinySouth = projectEnuToSkyDome(0, -1e-8, 10000, cx, cy, radius, 'hemisphere');
+    expect(tinyNorth.visible).toBe(true);
+    expect(tinyNorth.y).toBeLessThan(cy);
+    expect(tinySouth.y).toBeGreaterThan(cy);
+    expect(Math.hypot(tinyNorth.x - cx, tinyNorth.y - cy)).toBeLessThan(1e-6);
+
+    // Below minEl culling vs allowBelowMinEl
+    expect(projectEnuToSkyDome(1000, 0, -50, cx, cy, radius, 'hemisphere', false).visible).toBe(false);
+    const extended = projectEnuToSkyDome(1000, 0, -50, cx, cy, radius, 'hemisphere', true);
+    expect(extended.visible).toBe(false);
+    expect(extended.normR).toBeGreaterThan(1);
+    expect(projectEnuToSkyDome(0, 0, 0, cx, cy, radius).visible).toBe(false);
+  });
+
+  it('keeps computeSkyDomeTrajectoryTangent smooth across EL = 90.000 Zenith and +-180 Antimeridian', () => {
+    const obs = { lat: 38.8512, lon: -77.0402, altM: 12 };
+    const cx = 250;
+    const cy = 250;
+    const radius = 200;
+
+    // Aircraft flying straight South-to-North overhead through observer's exact Zenith
+    const offsetsKm = [-5, -1, -0.05, -0.001, 0, 0.001, 0.05, 1, 5];
+    const maxVariationRad = (2 * Math.PI) / 180;
+    for (const mode of ['hemisphere', 'zenith'] as const) {
+      for (const kmNorth of offsetsKm) {
+        const pos =
+          kmNorth === 0
+            ? { lat: obs.lat, lon: obs.lon }
+            : greatCircleDestination(obs.lat, obs.lon, kmNorth > 0 ? 0 : 180, Math.abs(kmNorth));
+        const angle = computeSkyDomeTrajectoryTangent(
+          obs,
+          { lat: pos.lat, lon: pos.lon, altM: 10012, speedMs: 250, headingDeg: 0, vertRateMs: 0 },
+          cx,
+          cy,
+          radius,
+          mode
+        );
+        expect(Number.isFinite(angle)).toBe(true);
+        const diff = Math.abs(Math.atan2(Math.sin(angle - -Math.PI / 2), Math.cos(angle - -Math.PI / 2)));
+        expect(diff).toBeLessThan(maxVariationRad);
+      }
+    }
+
+    // Antimeridian crossing: target eastbound from +179.99 to -179.99 viewed near the seam
+    const antObs = { lat: 0, lon: 179.95, altM: 0 };
+    const westSideAngle = computeSkyDomeTrajectoryTangent(
+      antObs,
+      { lat: 0, lon: 179.99, altM: 11000, speedMs: 240, headingDeg: 90, vertRateMs: 0 },
+      cx,
+      cy,
+      radius,
+      'hemisphere'
+    );
+    const eastSideAngle = computeSkyDomeTrajectoryTangent(
+      antObs,
+      { lat: 0, lon: -179.99, altM: 11000, speedMs: 240, headingDeg: 90, vertRateMs: 0 },
+      cx,
+      cy,
+      radius,
+      'hemisphere'
+    );
+    expect(Math.abs(westSideAngle)).toBeLessThan(0.05);
+    expect(Math.abs(eastSideAngle)).toBeLessThan(0.05);
+    expect(Math.abs(eastSideAngle - westSideAngle)).toBeLessThan(0.05);
+
+    // Stationary/hovering target with valid heading uses synthetic 10 m/s forward tangent
+    const hoverEast = computeSkyDomeTrajectoryTangent(
+      obs,
+      { lat: obs.lat, lon: obs.lon, altM: 500, speedMs: 0, headingDeg: 90, headingValid: true, vertRateMs: 0 },
+      cx,
+      cy,
+      radius
+    );
+    expect(hoverEast).toBeCloseTo(0, 3);
+
+    // Invalid heading falls back cleanly without NaN
+    const invalidHeadingState = computeTargetEnuState(obs, {
+      lat: obs.lat,
+      lon: obs.lon,
+      altM: 500,
+      speedMs: 50,
+      headingDeg: 180,
+      headingValid: false,
+    });
+    expect(invalidHeadingState.ve).toBe(0);
+    expect(invalidHeadingState.vn).toBe(0);
+    expect(invalidHeadingState.vu).toBe(0);
+
+    const fallbackAngle = computeSkyDomeTrajectoryTangent(
+      obs,
+      { lat: obs.lat, lon: obs.lon, altM: 500, speedMs: 0, headingDeg: 180, headingValid: false },
+      cx,
+      cy,
+      radius
+    );
+    expect(fallbackAngle).toBeCloseTo(Math.PI / 2, 9);
+  });
+
+  it('computes accurate solar/lunar topocentric positions, twilight states, and lunar phase/illumination', () => {
+    // Vernal Equinox 2026 solar noon & midnight at (0, 0) (EoT ~ -7.6 min -> solar noon ~ 12:07:36 UTC)
+    const eqNoon = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 2, 20, 12, 7, 36));
+    expect(eqNoon.sun.elevationDeg).toBeGreaterThan(89);
+    expect(eqNoon.twilightState).toBe('day');
+
+    const eqMidnight = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 2, 20, 0, 7, 36));
+    expect(eqMidnight.sun.elevationDeg).toBeLessThan(-89);
+    expect(eqMidnight.twilightState).toBe('night');
+
+    // Civil and nautical twilight bands on Vernal Equinox evening
+    const eqCivil = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 2, 20, 18, 20, 0));
+    expect(eqCivil.sun.elevationDeg).toBeGreaterThanOrEqual(-6);
+    expect(eqCivil.sun.elevationDeg).toBeLessThan(0);
+    expect(eqCivil.twilightState).toBe('civil-twilight');
+
+    const eqNautical = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 2, 20, 18, 45, 0));
+    expect(eqNautical.sun.elevationDeg).toBeGreaterThanOrEqual(-12);
+    expect(eqNautical.sun.elevationDeg).toBeLessThan(-6);
+    expect(eqNautical.twilightState).toBe('nautical-twilight');
+
+    // Summer Solstice Midnight Sun (+89.9 deg) & Polar Night (-89.9 deg)
+    const juneNorth = computeSolarLunarTopocentric({ lat: 89.9, lon: 0 }, Date.UTC(2026, 5, 21, 12, 0, 0));
+    expect(juneNorth.sun.elevationDeg).toBeGreaterThan(22);
+    expect(juneNorth.twilightState).toBe('day');
+
+    const juneSouth = computeSolarLunarTopocentric({ lat: -89.9, lon: 0 }, Date.UTC(2026, 5, 21, 12, 0, 0));
+    expect(juneSouth.sun.elevationDeg).toBeLessThan(-22);
+    expect(juneSouth.twilightState).toBe('night');
+
+    // Winter Solstice Polar Night (+89.9 deg) & Midnight Sun (-89.9 deg)
+    const decNorth = computeSolarLunarTopocentric({ lat: 89.9, lon: 0 }, Date.UTC(2026, 11, 21, 12, 0, 0));
+    expect(decNorth.sun.elevationDeg).toBeLessThan(-22);
+    expect(decNorth.twilightState).toBe('night');
+
+    const decSouth = computeSolarLunarTopocentric({ lat: -89.9, lon: 0 }, Date.UTC(2026, 11, 21, 12, 0, 0));
+    expect(decSouth.sun.elevationDeg).toBeGreaterThan(22);
+    expect(decSouth.twilightState).toBe('day');
+
+    // Southern Hemisphere solar noon (Sydney: Sun culminates due North, az ~ 0 / 360 deg)
+    const sydneyNoon = computeSolarLunarTopocentric(
+      { lat: -33.8688, lon: 151.2093 },
+      Date.UTC(2026, 2, 20, 2, 3, 0)
+    );
+    const northDist = Math.min(sydneyNoon.sun.azimuthDeg, 360 - sydneyNoon.sun.azimuthDeg);
+    expect(northDist).toBeLessThan(2);
+    expect(sydneyNoon.sun.elevationDeg).toBeGreaterThan(50);
+
+    // New Moon (2026-03-19T01:23Z) vs Full Moon (2026-04-02T02:12Z)
+    const newMoon = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 2, 19, 1, 23, 0));
+    expect(newMoon.moon.illuminationFraction).toBeLessThan(0.01);
+    const newPhaseErr = Math.min(newMoon.moon.phaseFraction, 1 - newMoon.moon.phaseFraction);
+    expect(newPhaseErr).toBeLessThan(0.02);
+
+    const fullMoon = computeSolarLunarTopocentric({ lat: 0, lon: 0 }, Date.UTC(2026, 3, 2, 2, 12, 0));
+    expect(fullMoon.moon.illuminationFraction).toBeGreaterThan(0.99);
+    expect(fullMoon.moon.phaseFraction).toBeCloseTo(0.5, 1);
+
+    // Non-finite timestamp and extreme latitude safety
+    const badInput = computeSolarLunarTopocentric({ lat: 95, lon: 540 }, Number.NaN);
+    expect(Number.isFinite(badInput.sun.azimuthDeg)).toBe(true);
+    expect(Number.isFinite(badInput.sun.elevationDeg)).toBe(true);
+    expect(Number.isFinite(badInput.moon.illuminationFraction)).toBe(true);
+  });
+
+  it('predicts Time of Closest Approach (TCA) for approaching, hovering, receding, and distant targets', () => {
+    const obs = { lat: 38.8512, lon: -77.0402, altM: 12 };
+
+    // 1. Approaching overhead jet: 30 km South heading North at 250 m/s, 10,000 m alt -> TCA ~ 120s, peak El ~ 90 deg
+    const south30Km = greatCircleDestination(obs.lat, obs.lon, 180, 30);
+    const approaching = computeClosestApproach(obs, {
+      lat: south30Km.lat,
+      lon: south30Km.lon,
+      altM: 10012,
+      speedMs: 250,
+      headingDeg: 0,
+      vertRateMs: 0,
+    });
+    expect(approaching.isApproaching).toBe(true);
+    expect(approaching.tcaSeconds).toBeCloseTo(120, 0);
+    expect(approaching.peakElevationDeg).toBeGreaterThan(85);
+    expect(approaching.minSlantRangeKm).toBeCloseTo(10, 0);
+
+    // 2. Stationary hovering drone (speedMs = 0) -> not approaching, zero NaN
+    const hoverPos = greatCircleDestination(obs.lat, obs.lon, 45, 2);
+    const hovering = computeClosestApproach(obs, {
+      lat: hoverPos.lat,
+      lon: hoverPos.lon,
+      altM: 120,
+      speedMs: 0,
+      headingDeg: 90,
+      vertRateMs: 0,
+    });
+    expect(hovering.isApproaching).toBe(false);
+    expect(hovering.tcaSeconds).toBe(0);
+    expect(Number.isFinite(hovering.peakElevationDeg)).toBe(true);
+    expect(Number.isFinite(hovering.minSlantRangeKm)).toBe(true);
+    expect(Number.isFinite(hovering.peakAzimuthDeg)).toBe(true);
+    expect(hovering.minSlantRangeKm).toBeCloseTo(2, 1);
+
+    // 3. Receding jet: 30 km North heading North -> tauRaw < 0 -> not approaching
+    const north30Km = greatCircleDestination(obs.lat, obs.lon, 0, 30);
+    const receding = computeClosestApproach(obs, {
+      lat: north30Km.lat,
+      lon: north30Km.lon,
+      altM: 10012,
+      speedMs: 250,
+      headingDeg: 0,
+      vertRateMs: 0,
+    });
+    expect(receding.isApproaching).toBe(false);
+    expect(receding.tcaSeconds).toBe(0);
+    expect(receding.minSlantRangeKm).toBeGreaterThan(30);
+
+    // 4. Distant approaching jet (250 km South at 250 m/s -> raw TCA ~ 1000s) clamped at maxWindowSec = 600
+    const south250Km = greatCircleDestination(obs.lat, obs.lon, 180, 250);
+    const clamped = computeClosestApproach(
+      obs,
+      {
+        lat: south250Km.lat,
+        lon: south250Km.lon,
+        altM: 11000,
+        speedMs: 250,
+        headingDeg: 0,
+        vertRateMs: 0,
+      },
+      600
+    );
+    expect(clamped.isApproaching).toBe(true);
+    expect(clamped.tcaSeconds).toBe(600);
+    expect(clamped.minSlantRangeKm).toBeLessThan(110);
   });
 });
 
