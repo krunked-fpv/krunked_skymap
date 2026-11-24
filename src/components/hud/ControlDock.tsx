@@ -5,8 +5,10 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type FormEvent,
   type KeyboardEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import {
   AlertTriangle,
   ChevronUp,
@@ -216,6 +218,7 @@ export function ControlDock({
   const abortRef = useRef<AbortController | null>(null);
   const requestSeqRef = useRef(0);
   const suppressNextSearchRef = useRef<string | null>(null);
+  const lastResolvedQueryRef = useRef<string>('');
 
   // Dismiss sub-filter tray on outside click
   useEffect(() => {
@@ -248,16 +251,17 @@ export function ControlDock({
   }, [commandPaletteOpen]);
 
   const runSearch = useCallback(
-    async (rawQuery: string) => {
+    async (rawQuery: string): Promise<LocationSearchResult[] | null> => {
       const trimmed = rawQuery.trim();
       abortRef.current?.abort();
       if (!trimmed) {
         requestSeqRef.current += 1;
+        lastResolvedQueryRef.current = '';
         setResults([]);
         setDropdownOpen(false);
         setActiveIndex(-1);
         setSearching(false);
-        return;
+        return [];
       }
 
       const controller = new AbortController();
@@ -267,15 +271,19 @@ export function ControlDock({
 
       try {
         const nextResults = await onSearchLocation(trimmed);
-        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return null;
+        lastResolvedQueryRef.current = trimmed;
         setResults(nextResults);
         setDropdownOpen(nextResults.length > 0);
         setActiveIndex(nextResults.length > 0 ? 0 : -1);
+        return nextResults;
       } catch {
-        if (controller.signal.aborted || seq !== requestSeqRef.current) return;
+        if (controller.signal.aborted || seq !== requestSeqRef.current) return null;
+        lastResolvedQueryRef.current = '';
         setResults([]);
         setDropdownOpen(false);
         setActiveIndex(-1);
+        return [];
       } finally {
         if (!controller.signal.aborted && seq === requestSeqRef.current) {
           setSearching(false);
@@ -300,6 +308,7 @@ export function ControlDock({
     if (!trimmed) {
       abortRef.current?.abort();
       requestSeqRef.current += 1;
+      lastResolvedQueryRef.current = '';
       setResults([]);
       setDropdownOpen(false);
       setActiveIndex(-1);
@@ -321,6 +330,7 @@ export function ControlDock({
 
   const selectSearchResult = (item: LocationSearchResult) => {
     suppressNextSearchRef.current = item.label.trim();
+    lastResolvedQueryRef.current = '';
     setObserver({
       lat: item.lat,
       lon: item.lon,
@@ -332,6 +342,31 @@ export function ControlDock({
     setDropdownOpen(false);
     setActiveIndex(-1);
     setCommandPaletteOpen(false);
+  };
+
+  const submitQuerySearch = async () => {
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    if (debounceRef.current !== null) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    if (results.length > 0 && lastResolvedQueryRef.current === trimmed) {
+      const chosen = results[activeIndex >= 0 ? activeIndex : 0];
+      if (chosen) {
+        selectSearchResult(chosen);
+        return;
+      }
+    }
+    const nextResults = await runSearch(trimmed);
+    if (nextResults && nextResults.length > 0) {
+      selectSearchResult(nextResults[0]);
+    }
+  };
+
+  const handleSearchFormSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    void submitQuerySearch();
   };
 
   const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -357,16 +392,7 @@ export function ControlDock({
 
     if (event.key === 'Enter') {
       event.preventDefault();
-      if (dropdownOpen && results.length > 0) {
-        const chosen = results[activeIndex >= 0 ? activeIndex : 0];
-        if (chosen) selectSearchResult(chosen);
-      } else if (query.trim()) {
-        if (debounceRef.current !== null) {
-          window.clearTimeout(debounceRef.current);
-          debounceRef.current = null;
-        }
-        void runSearch(query);
-      }
+      void submitQuerySearch();
       return;
     }
 
@@ -401,6 +427,197 @@ export function ControlDock({
     setCommandPaletteOpen(false);
   };
 
+  const commandPaletteModal = commandPaletteOpen ? (
+    <div
+      className="cockpit-modal-backdrop"
+      data-testid="command-palette-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          setCommandPaletteOpen(false);
+        }
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) {
+          setCommandPaletteOpen(false);
+        }
+      }}
+    >
+      <div
+        className="command-palette"
+        data-testid="command-palette-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Observer Location Command Palette"
+        onMouseDown={(e) => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="command-palette__search-header">
+          <form className="command-palette__search-form" onSubmit={handleSearchFormSubmit}>
+            <div className="command-palette__input-wrap">
+              <Search size={14} className="command-palette__search-icon" aria-hidden="true" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                className="command-palette__input"
+                data-testid="command-palette-input"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onFocus={() => {
+                  if (results.length > 0) setDropdownOpen(true);
+                }}
+                onKeyDown={handleSearchKeyDown}
+                placeholder="City, airport, ICAO, or coordinates (lat, lon)..."
+                aria-label="Search observer city, airport, ICAO, or coordinates"
+                aria-expanded={dropdownOpen}
+                aria-autocomplete="list"
+                role="combobox"
+              />
+              {query && (
+                <button
+                  type="button"
+                  className="dock-clear-btn"
+                  onClick={() => {
+                    lastResolvedQueryRef.current = '';
+                    setQuery('');
+                    setResults([]);
+                    setDropdownOpen(false);
+                    setActiveIndex(-1);
+                    searchInputRef.current?.focus();
+                  }}
+                  aria-label="Clear location search"
+                >
+                  <X size={13} aria-hidden="true" />
+                </button>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              className="command-palette__submit-btn"
+              data-testid="command-palette-submit"
+              disabled={!query.trim()}
+              title="Jump directly to entered coordinates or top location match"
+            >
+              GO
+            </button>
+          </form>
+
+          <button
+            type="button"
+            className="dock-gps-btn"
+            data-testid="command-palette-gps"
+            onClick={onLocateGps}
+            disabled={gpsBusy}
+            title="Acquire live browser GPS coordinates"
+          >
+            <Crosshair size={13} aria-hidden="true" />
+            <span>{gpsBusy ? 'LOCATING...' : 'GPS LOCATE'}</span>
+          </button>
+
+          <button
+            type="button"
+            className="inspector-close-btn"
+            data-testid="command-palette-close"
+            onClick={() => setCommandPaletteOpen(false)}
+            aria-label="Close location command palette"
+          >
+            <X size={14} aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="command-palette__body cockpit-scroll">
+          {gpsError && (
+            <div className="dock-notice dock-notice--error" role="alert">
+              <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
+              <span>{gpsError}</span>
+            </div>
+          )}
+
+          {searching && (
+            <div className="command-palette__section-head">
+              <span>Resolving geodetic coordinates...</span>
+            </div>
+          )}
+
+          {dropdownOpen && results.length > 0 && (
+            <div>
+              <div className="command-palette__section-head" style={{ marginBottom: 6 }}>
+                <span>Search Matches</span>
+                <span className="tabular">{results.length}</span>
+              </div>
+              <ul className="command-palette__results" role="listbox">
+                {results.map((item, idx) => (
+                  <li
+                    key={`${item.lat}-${item.lon}-${item.label}-${idx}`}
+                    role="option"
+                    aria-selected={idx === activeIndex}
+                    data-testid={`command-palette-result-${idx}`}
+                    className={`dock-search-option${idx === activeIndex ? ' is-active' : ''}`}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                    }}
+                    onClick={() => selectSearchResult(item)}
+                    onMouseEnter={() => setActiveIndex(idx)}
+                  >
+                    <div className="dock-search-option__top">
+                      <span className="dock-search-option__label">{item.label}</span>
+                      <span className="dock-search-option__coords tabular">
+                        {formatCoords(item.lat, item.lon, 2)}
+                      </span>
+                    </div>
+                    <span className="dock-search-option__sub">{item.subtitle}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div>
+            <div className="command-palette__section-head" style={{ marginBottom: 7 }}>
+              <span>Aerospace Hotspot Presets</span>
+              <span className="tabular">
+                {observer.source === 'pending'
+                  ? locationStatus === 'unavailable'
+                    ? 'ACTIVE: AWAITING LOCATION'
+                    : 'ACTIVE: ACQUIRING LOCATION…'
+                  : `ACTIVE: ${observer.label} (${formatCoords(observer.lat, observer.lon, 2)})`}
+              </span>
+            </div>
+            <div className="command-palette__presets">
+              {AEROSPACE_PRESETS.map((preset) => {
+                const isActive = matchedPresetId === preset.id;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    data-testid={`preset-${preset.id}`}
+                    className={`palette-preset-card${isActive ? ' is-active' : ''}`}
+                    onClick={() => handlePresetSelect(preset.id)}
+                  >
+                    <div className="palette-preset-card__top">
+                      <span className="palette-preset-card__name">{preset.name}</span>
+                      <span className="palette-preset-card__coords tabular">
+                        {preset.lat.toFixed(2)}, {preset.lon.toFixed(2)}
+                      </span>
+                    </div>
+                    <span className="palette-preset-card__sub">{preset.subtitle}</span>
+                    {isActive && <span className="palette-preset-card__badge">ACTIVE STATION</span>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="command-palette__footer tabular">
+          <span>↑↓ Navigate · ↵ or GO Jump to Station</span>
+          <span>ESC Close</span>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   const flightsFeed = feeds.flights;
   const canRetryLiveFeed =
     flightsFeed.status === 'error' ||
@@ -408,7 +625,8 @@ export function ControlDock({
     flightsFeed.status === 'delayed';
 
   return (
-    <div className="control-dock-wrap" ref={dockWrapRef}>
+    <>
+      <div className="control-dock-wrap" ref={dockWrapRef}>
       {/* A) Floating Bottom-Center Tactical Layer Pill Dock + Contextual Trays */}
       {canRetryLiveFeed && (
         <div
@@ -612,172 +830,14 @@ export function ControlDock({
           />
         </div>
       </nav>
-
-      {/* B) Centered Glass ⌘K Location Command Palette Modal */}
-      {commandPaletteOpen && (
-        <div
-          className="cockpit-modal-backdrop"
-          role="presentation"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) {
-              setCommandPaletteOpen(false);
-            }
-          }}
-        >
-          <div
-            className="command-palette"
-            role="dialog"
-            aria-modal="true"
-            aria-label="Observer Location Command Palette"
-          >
-            <div className="command-palette__search-header">
-              <div className="command-palette__input-wrap">
-                <Search size={14} className="command-palette__search-icon" aria-hidden="true" />
-                <input
-                  ref={searchInputRef}
-                  type="text"
-                  className="command-palette__input"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  onFocus={() => {
-                    if (results.length > 0) setDropdownOpen(true);
-                  }}
-                  onKeyDown={handleSearchKeyDown}
-                  placeholder="City, airport, ICAO, or coordinates (lat, lon)..."
-                  aria-label="Search observer city, airport, ICAO, or coordinates"
-                  aria-expanded={dropdownOpen}
-                  aria-autocomplete="list"
-                  role="combobox"
-                />
-                {query && (
-                  <button
-                    type="button"
-                    className="dock-clear-btn"
-                    onClick={() => {
-                      setQuery('');
-                      setResults([]);
-                      setDropdownOpen(false);
-                      setActiveIndex(-1);
-                      searchInputRef.current?.focus();
-                    }}
-                    aria-label="Clear location search"
-                  >
-                    <X size={13} aria-hidden="true" />
-                  </button>
-                )}
-              </div>
-
-              <button
-                type="button"
-                className="dock-gps-btn"
-                onClick={onLocateGps}
-                disabled={gpsBusy}
-                title="Acquire live browser GPS coordinates"
-              >
-                <Crosshair size={13} aria-hidden="true" />
-                <span>{gpsBusy ? 'LOCATING...' : 'GPS LOCATE'}</span>
-              </button>
-
-              <button
-                type="button"
-                className="inspector-close-btn"
-                onClick={() => setCommandPaletteOpen(false)}
-                aria-label="Close location command palette"
-              >
-                <X size={14} aria-hidden="true" />
-              </button>
-            </div>
-
-            <div className="command-palette__body cockpit-scroll">
-              {gpsError && (
-                <div className="dock-notice dock-notice--error" role="alert">
-                  <AlertTriangle size={13} style={{ flexShrink: 0, marginTop: 1 }} aria-hidden="true" />
-                  <span>{gpsError}</span>
-                </div>
-              )}
-
-              {searching && (
-                <div className="command-palette__section-head">
-                  <span>Resolving geodetic coordinates...</span>
-                </div>
-              )}
-
-              {dropdownOpen && results.length > 0 && (
-                <div>
-                  <div className="command-palette__section-head" style={{ marginBottom: 6 }}>
-                    <span>Search Matches</span>
-                    <span className="tabular">{results.length}</span>
-                  </div>
-                  <ul className="command-palette__results" role="listbox">
-                    {results.map((item, idx) => (
-                      <li
-                        key={`${item.lat}-${item.lon}-${item.label}-${idx}`}
-                        role="option"
-                        aria-selected={idx === activeIndex}
-                        className={`dock-search-option${idx === activeIndex ? ' is-active' : ''}`}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          selectSearchResult(item);
-                        }}
-                        onMouseEnter={() => setActiveIndex(idx)}
-                      >
-                        <div className="dock-search-option__top">
-                          <span className="dock-search-option__label">{item.label}</span>
-                          <span className="dock-search-option__coords tabular">
-                            {formatCoords(item.lat, item.lon, 2)}
-                          </span>
-                        </div>
-                        <span className="dock-search-option__sub">{item.subtitle}</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-
-              <div>
-                <div className="command-palette__section-head" style={{ marginBottom: 7 }}>
-                  <span>Aerospace Hotspot Presets</span>
-                  <span className="tabular">
-                    {observer.source === 'pending'
-                      ? locationStatus === 'unavailable'
-                        ? 'ACTIVE: AWAITING LOCATION'
-                        : 'ACTIVE: ACQUIRING LOCATION…'
-                      : `ACTIVE: ${observer.label} (${formatCoords(observer.lat, observer.lon, 2)})`}
-                  </span>
-                </div>
-                <div className="command-palette__presets">
-                  {AEROSPACE_PRESETS.map((preset) => {
-                    const isActive = matchedPresetId === preset.id;
-                    return (
-                      <button
-                        key={preset.id}
-                        type="button"
-                        className={`palette-preset-card${isActive ? ' is-active' : ''}`}
-                        onClick={() => handlePresetSelect(preset.id)}
-                      >
-                        <div className="palette-preset-card__top">
-                          <span className="palette-preset-card__name">{preset.name}</span>
-                          <span className="palette-preset-card__coords tabular">
-                            {preset.lat.toFixed(2)}, {preset.lon.toFixed(2)}
-                          </span>
-                        </div>
-                        <span className="palette-preset-card__sub">{preset.subtitle}</span>
-                        {isActive && <span className="palette-preset-card__badge">ACTIVE STATION</span>}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-
-            <div className="command-palette__footer tabular">
-              <span>↑↓ Navigate · ↵ Select Station</span>
-              <span>ESC Close</span>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
+
+      {/* B) Portal-Mounted Glass ⌘K Location Command Palette Modal (escapes .control-dock-wrap pointer-events: none) */}
+      {commandPaletteModal &&
+        (typeof document !== 'undefined' && document.body
+          ? createPortal(commandPaletteModal, document.body)
+          : commandPaletteModal)}
+    </>
   );
 }
 

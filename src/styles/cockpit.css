@@ -1,8 +1,9 @@
 /* ==========================================================================
-   KRUNKED // SKY-MAP â€” Tactical Smoked-Obsidian Glass-Cockpit Design System
+   KRUNKED // SKY-MAP — Tactical Smoked-Obsidian Glass-Cockpit Design System
    100dvh x 100dvw zero-scrollbar viewport, tabular avionics numerals,
-   240x240 PIP Polar Sky-Dome, floating bottom-center layer dock, âŒ˜K command
-   palette, and 340px Target Inspector (mobile <= 767px bottom-sheet drawer).
+   320x320 right-side translucent PIP Polar Sky-Dome, floating bottom-center
+   layer dock, portal-mounted ⌘K command palette, and 340px Target Inspector
+   (mobile <= 767px bottom-sheet drawer).
    ========================================================================== */
 
 :root {
@@ -40,6 +41,7 @@
   --radius-md: 10px;
   --radius-lg: 14px;
   --topbar-height: 44px;
+  --inspector-width: 340px;
 }
 
 *,
@@ -130,67 +132,94 @@ select {
   min-width: 0;
   width: 100%;
   overflow: hidden;
-  display: grid;
-  grid-template-columns: minmax(0, 1.38fr) minmax(320px, 0.92fr);
-  grid-template-rows: minmax(0, 1fr);
+  display: block;
 }
 
-.skymap-stage.skymap-stage--split,
-.skymap-stage[data-layout='split'] {
-  grid-template-columns: minmax(0, 1.38fr) minmax(320px, 0.92fr);
-  grid-template-rows: minmax(0, 1fr);
-}
-
-.skymap-stage.skymap-stage--map,
-.skymap-stage[data-layout='map'] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
-}
-
-.skymap-stage.skymap-stage--dome,
-.skymap-stage[data-layout='dome'] {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: minmax(0, 1fr);
-}
-
+/* Full-bleed MapLibre viewport continuously mounted behind translucent Sky-Dome across ALL modes */
 .stage-map-pane,
-.stage-dome-pane {
-  position: relative;
-  min-width: 0;
-  min-height: 0;
+[data-pane='map'] {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  z-index: 1;
   overflow: hidden;
+  display: block !important;
 }
 
+/* Translucent Smoked-Glass Sky-Dome Overlay across SPLIT, DOME, and PIP modes */
 .stage-dome-pane,
 [data-pane='dome'] {
-  background: radial-gradient(circle at 50% 50%, rgba(12, 20, 36, 0.6), #06090f 78%);
-  border-left: 1px solid var(--border-hairline);
+  position: absolute;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: rgba(6, 10, 18, 0.30);
+  backdrop-filter: blur(1px);
+  -webkit-backdrop-filter: blur(1px);
+  z-index: 12;
 }
 
-.skymap-stage--map .stage-dome-pane,
-.skymap-stage--map [data-pane='dome'],
-[data-layout='map'] .stage-dome-pane,
-[data-layout='map'] [data-pane='dome'] {
+/* SPLIT mode (desktop > 767px): translucent right-side Sky-Dome over continuous full-bleed map */
+.skymap-stage[data-layout='split'] .stage-dome-pane,
+.skymap-stage.skymap-stage--split .stage-dome-pane,
+[data-layout='split'] [data-pane='dome'] {
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: auto;
+  width: clamp(340px, 42%, 680px);
+  height: 100%;
+  z-index: 12;
+  border-left: 1px solid var(--border-hairline-strong);
+  border-top: none;
+}
+
+/* DOME mode: full-bleed translucent Sky-Dome over live MapLibre traffic */
+.skymap-stage[data-layout='dome'] .stage-dome-pane,
+.skymap-stage.skymap-stage--dome .stage-dome-pane,
+[data-layout='dome'] [data-pane='dome'] {
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 12;
+  border: none;
+}
+
+/* MAP mode without PIP: hide dome pane */
+.skymap-stage[data-layout='map'][data-pip='false'] .stage-dome-pane,
+.skymap-stage--map[data-pip='false'] .stage-dome-pane,
+.skymap-stage[data-layout='map']:not([data-pip='true']) .stage-dome-pane,
+.skymap-stage--map:not([data-pip='true']) .stage-dome-pane {
   display: none;
 }
 
-/* 240x240 Floating Corner Sky-Dome PIP inside Map Mode */
+/* 320x320 Floating Right-Side Translucent Sky-Dome PIP inside Map Mode (+33% larger) */
 .skymap-stage[data-layout='map'][data-pip='true'] .stage-dome-pane,
 .skymap-stage--map[data-pip='true'] .stage-dome-pane {
   display: block;
   position: absolute;
   top: 12px;
-  left: max(12px, env(safe-area-inset-left));
-  width: 240px;
-  height: 240px;
+  right: max(12px, env(safe-area-inset-right));
+  left: auto;
+  bottom: auto;
+  width: 320px;
+  height: 320px;
   border-radius: 14px;
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(6, 10, 18, 0.30);
+  backdrop-filter: blur(1px);
+  -webkit-backdrop-filter: blur(1px);
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.65);
   z-index: 22;
   overflow: hidden;
-  transition: border-color 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+  transition:
+    transform 220ms cubic-bezier(0.22, 1, 0.36, 1),
+    border-color 160ms ease,
+    box-shadow 160ms ease,
+    opacity 160ms ease;
 }
 
 .skymap-stage[data-layout='map'][data-pip='true'] .stage-dome-pane:hover,
@@ -198,26 +227,22 @@ select {
   border-color: rgba(34, 211, 238, 0.42);
 }
 
-.skymap-stage--dome .stage-map-pane,
-.skymap-stage--dome [data-pane='map'],
-[data-layout='dome'] .stage-map-pane,
-[data-layout='dome'] [data-pane='map'] {
-  display: none;
+/* Zero Right-Side Collision: shift 320x320 PIP left of open 340px TargetInspector on desktop */
+@media (min-width: 768px) {
+  .skymap-stage[data-layout='map'][data-pip='true']:has(.target-inspector.is-open) .stage-dome-pane,
+  .skymap-stage--map[data-pip='true']:has(.target-inspector.is-open) .stage-dome-pane {
+    transform: translateX(calc(-1 * (var(--inspector-width) + 12px)));
+  }
 }
 
-.skymap-stage--dome .stage-dome-pane,
-.skymap-stage--dome [data-pane='dome'],
-[data-layout='dome'] .stage-dome-pane,
-[data-layout='dome'] [data-pane='dome'] {
-  border-left: none;
-}
-
-/* Keep Split-view lower pane bezel & MapLibre controls clear of bottom-center dock */
+/* Keep Split/Dome lower pane bezel & MapLibre zoom controls clear of split overlay and bottom dock */
 .skymap-stage[data-layout='split'] .stage-map-pane .maplibregl-ctrl-bottom-right {
+  right: calc(clamp(340px, 42%, 680px) + 8px);
   bottom: 66px;
 }
 
-.skymap-stage[data-layout='split'] .stage-dome-pane .skydome-bezel-controls {
+.skymap-stage[data-layout='split'] .stage-dome-pane .skydome-bezel-controls,
+.skymap-stage[data-layout='dome'] .stage-dome-pane .skydome-bezel-controls {
   bottom: 66px !important;
 }
 
@@ -468,6 +493,70 @@ select {
 }
 
 /* Right Zone Readouts & Controls */
+.topbar-overhead-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 9px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-hairline);
+  background: rgba(255, 255, 255, 0.03);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.topbar-overhead-btn.has-targets {
+  border-color: rgba(34, 211, 238, 0.36);
+  background: rgba(34, 211, 238, 0.1);
+  color: #cffafe;
+}
+
+.topbar-overhead-btn.has-targets:hover {
+  border-color: rgba(34, 211, 238, 0.62);
+  background: rgba(34, 211, 238, 0.18);
+  color: var(--text-bright);
+}
+
+.topbar-overhead-btn.has-targets:active {
+  background: rgba(34, 211, 238, 0.24);
+}
+
+.topbar-overhead-btn.is-empty {
+  opacity: 0.6;
+  color: var(--text-muted);
+}
+
+.topbar-overhead-btn.is-empty:hover {
+  opacity: 0.8;
+  border-color: var(--border-hairline-strong);
+}
+
+.topbar-overhead-btn:focus-visible {
+  outline: 1.5px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.topbar-overhead-btn__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.topbar-overhead-btn.has-targets .topbar-overhead-btn__dot {
+  background: var(--cat-flight);
+  box-shadow: 0 0 8px rgba(34, 211, 238, 0.72);
+}
+
 .topbar-metrics-pill {
   display: inline-flex;
   align-items: center;
@@ -1309,7 +1398,8 @@ select {
 .cockpit-modal-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 85;
+  z-index: 120;
+  pointer-events: auto;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1324,6 +1414,9 @@ select {
 }
 
 .command-palette {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
   width: 100%;
   max-width: 600px;
   max-height: calc(100dvh - 36px);
@@ -1348,12 +1441,51 @@ select {
   flex-shrink: 0;
 }
 
+.command-palette__search-form {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .command-palette__input-wrap {
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
   align-items: center;
+}
+
+.command-palette__submit-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 36px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(34, 211, 238, 0.44);
+  background: rgba(34, 211, 238, 0.16);
+  color: var(--cat-flight);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease, opacity 140ms ease;
+}
+
+.command-palette__submit-btn:hover:not(:disabled) {
+  background: rgba(34, 211, 238, 0.26);
+  border-color: rgba(34, 211, 238, 0.7);
+  color: var(--text-bright);
+}
+
+.command-palette__submit-btn:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
 }
 
 .command-palette__search-icon {
@@ -1700,7 +1832,7 @@ select {
   top: 12px;
   right: 12px;
   bottom: 12px;
-  width: 340px;
+  width: var(--inspector-width);
   max-width: calc(100% - 24px);
   z-index: 32;
   display: flex;
@@ -1991,6 +2123,9 @@ select {
    ========================================================================== */
 
 .cockpit-modal {
+  position: relative;
+  z-index: 1;
+  pointer-events: auto;
   width: 100%;
   max-width: 540px;
   max-height: calc(100dvh - 32px);
@@ -2234,14 +2369,26 @@ select {
   }
 
   .topbar-action-btn,
+  .topbar-overhead-btn,
   .topbar-beacon-pill,
   .pwa-install-pill {
     height: 34px;
     touch-action: manipulation;
   }
 
+  .topbar-overhead-btn {
+    padding: 0 6px;
+    gap: 4px;
+    font-size: 8.5px;
+    letter-spacing: 0.03em;
+  }
+
+  .topbar-overhead-btn__dot {
+    display: none;
+  }
+
   .topbar-beacon-pill {
-    max-width: 96px;
+    max-width: 82px;
     overflow: hidden;
     text-overflow: ellipsis;
     padding: 0 7px;
@@ -2295,27 +2442,30 @@ select {
     top: calc(88px + env(safe-area-inset-top));
   }
 
-  /* Split view stacks vertically on <= 767px */
-  .skymap-stage,
-  .skymap-stage.skymap-stage--split,
-  .skymap-stage[data-layout='split'] {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1.04fr) minmax(0, 0.96fr);
-  }
-
-  .stage-dome-pane,
-  [data-pane='dome'] {
+  /* Split view overlays translucent Sky-Dome across bottom 48% on <= 767px */
+  .skymap-stage[data-layout='split'] .stage-dome-pane,
+  .skymap-stage.skymap-stage--split .stage-dome-pane,
+  [data-layout='split'] [data-pane='dome'] {
+    left: 0;
+    right: 0;
+    bottom: 0;
+    top: auto;
+    width: 100%;
+    height: 48%;
+    z-index: 12;
     border-left: none;
-    border-top: 1px solid var(--border-hairline);
+    border-top: 1px solid var(--border-hairline-strong);
   }
 
-  /* 156x156 PIP corner radar on mobile; hide cleanly when bottom-sheet inspector opens */
+  /* 208x208 Right-Side PIP radar on mobile (+33%); hide cleanly when bottom-sheet inspector opens */
   .skymap-stage[data-layout='map'][data-pip='true'] .stage-dome-pane,
   .skymap-stage--map[data-pip='true'] .stage-dome-pane {
     top: 10px;
-    left: max(10px, env(safe-area-inset-left));
-    width: 156px;
-    height: 156px;
+    right: max(10px, env(safe-area-inset-right));
+    left: auto;
+    bottom: auto;
+    width: min(208px, calc(100vw - 24px));
+    height: min(208px, calc(100vw - 24px));
     border-radius: 12px;
   }
 
@@ -2325,9 +2475,10 @@ select {
     pointer-events: none;
   }
 
-  /* Lift SkyDome bezel micro-controls & MapLibre controls clear of mobile bottom dock */
+  /* Lift SkyDome bezel micro-controls & MapLibre controls clear of mobile split pane & bottom dock */
   .skymap-stage[data-layout='split'] .stage-map-pane .maplibregl-ctrl-bottom-right {
-    bottom: 8px;
+    right: max(8px, env(safe-area-inset-right));
+    bottom: calc(48% + 8px);
   }
 
   .skymap-stage .stage-dome-pane .skydome-bezel-controls,
@@ -2443,10 +2594,15 @@ select {
     flex-wrap: wrap;
   }
 
+  .command-palette__search-form {
+    flex: 1 1 100%;
+  }
+
   .command-palette__input {
     min-height: 44px;
   }
 
+  .command-palette__submit-btn,
   .dock-gps-btn,
   .palette-preset-card {
     min-height: 44px;

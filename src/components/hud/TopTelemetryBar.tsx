@@ -228,6 +228,8 @@ export function TopTelemetryBar({
 
   const isPendingLocation = observer.source === 'pending';
   const isLiveCurrentLocation = observer.source === 'gps' || observer.source === 'ip';
+  const overheadConeDeg = counts.overheadConeDeg ?? 45;
+  const hasOverhead = counts.overhead > 0;
   const stationLabel = isPendingLocation
     ? locationStatus === 'unavailable'
       ? 'Set Location'
@@ -332,19 +334,37 @@ export function TopTelemetryBar({
         </button>
       </div>
 
-      {/* Right Zone: Zenith & FPS Readout, Sweep, Telemetry Beacon, Settings & PWA */}
+      {/* Right Zone: Overhead Target Lock, FPS Readout, Sweep, Telemetry Beacon, Settings & PWA */}
       <div className="topbar-zone topbar-zone--right">
+        <button
+          type="button"
+          className={`topbar-overhead-btn tabular${hasOverhead ? ' has-targets' : ' is-empty'}`}
+          data-testid="topbar-overhead-lock"
+          aria-disabled={!hasOverhead}
+          onClick={() => {
+            useSkyStore.getState().lockHighestOverheadTarget();
+          }}
+          title={
+            hasOverhead
+              ? `Lock onto highest target directly overhead (EL >= ${overheadConeDeg}° — click again to cycle)`
+              : 'No active targets overhead (EL >= 20°)'
+          }
+          aria-label={
+            hasOverhead
+              ? `Lock onto highest overhead target (${counts.overhead} active at elevation ${overheadConeDeg} degrees or higher)`
+              : 'No active targets overhead'
+          }
+        >
+          <span className="topbar-overhead-btn__dot" aria-hidden="true" />
+          <span>OVERHEAD</span>
+          <strong className="topbar-metrics-pill__val">{counts.overhead}</strong>
+        </button>
+
         <div
           className="topbar-metrics-pill tabular"
-          title={`Targets above 30° local horizon: ${counts.overhead} · Render FPS: ${Math.round(fps)} · ${workerReady ? 'SGP4 Worker Ready' : 'SGP4 Initializing'}`}
+          title={`Render FPS: ${Math.round(fps)} · ${workerReady ? 'SGP4 Worker Ready' : 'SGP4 Initializing'}`}
         >
           <span className={`worker-dot${workerReady ? ' is-ready' : ''}`} aria-hidden="true" />
-          <span>
-            ZENITH <strong className="topbar-metrics-pill__val">{counts.overhead}</strong>
-          </span>
-          <span aria-hidden="true" style={{ opacity: 0.4 }}>
-            ·
-          </span>
           <span>
             <strong className="topbar-metrics-pill__val">{Math.round(fps)}</strong> FPS
           </span>
@@ -447,7 +467,7 @@ export function TopTelemetryBar({
 
           <div className="topbar-popover__body cockpit-scroll">
             <div className="diag-metrics-strip tabular">
-              <span>ZENITH EL&gt;30°: {counts.overhead}</span>
+              <span>OVERHEAD EL&gt;={overheadConeDeg}°: {counts.overhead}</span>
               <span>TOTAL: {counts.total}</span>
               <span>{Math.round(fps)} FPS</span>
               <span>{workerReady ? 'SGP4 OK' : 'SGP4 INIT'}</span>
@@ -604,7 +624,7 @@ export function TopTelemetryBar({
                   aria-pressed={skyDomeZoom === 'hemisphere'}
                   onClick={() => setSkyDomeZoom('hemisphere')}
                 >
-                  HEMISPHERE 0°
+                  FULL SKY
                 </button>
                 <button
                   type="button"
@@ -612,7 +632,7 @@ export function TopTelemetryBar({
                   aria-pressed={skyDomeZoom === 'zenith'}
                   onClick={() => setSkyDomeZoom('zenith')}
                 >
-                  ZENITH 30°+
+                  OVERHEAD 2×
                 </button>
               </div>
             </div>
