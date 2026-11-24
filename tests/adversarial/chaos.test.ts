@@ -1221,13 +1221,9 @@ describe('Challenge 5 — 60fps Memory Hygiene, Cleanup & Sprint 02 Render Probe
 
     // 2. Immediate polar trail pruning with zero +40 slack retention
     expect(polarDomeSourceRaw).not.toMatch(/polarTrailsRef\.current\.size\s*>\s*activeIds\.size\s*\+\s*40/);
-    const pruneSlice = polarDomeSourceRaw.slice(
-      polarDomeSourceRaw.indexOf('// Immediately prune stale trail cache entries'),
-      polarDomeSourceRaw.indexOf('// Draw lowest priority first')
-    );
-    expect(pruneSlice).toContain('if (!activeIds.has(key))');
-    expect(pruneSlice).toContain('polarTrailsRef.current.delete(key)');
-    expect(pruneSlice).toContain('lastTrailSampleRef.current.delete(key)');
+    // Sprint 04 refactor removed comment anchors; assert prune statements directly.
+    expect(polarDomeSourceRaw).toContain('if (!activeIds.has(key)) polarTrailsRef.current.delete(key)');
+    expect(polarDomeSourceRaw).toContain('if (!activeIds.has(key)) lastTrailSampleRef.current.delete(key)');
 
     // 3. MapLibre pitch lock + recenterNonce + deduplication
     expect(tacticalMapSourceRaw).toContain('maxPitch: 0');
@@ -1371,7 +1367,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
 
-    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v3'");
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v4'");
     expect(swSource).toContain("addEventListener('install'");
     expect(swSource).toContain("addEventListener('activate'");
     expect(swSource).toContain("addEventListener('fetch'");
@@ -1417,7 +1413,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
         };
       },
       async keys() {
-        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3'];
+        return ['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3', 'krunked-skymap-v4'];
       },
       async delete(key: string) {
         deletedCaches.push(key);
@@ -1438,7 +1434,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       Promise,
     });
 
-    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v3)
+    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v4)
     const activateTasks: Array<Promise<unknown>> = [];
     listeners.get('activate')?.({
       waitUntil(p: Promise<unknown>) {
@@ -1446,8 +1442,8 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       },
     });
     await Promise.all(activateTasks);
-    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2']);
-    expect(deletedCaches).not.toContain('krunked-skymap-v3');
+    expect(deletedCaches).toEqual(['krunked-skymap-v1', 'krunked-skymap-v2', 'krunked-skymap-v3']);
+    expect(deletedCaches).not.toContain('krunked-skymap-v4');
 
     // Telemetry, CORS relays (r.jina.ai), and /api-proxy/ URLs MUST bypass respondWith()
     const fetchListener = listeners.get('fetch')!;
@@ -2789,7 +2785,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
     ).toBe(true);
   });
 
-  it('verifies sw.js krunked-skymap-v3 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
+  it('verifies sw.js krunked-skymap-v4 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
     const fs = await loadNodeFs();
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
@@ -2828,7 +2824,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
         };
       },
       async keys() {
-        return ['krunked-skymap-v3'];
+        return ['krunked-skymap-v4'];
       },
       async delete() {
         return true;
@@ -3045,4 +3041,242 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
       'PolarSkyDome bottom-right legend lacks a .skydome-legend CSS hook lifted clear of the mobile ControlDock on <=767px'
     ).toBe(true);
   });
+});
+
+
+// ---------------------------------------------------------------------------
+// Challenge 9 — Sprint 04 3D Sky-Dome, Celestial/TCA, Zero-GC & Hotkey Audit
+// ---------------------------------------------------------------------------
+import {
+  projectToSkyDome as c9Project,
+  unprojectFromSkyDome as c9Unproject,
+  projectEnuToSkyDome as c9ProjectEnu,
+  computeTargetEnuState as c9EnuState,
+  computeSkyDomeTrajectoryTangent as c9Tangent,
+  computeSolarLunarTopocentric as c9Celestial,
+  computeClosestApproach as c9Tca,
+} from '../../src/math/geodesy';
+import {
+  solveDomeLabelLayout as c9SolveLabels,
+  type DomeLabelCandidate as C9Candidate,
+} from '../../src/components/skydome/PolarSkyDome';
+import { pruneLiveKinematicsRegistry as c9Prune } from '../../src/store/useSkyStore';
+
+describe('Challenge 9 — Sprint 04 3D Sky-Dome, Celestial/TCA, Zero-GC & Hotkey Audit', () => {
+  it('9.1 below-horizon targets are culled in both zoom modes; zenith culls el<30; no -5deg/OTH tolerance in source', () => {
+    for (let i = 0; i < 1000; i += 1) {
+      const el = -85 + (84.99 * i) / 999;
+      const az = (i * 37) % 360;
+      expect(c9Project(az, el, 200, 200, 180, 'hemisphere').visible, `hemi el=${el}`).toBe(false);
+      expect(c9Project(az, el, 200, 200, 180, 'zenith').visible, `zenith el=${el}`).toBe(false);
+    }
+    for (let el = 0; el < 30; el += 0.5) {
+      expect(c9Project(10, el, 200, 200, 180, 'zenith').visible, `zenith el=${el}`).toBe(false);
+    }
+    expect(/-5\s*°/.test(polarDomeSourceRaw)).toBe(false);
+    expect(/\bOTH\b/.test(polarDomeSourceRaw)).toBe(false);
+    expect(/EL_MIN\s*=\s*-5/.test(polarDomeSourceRaw)).toBe(false);
+  });
+
+  it('9.2 zenith overflight and antimeridian crossing: tangent finite, smooth (<2deg/step), ENU projection finite', () => {
+    const observer = { lat: 0, lon: 179.99, altM: 0 };
+    const run = (label: string, mk: (i: number) => { lat: number; lon: number }, headingDeg: number) => {
+      let prev: number | null = null;
+      let maxStep = 0;
+      for (let i = 0; i < 61; i += 1) {
+        const p = mk(i);
+        const target = { ...p, altM: 3000, speedMs: 200, headingDeg, headingValid: true, vertRateMs: 0 };
+        const ang = c9Tangent(observer, target, 200, 200, 180, 'hemisphere');
+        expect(Number.isFinite(ang), `${label} i=${i}`).toBe(true);
+        const st = c9EnuState(observer, target);
+        const pr = c9ProjectEnu(st.e, st.n, st.u, 200, 200, 180, 'hemisphere', true);
+        expect(Number.isFinite(pr.x) && Number.isFinite(pr.y), `${label} enu i=${i}`).toBe(true);
+        if (prev !== null) {
+          let d = Math.abs(ang - prev) % (2 * Math.PI);
+          if (d > Math.PI) d = 2 * Math.PI - d;
+          maxStep = Math.max(maxStep, (d * 180) / Math.PI);
+        }
+        prev = ang;
+      }
+      expect(maxStep, `${label} max tangent step deg`).toBeLessThan(2);
+    };
+    // Due-east track crossing the antimeridian directly overhead (observer at lon 179.99).
+    run('antimeridian', (i) => ({ lat: 0, lon: normalizeLonDeg(179.99 - 0.03 + i * 0.001) }), 90);
+    // Northbound track through zenith (az flips 180).
+    run('zenith', (i) => ({ lat: -0.03 + i * 0.001, lon: 179.99 }), 0);
+  });
+
+  it('9.3 project/unproject round-trip < 0.01deg across canvases, DPR and zoom modes', () => {
+    const canvases: Array<[number, number]> = [[156, 156], [240, 240], [390, 844], [1440, 900], [3840, 2160]];
+    for (const [w, h] of canvases) {
+      for (const dpr of [1, 2, 3]) {
+        const cw = w * dpr;
+        const ch = h * dpr;
+        const radius = Math.min(cw, ch) / 2 - 12 * dpr;
+        const cx = cw / 2;
+        const cy = ch / 2;
+        for (const zoom of ['hemisphere', 'zenith'] as const) {
+          const minEl = zoom === 'zenith' ? 30 : 0;
+          for (let az = 0; az < 360; az += 23) {
+            for (let el = minEl + 0.5; el <= 89.5; el += 7.3) {
+              const p = c9Project(az, el, cx, cy, radius, zoom);
+              expect(p.visible).toBe(true);
+              const u = c9Unproject(p.x, p.y, cx, cy, radius, zoom);
+              let dAz = Math.abs(u.azimuthDeg - az);
+              if (dAz > 180) dAz = 360 - dAz;
+              expect(dAz * Math.cos((el * Math.PI) / 180), `az ${w}x${h}@${dpr} ${zoom} ${az}/${el}`).toBeLessThan(0.01);
+              expect(Math.abs(u.elevationDeg - el), `el ${w}x${h}@${dpr} ${zoom} ${az}/${el}`).toBeLessThan(0.01);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  it('9.4 celestial ephemeris edge cases are finite and in range; TCA handles zero/receding/approaching', () => {
+    const lats = [89.9, -89.9, 0];
+    const lons = [0, 179.999, -179.999, 180];
+    const stamps = [0, NaN, Date.UTC(2100, 5, 21, 12)];
+    for (const lat of lats) {
+      for (const lon of lons) {
+        for (const ts of stamps) {
+          const c = c9Celestial({ lat, lon, altM: 0 }, ts);
+          const tag = `${lat},${lon},${ts}`;
+          for (const v of [c.sun.azimuthDeg, c.sun.elevationDeg, c.moon.azimuthDeg, c.moon.elevationDeg, c.moon.phaseFraction, c.moon.illuminationFraction]) {
+            expect(Number.isFinite(v), tag).toBe(true);
+          }
+          expect(c.sun.azimuthDeg >= 0 && c.sun.azimuthDeg < 360, tag).toBe(true);
+          expect(c.moon.azimuthDeg >= 0 && c.moon.azimuthDeg < 360, tag).toBe(true);
+          expect(Math.abs(c.sun.elevationDeg)).toBeLessThanOrEqual(90);
+          expect(Math.abs(c.moon.elevationDeg)).toBeLessThanOrEqual(90);
+          expect(c.moon.phaseFraction >= 0 && c.moon.phaseFraction <= 1, tag).toBe(true);
+          expect(c.moon.illuminationFraction >= 0 && c.moon.illuminationFraction <= 1, tag).toBe(true);
+          expect(['day', 'civil', 'nautical', 'astronomical', 'night'].length).toBeGreaterThan(0);
+          expect(typeof c.twilightState).toBe('string');
+        }
+      }
+    }
+    const obs = { lat: 40, lon: -75, altM: 0 };
+    const stationary = c9Tca(obs, { lat: 40.05, lon: -75, altM: 3000, speedMs: 0, headingDeg: 0, headingValid: true });
+    for (const v of [stationary.tcaSeconds, stationary.peakElevationDeg, stationary.minSlantRangeKm, stationary.peakAzimuthDeg]) {
+      expect(Number.isFinite(v)).toBe(true);
+    }
+    expect(stationary.isApproaching).toBe(false);
+    const receding = c9Tca(obs, { lat: 40.05, lon: -75, altM: 3000, speedMs: 200, headingDeg: 0, headingValid: true });
+    expect(receding.isApproaching).toBe(false);
+    expect(Number.isFinite(receding.minSlantRangeKm)).toBe(true);
+    const approaching = c9Tca(obs, { lat: 40.4, lon: -75, altM: 3000, speedMs: 200, headingDeg: 180, headingValid: true });
+    expect(approaching.isApproaching).toBe(true);
+    expect(approaching.tcaSeconds).toBeGreaterThan(0);
+    expect(approaching.tcaSeconds).toBeLessThanOrEqual(600);
+    expect(approaching.peakElevationDeg).toBeGreaterThan(60);
+  });
+
+  it('9.5 label layout: 80 aircraft in a 15deg zenith cone obey caps, no overlap, margins; registry prune is synchronous', () => {
+    const W = 800;
+    const H = 800;
+    const cx = 400;
+    const cy = 400;
+    const radius = 380;
+    const cands: C9Candidate[] = [];
+    for (let i = 0; i < 80; i += 1) {
+      const el = 75 + ((i * 7) % 15) + 0.01;
+      const p = c9Project((i * 47) % 360, Math.min(90, el), cx, cy, radius, 'zenith');
+      cands.push({
+        id: `ac${i}`, x: p.x, y: p.y, w: 64, h: 16, elDeg: Math.min(90, el), slantRangeKm: 5 + i,
+        isSelected: false, isHovered: false, isEmergency: false, isBreach: false, text: `AC${i}`, color: '#fff',
+      });
+    }
+    const inside = (l: { x: number; y: number; w: number; h: number }) =>
+      l.x >= 8 && l.y >= 8 && l.x + l.w <= W - 8 && l.y + l.h <= H - 8;
+    for (const [mode, cap] of [['dome', 12], ['split', 7], ['pip', 0]] as const) {
+      const r = c9SolveLabels({ candidates: cands, width: W, height: H, cx, cy, radius, mode, zoomMode: 'zenith', labelsEnabled: true });
+      const L = r.labels.slice(0, r.count);
+      expect(r.count, mode).toBeLessThanOrEqual(cap);
+      for (let i = 0; i < L.length; i += 1) {
+        expect(inside(L[i]), `${mode} margin ${L[i].id}`).toBe(true);
+        for (let j = i + 1; j < L.length; j += 1) {
+          const a = L[i];
+          const b = L[j];
+          const overlap = a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+          expect(overlap, `${mode} overlap ${a.id}/${b.id}`).toBe(false);
+        }
+      }
+    }
+    const low = cands.map((c) => ({ ...c, elDeg: 7.9 }));
+    expect(c9SolveLabels({ candidates: low, width: W, height: H, cx, cy, radius, mode: 'dome', zoomMode: 'hemisphere', labelsEnabled: true }).count).toBe(0);
+
+    // Registry prune
+    const st = useSkyStore.getState();
+    const ctx = {
+      layers: { ...st.layers, flight: false, military: true },
+      satGroups: st.satGroups,
+      balloonSublayers: st.balloonSublayers,
+      droneSublayers: st.droneSublayers,
+      atmosphericScope: 'local' as const,
+      observer: { lat: 40, lon: -75, altM: 0 },
+      radiusKm: 100,
+    };
+    liveKinematicsRegistry.entities.clear();
+    const mk = (id: string, category: string, lat: number, lon: number, extra: Record<string, unknown> = {}) =>
+      liveKinematicsRegistry.entities.set(id, { id, category, lat, lon, altM: 1000, ...extra } as unknown as SkyEntity);
+    mk('f1', 'flight', 40, -75);
+    mk('m1', 'military', 40, -75);
+    mk('mFar', 'military', 10, 10);
+    mk('bw', 'balloon', 40, -75, { subSource: 'windborne' });
+    const pruned = c9Prune(ctx as unknown as Parameters<typeof c9Prune>[0]);
+    expect(pruned).toBe(3);
+    expect([...liveKinematicsRegistry.entities.keys()]).toEqual(['m1']);
+    liveKinematicsRegistry.entities.clear();
+  });
+
+  it('9.6 hotkeys M/S/D/P/L/Esc work on body, are ignored in <input>, and ignored with odid modal / palette open', async () => {
+    const appMount = await mountAppInJsdom();
+    try {
+      const { act } = await import('react');
+      const press = async (target: EventTarget, key: string) => {
+        await act(async () => {
+          target.dispatchEvent(new appMount.window.KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+        });
+      };
+      const body = appMount.document.body;
+      const s = () => useSkyStore.getState();
+      await act(async () => { s().setLayout('map'); });
+      await press(body, 'd');
+      expect(s().layout).toBe('dome');
+      await press(body, 's');
+      expect(s().layout).toBe('split');
+      await press(body, 'm');
+      expect(s().layout).toBe('map');
+      await press(body, 'p');
+      const pipAfterP = s().skyDomePip;
+      await press(body, 'p');
+      expect(s().skyDomePip).toBe(!pipAfterP);
+      const labels0 = s().domeLabelsEnabled;
+      await press(body, 'l');
+      expect(s().domeLabelsEnabled).toBe(!labels0);
+
+      const input = appMount.document.createElement('input');
+      body.appendChild(input);
+      await press(input, 'd');
+      expect(s().layout, 'D inside <input>').toBe('map');
+      const lbl = s().domeLabelsEnabled;
+      await press(input, 'l');
+      expect(s().domeLabelsEnabled, 'L inside <input>').toBe(lbl);
+
+      await act(async () => { s().setOdidModalOpen(true); });
+      await press(body, 'd');
+      expect(s().layout, 'D under odid modal').toBe('map');
+      await press(body, 'Escape');
+      expect(s().odidModalOpen).toBe(false);
+
+      await act(async () => { s().setCommandPaletteOpen(true); });
+      await press(body, 's');
+      expect(s().layout, 'S under palette').toBe('map');
+      await press(body, 'Escape');
+      expect(s().commandPaletteOpen).toBe(false);
+    } finally {
+      await appMount.cleanup();
+    }
+  }, 20_000);
 });

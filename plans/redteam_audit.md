@@ -425,3 +425,29 @@ npx vitest run --pool=vmThreads
   - `[DEFECT-S3-07]` Fixed: Scoped Vite proxy unavailability latching strictly to primary proxy `404`/`405` or static HTML fallback responses in `flightsService.ts`, and evaluated `B6` UAS compliance against observer-relative AGL (`altM - observer.altM`) rather than MSL.
   - `[DEFECT-S3-08]` Fixed: Wrapped `.dock-pill` when `.target-inspector.is-open` at `@media (min-width: 768px) and (max-width: 1440px)` in `cockpit.css`, and added `.skydome-legend` in `PolarSkyDome.tsx` lifted clear above mobile dock under `@media (max-width: 767px)`.
 
+
+---
+
+## Sprint 04 — 3D Sky-Dome, Celestial/TCA, Zero-GC & Hotkey Audit (Challenge 9)
+
+**Result: 0 Critical / 0 High / 0 Medium / 0 Low OPEN.** Challenge 9 = 6/6 PASS.
+
+| Probe | Coverage | Outcome |
+|---|---|---|
+| 9.1 | 1,000 targets el -85..-0.01 culled (hemisphere + zenith, zenith el<30); no -5deg/OTH/EL_MIN=-5 in PolarSkyDome.tsx | PASS |
+| 9.2 | Zenith overflight + antimeridian crossing, 61 steps: tangent finite, max step <2deg, ENU projection finite | PASS |
+| 9.3 | Project/unproject <0.01deg, both zoom modes, 156^2..3840x2160, DPR 1/2/3 | PASS |
+| 9.4 | Sun/Moon at +/-89.9 lat, equator, antimeridian, ts 0/NaN/2100 finite+in range; TCA speed 0, receding, approaching 0<tca<=600 | PASS |
+| 9.5 | 80 aircraft in 15deg zenith cone: caps 12/7/0, no overlap, 8px margins, el<8 hidden; prune evicts disabled layer + GLOBAL->LOCAL synchronously | PASS |
+| 9.6 | Hotkeys M/S/D/P/L/Esc on body; ignored in input, odid modal, palette | PASS |
+
+| Severity | Open | Notes |
+|---|---|---|
+| Critical | 0 | |
+| High | 0 | |
+| Medium | 0 | |
+| Low | 0 | |
+
+**Test maintenance (not src defects):** sw.js assertions bumped to `krunked-skymap-v4` (prune v1/v2/v3); Sprint 02 polar-trail prune assertion re-anchored because Sprint 04 removed the comment markers (prune logic intact at PolarSkyDome.tsx ~L1656-1659).
+
+Suite: 
