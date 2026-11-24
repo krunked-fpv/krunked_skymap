@@ -1,6 +1,6 @@
 export type SkyCategory = 'flight' | 'military' | 'satellite' | 'balloon' | 'drone';
 
-export type FeedKey = 'flights' | 'satellites' | 'balloons' | 'airspace' | 'drones';
+export type FeedKey = 'flights' | 'military' | 'satellites' | 'balloons' | 'airspace' | 'drones';
 
 export type FeedHealthStatus =
   | 'idle'
@@ -19,7 +19,27 @@ export type LayoutMode = 'split' | 'map' | 'dome';
 
 export type OrbitalScope = 'cylinder' | 'hemisphere';
 
+export type AtmosphericScope = 'local' | 'global';
+
 export type SatelliteGroup = 'stations' | 'visual' | 'starlink';
+
+export type BalloonSubSource = 'windborne' | 'sondehub' | 'sondehub-amateur' | 'adsb-lta';
+
+export type DroneSubSource = 'adsb-uas' | 'odid-live' | 'odid-sim';
+
+export type AdsbSourceFeed = 'point' | 'mil' | 'ladd' | 'pia' | 'opensky';
+
+export interface BalloonSublayerState {
+  windborne: boolean;
+  sondehub: boolean;
+  adsbLta: boolean;
+}
+
+export interface DroneSublayerState {
+  liveUas: boolean;
+  airspace: boolean;
+  simOdid: boolean;
+}
 
 export const CATEGORY_COLORS: Record<SkyCategory, string> = {
   flight: '#22D3EE',
@@ -163,6 +183,8 @@ export interface FlightEntity extends BaseSkyEntity {
   isMilitary: boolean;
   isLadd?: boolean;
   isPia?: boolean;
+  adsbCategory?: string;
+  sourceFeed?: AdsbSourceFeed;
   airframeClass: 'heavy' | 'jet' | 'prop' | 'heli' | 'fast-mil';
 }
 
@@ -183,6 +205,12 @@ export interface BalloonEntity extends BaseSkyEntity {
   category: 'balloon';
   serial: string;
   sondeType: string;
+  subSource?: BalloonSubSource;
+  constellationId?: string;
+  icaoHex?: string;
+  registration?: string;
+  squawk?: string;
+  isCachedSeed?: boolean;
   freqMHz?: number;
   tempC?: number;
   pressureHPa?: number;
@@ -195,6 +223,16 @@ export interface DroneEntity extends BaseSkyEntity {
   category: 'drone';
   uasId: string;
   uaType: 'multirotor' | 'fixed-wing' | 'vtol';
+  subSource?: DroneSubSource;
+  icaoHex?: string;
+  registration?: string;
+  aircraftType?: string;
+  adsbCategory?: string;
+  squawk?: string;
+  isMilitary?: boolean;
+  isLadd?: boolean;
+  isPia?: boolean;
+  hasOperatorLocation?: boolean;
   altAglM: number;
   operatorLat: number;
   operatorLon: number;
@@ -217,6 +255,7 @@ export interface FeedTelemetryState {
   errorMsg?: string;
   httpStatus?: number;
   count: number;
+  sourceBreakdown?: string;
 }
 
 export interface OpenDroneIdConfig {

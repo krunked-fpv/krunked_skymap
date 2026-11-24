@@ -2,8 +2,11 @@ import { create } from 'zustand';
 import {
   AEROSPACE_PRESETS,
   type AirspaceData,
+  type AtmosphericScope,
   type BalloonEntity,
+  type BalloonSublayerState,
   type DroneEntity,
+  type DroneSublayerState,
   type FeedKey,
   type FeedTelemetryState,
   type FlightEntity,
@@ -27,8 +30,11 @@ export interface SkyCounts extends Record<SkyCategory, number> {
 export interface LiveKinematicsRegistry {
   entities: Map<string, SkyEntity>;
   rawFlights: Map<string, FlightEntity>;
+  rawGlobalFlights: Map<string, FlightEntity>;
   rawBalloons: Map<string, BalloonEntity>;
+  rawAdsbBalloons: Map<string, BalloonEntity>;
   rawDrones: Map<string, DroneEntity>;
+  rawAdsbDrones: Map<string, DroneEntity>;
   satellites: Map<string, SatelliteEntity>;
   orbitOverlay: SatelliteOrbitOverlay | null;
   version: number;
@@ -37,8 +43,11 @@ export interface LiveKinematicsRegistry {
 export const liveKinematicsRegistry: LiveKinematicsRegistry = {
   entities: new Map(),
   rawFlights: new Map(),
+  rawGlobalFlights: new Map(),
   rawBalloons: new Map(),
+  rawAdsbBalloons: new Map(),
   rawDrones: new Map(),
+  rawAdsbDrones: new Map(),
   satellites: new Map(),
   orbitOverlay: null,
   version: 0,
@@ -51,6 +60,8 @@ export interface UrlHydrationPatch {
   units?: UnitSystem;
   layout?: LayoutMode;
   orbitalScope?: OrbitalScope;
+  atmosphericScope?: AtmosphericScope;
+  skyDomePip?: boolean;
   selectedId?: string | null;
 }
 
@@ -59,10 +70,14 @@ export interface SkyStoreState {
   radiusKm: number;
   layers: Record<SkyCategory, boolean>;
   satGroups: Record<SatelliteGroup, boolean>;
+  balloonSublayers: BalloonSublayerState;
+  droneSublayers: DroneSublayerState;
   fullConstellation: boolean;
   orbitalScope: OrbitalScope;
+  atmosphericScope: AtmosphericScope;
   units: UnitSystem;
   layout: LayoutMode;
+  skyDomePip: boolean;
   audioEnabled: boolean;
   audioVolume: number;
   sweepEnabled: boolean;
@@ -77,6 +92,9 @@ export interface SkyStoreState {
   followSelected: boolean;
   inspectorOpen: boolean;
   odidModalOpen: boolean;
+  commandPaletteOpen: boolean;
+  diagnosticsOpen: boolean;
+  settingsOpen: boolean;
   odidConfig: OpenDroneIdConfig;
   feeds: Record<FeedKey, FeedTelemetryState>;
   airspace: AirspaceData;
@@ -92,10 +110,18 @@ export interface SkyStoreState {
   toggleLayer: (category: SkyCategory) => void;
   setLayer: (category: SkyCategory, enabled: boolean) => void;
   toggleSatGroup: (group: SatelliteGroup) => void;
+  toggleBalloonSublayer: (key: keyof BalloonSublayerState) => void;
+  setBalloonSublayer: (key: keyof BalloonSublayerState, enabled: boolean) => void;
+  toggleDroneSublayer: (key: keyof DroneSublayerState) => void;
+  setDroneSublayer: (key: keyof DroneSublayerState, enabled: boolean) => void;
   setFullConstellation: (enabled: boolean) => void;
   setOrbitalScope: (scope: OrbitalScope) => void;
+  setAtmosphericScope: (scope: AtmosphericScope) => void;
+  toggleAtmosphericScope: () => void;
   setUnits: (units: UnitSystem) => void;
   setLayout: (layout: LayoutMode) => void;
+  setSkyDomePip: (enabled: boolean) => void;
+  toggleSkyDomePip: () => void;
   setAudioEnabled: (enabled: boolean) => void;
   setAudioVolume: (volume: number) => void;
   setSweepEnabled: (enabled: boolean) => void;
@@ -108,6 +134,10 @@ export interface SkyStoreState {
   setFollowSelected: (follow: boolean) => void;
   setInspectorOpen: (open: boolean) => void;
   setOdidModalOpen: (open: boolean) => void;
+  setCommandPaletteOpen: (open: boolean) => void;
+  setDiagnosticsOpen: (open: boolean) => void;
+  setSettingsOpen: (open: boolean) => void;
+  closeAllPopovers: () => void;
   updateOdidConfig: (patch: Partial<OpenDroneIdConfig>) => void;
   setFeedState: (feed: FeedKey, patch: Partial<FeedTelemetryState>) => void;
   tickCountdowns: () => void;
@@ -135,6 +165,14 @@ const createInitialFeeds = (): Record<FeedKey, FeedTelemetryState> => ({
     nextRefreshSec: 10,
     intervalSec: 10,
     provider: 'adsb-cascade',
+    count: 0,
+  },
+  military: {
+    status: 'idle',
+    lastUpdatedMs: null,
+    nextRefreshSec: 18,
+    intervalSec: 18,
+    provider: 'adsb-mil-ladd-pia',
     count: 0,
   },
   satellites: {
@@ -192,10 +230,22 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     visual: true,
     starlink: true,
   },
+  balloonSublayers: {
+    windborne: true,
+    sondehub: true,
+    adsbLta: true,
+  },
+  droneSublayers: {
+    liveUas: true,
+    airspace: true,
+    simOdid: false,
+  },
   fullConstellation: false,
   orbitalScope: 'hemisphere',
+  atmosphericScope: 'global',
   units: 'aviation',
   layout: 'split',
+  skyDomePip: true,
   audioEnabled: false,
   audioVolume: 0.35,
   sweepEnabled: true,
@@ -210,6 +260,9 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   followSelected: false,
   inspectorOpen: false,
   odidModalOpen: false,
+  commandPaletteOpen: false,
+  diagnosticsOpen: false,
+  settingsOpen: false,
   odidConfig: {
     simulatorEnabled: false,
     endpointUrl: '',
@@ -253,10 +306,48 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     set((state) => ({
       satGroups: { ...state.satGroups, [group]: !state.satGroups[group] },
     })),
+  toggleBalloonSublayer: (key) =>
+    set((state) => ({
+      balloonSublayers: { ...state.balloonSublayers, [key]: !state.balloonSublayers[key] },
+    })),
+  setBalloonSublayer: (key, enabled) =>
+    set((state) => ({
+      balloonSublayers: { ...state.balloonSublayers, [key]: enabled },
+    })),
+  toggleDroneSublayer: (key) =>
+    set((state) => {
+      const nextVal = !state.droneSublayers[key];
+      const nextDroneSublayers = { ...state.droneSublayers, [key]: nextVal };
+      if (key === 'simOdid') {
+        return {
+          droneSublayers: nextDroneSublayers,
+          odidConfig: { ...state.odidConfig, simulatorEnabled: nextVal },
+        };
+      }
+      return { droneSublayers: nextDroneSublayers };
+    }),
+  setDroneSublayer: (key, enabled) =>
+    set((state) => {
+      const nextDroneSublayers = { ...state.droneSublayers, [key]: enabled };
+      if (key === 'simOdid') {
+        return {
+          droneSublayers: nextDroneSublayers,
+          odidConfig: { ...state.odidConfig, simulatorEnabled: enabled },
+        };
+      }
+      return { droneSublayers: nextDroneSublayers };
+    }),
   setFullConstellation: (fullConstellation) => set({ fullConstellation }),
   setOrbitalScope: (orbitalScope) => set({ orbitalScope }),
+  setAtmosphericScope: (atmosphericScope) => set({ atmosphericScope }),
+  toggleAtmosphericScope: () =>
+    set((state) => ({
+      atmosphericScope: state.atmosphericScope === 'global' ? 'local' : 'global',
+    })),
   setUnits: (units) => set({ units }),
   setLayout: (layout) => set({ layout }),
+  setSkyDomePip: (skyDomePip) => set({ skyDomePip }),
+  toggleSkyDomePip: () => set((state) => ({ skyDomePip: !state.skyDomePip })),
   setAudioEnabled: (audioEnabled) => set({ audioEnabled }),
   setAudioVolume: (audioVolume) =>
     set({ audioVolume: Math.max(0, Math.min(1, audioVolume)) }),
@@ -286,10 +377,41 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
   setFollowSelected: (followSelected) => set({ followSelected }),
   setInspectorOpen: (inspectorOpen) => set({ inspectorOpen }),
   setOdidModalOpen: (odidModalOpen) => set({ odidModalOpen }),
-  updateOdidConfig: (patch) =>
+  setCommandPaletteOpen: (commandPaletteOpen) =>
     set((state) => ({
-      odidConfig: { ...state.odidConfig, ...patch },
+      commandPaletteOpen,
+      diagnosticsOpen: commandPaletteOpen ? false : state.diagnosticsOpen,
+      settingsOpen: commandPaletteOpen ? false : state.settingsOpen,
     })),
+  setDiagnosticsOpen: (diagnosticsOpen) =>
+    set((state) => ({
+      diagnosticsOpen,
+      commandPaletteOpen: diagnosticsOpen ? false : state.commandPaletteOpen,
+      settingsOpen: diagnosticsOpen ? false : state.settingsOpen,
+    })),
+  setSettingsOpen: (settingsOpen) =>
+    set((state) => ({
+      settingsOpen,
+      commandPaletteOpen: settingsOpen ? false : state.commandPaletteOpen,
+      diagnosticsOpen: settingsOpen ? false : state.diagnosticsOpen,
+    })),
+  closeAllPopovers: () =>
+    set({
+      commandPaletteOpen: false,
+      diagnosticsOpen: false,
+      settingsOpen: false,
+    }),
+  updateOdidConfig: (patch) =>
+    set((state) => {
+      const nextOdidConfig = { ...state.odidConfig, ...patch };
+      if (patch.simulatorEnabled !== undefined) {
+        return {
+          odidConfig: nextOdidConfig,
+          droneSublayers: { ...state.droneSublayers, simOdid: patch.simulatorEnabled },
+        };
+      }
+      return { odidConfig: nextOdidConfig };
+    }),
   setFeedState: (feed, patch) =>
     set((state) => ({
       feeds: {
@@ -299,14 +421,16 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
     })),
   tickCountdowns: () =>
     set((state) => {
+      let changed = false;
       const nextFeeds = { ...state.feeds };
       (Object.keys(nextFeeds) as FeedKey[]).forEach((key) => {
         const curr = nextFeeds[key];
         if (curr.nextRefreshSec > 0) {
           nextFeeds[key] = { ...curr, nextRefreshSec: curr.nextRefreshSec - 1 };
+          changed = true;
         }
       });
-      return { feeds: nextFeeds };
+      return changed ? { feeds: nextFeeds } : {};
     }),
   setAirspace: (airspace) => set({ airspace }),
   setNearestSondeHint: (nearestSondeHint) => set({ nearestSondeHint }),
@@ -328,6 +452,8 @@ export const useSkyStore = create<SkyStoreState>((set) => ({
       units: patch.units ?? state.units,
       layout: patch.layout ?? state.layout,
       orbitalScope: patch.orbitalScope ?? state.orbitalScope,
+      atmosphericScope: patch.atmosphericScope ?? state.atmosphericScope,
+      skyDomePip: patch.skyDomePip ?? state.skyDomePip,
       selectedId: patch.selectedId !== undefined ? patch.selectedId : state.selectedId,
       inspectorOpen:
         patch.selectedId !== undefined && patch.selectedId !== null
