@@ -49,11 +49,53 @@ const DEG_TO_RAD = Math.PI / 180;
 const MONO_FONT =
   "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace";
 
-interface LabelBox {
+export const MAP_OUTER_EDGE_MARGIN_PX = 6;
+export const MAP_SPLIT_SEAM_MARGIN_PX = 10;
+export const MAP_SPRITE_EXCLUSION_RADIUS_PX = 13;
+export const MAP_SPRITE_SEAM_CLEARANCE_PX = 14;
+export const MAP_TOOLTIP_WIDTH_PX = 220;
+export const MAP_TOOLTIP_MAX_HEIGHT_PX = 104;
+export const MAP_TOOLTIP_EDGE_MARGIN_PX = 8;
+export const MAP_TOOLTIP_SEAM_MARGIN_PX = 10;
+const MAP_TOOLTIP_CURSOR_OFFSET_PX = 14;
+
+export type SplitSeamSide = 'bottom' | 'right' | 'none';
+
+export interface LabelBox {
   x: number;
   y: number;
   w: number;
   h: number;
+}
+
+export interface ViewportRectLike {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+export interface LayoutViewportOptions {
+  mapRect?: Partial<ViewportRectLike> | null;
+  domeRect?: Partial<ViewportRectLike> | null;
+  isMobile?: boolean;
+}
+
+export interface ExposedMapViewport {
+  width: number;
+  height: number;
+  seam: SplitSeamSide;
+  padding: maplibregl.PaddingOptions;
+}
+
+export interface ClampedTooltipRect {
+  left: number;
+  top: number;
+  width: number;
+  maxHeight: number;
+  visible: boolean;
 }
 
 function boxesOverlap(a: LabelBox, b: LabelBox, padding = 0): boolean {
@@ -65,7 +107,7 @@ function boxesOverlap(a: LabelBox, b: LabelBox, padding = 0): boolean {
   );
 }
 
-function overlapsAny(box: LabelBox, existing: LabelBox[], padding = 0): boolean {
+function overlapsAny(box: LabelBox, existing: readonly LabelBox[], padding = 0): boolean {
   for (let i = 0; i < existing.length; i += 1) {
     if (boxesOverlap(box, existing[i], padding)) return true;
   }
@@ -74,19 +116,21 @@ function overlapsAny(box: LabelBox, existing: LabelBox[], padding = 0): boolean 
 
 function findAvailableLabelSlot(
   slotCandidates: readonly [LabelBox, LabelBox, LabelBox, LabelBox],
-  width: number,
-  height: number,
-  spriteBoxes: LabelBox[],
-  placedLabelBoxes: LabelBox[],
+  minX: number,
+  minY: number,
+  maxRight: number,
+  maxBottom: number,
+  spriteBoxes: readonly LabelBox[],
+  placedLabelBoxes: readonly LabelBox[],
   checkSprites: boolean
 ): LabelBox | null {
   for (let s = 0; s < 4; s += 1) {
     const candidateBox = slotCandidates[s];
     if (
-      candidateBox.x < 6 ||
-      candidateBox.x + candidateBox.w > width - 6 ||
-      candidateBox.y < 6 ||
-      candidateBox.y + candidateBox.h > height - 6
+      candidateBox.x < minX ||
+      candidateBox.x + candidateBox.w > maxRight ||
+      candidateBox.y < minY ||
+      candidateBox.y + candidateBox.h > maxBottom
     ) {
       continue;
     }
@@ -98,6 +142,171 @@ function findAvailableLabelSlot(
     }
   }
   return null;
+}
+
+export function isPointInExposedMapViewport(
+  x: number,
+  y: number,
+  exposedWidth: number,
+  exposedHeight: number
+): boolean {
+  return (
+    Number.isFinite(x) &&
+    Number.isFinite(y) &&
+    Number.isFinite(exposedWidth) &&
+    Number.isFinite(exposedHeight) &&
+    exposedWidth > 0 &&
+    exposedHeight > 0 &&
+    x >= 0 &&
+    y >= 0 &&
+    x < exposedWidth &&
+    y < exposedHeight
+  );
+}
+
+export function isMapLabelAnchorEligible(
+  px: number,
+  py: number,
+  exposedWidth: number,
+  exposedHeight: number,
+  seam: SplitSeamSide
+): boolean {
+  if (
+    !Number.isFinite(px) ||
+    !Number.isFinite(py) ||
+    !Number.isFinite(exposedWidth) ||
+    !Number.isFinite(exposedHeight) ||
+    exposedWidth <= 0 ||
+    exposedHeight <= 0 ||
+    px < 0 ||
+    py < 0 ||
+    px > exposedWidth ||
+    py > exposedHeight
+  ) {
+    return false;
+  }
+  if (seam === 'bottom' && py > exposedHeight - MAP_SPRITE_SEAM_CLEARANCE_PX) {
+    return false;
+  }
+  if (seam === 'right' && px > exposedWidth - MAP_SPRITE_SEAM_CLEARANCE_PX) {
+    return false;
+  }
+  return true;
+}
+
+export function solveMapLabelBox(
+  px: number,
+  py: number,
+  boxW: number,
+  boxH: number,
+  exposedWidth: number,
+  exposedHeight: number,
+  seam: SplitSeamSide,
+  mustShow: boolean,
+  isAlert: boolean,
+  spriteBoxes: readonly LabelBox[],
+  placedLabelBoxes: readonly LabelBox[],
+  slotScratch?: [LabelBox, LabelBox, LabelBox, LabelBox],
+  outBox?: LabelBox,
+  offset = 14
+): LabelBox | null {
+  if (!isMapLabelAnchorEligible(px, py, exposedWidth, exposedHeight, seam)) {
+    return null;
+  }
+
+  const minX = MAP_OUTER_EDGE_MARGIN_PX;
+  const minY = MAP_OUTER_EDGE_MARGIN_PX;
+  const maxRight =
+    exposedWidth - (seam === 'right' ? MAP_SPLIT_SEAM_MARGIN_PX : MAP_OUTER_EDGE_MARGIN_PX);
+  const maxBottom =
+    exposedHeight - (seam === 'bottom' ? MAP_SPLIT_SEAM_MARGIN_PX : MAP_OUTER_EDGE_MARGIN_PX);
+
+  if (
+    !Number.isFinite(boxW) ||
+    !Number.isFinite(boxH) ||
+    boxW <= 0 ||
+    boxH <= 0 ||
+    maxRight - minX < boxW ||
+    maxBottom - minY < boxH
+  ) {
+    return null;
+  }
+
+  const slots: [LabelBox, LabelBox, LabelBox, LabelBox] = slotScratch ?? [
+    { x: 0, y: 0, w: 0, h: 0 },
+    { x: 0, y: 0, w: 0, h: 0 },
+    { x: 0, y: 0, w: 0, h: 0 },
+    { x: 0, y: 0, w: 0, h: 0 },
+  ];
+
+  const clampedSideY = Math.max(minY, Math.min(maxBottom - boxH, py - boxH / 2));
+  const clampedCenterX = Math.max(minX, Math.min(maxRight - boxW, px - boxW / 2));
+
+  slots[0].x = px + offset;
+  slots[0].y = clampedSideY;
+  slots[0].w = boxW;
+  slots[0].h = boxH;
+
+  slots[1].x = px - offset - boxW;
+  slots[1].y = clampedSideY;
+  slots[1].w = boxW;
+  slots[1].h = boxH;
+
+  slots[2].x = clampedCenterX;
+  slots[2].y = py - offset - boxH;
+  slots[2].w = boxW;
+  slots[2].h = boxH;
+
+  slots[3].x = clampedCenterX;
+  slots[3].y = py + offset;
+  slots[3].w = boxW;
+  slots[3].h = boxH;
+
+  let chosenSlot = findAvailableLabelSlot(
+    slots,
+    minX,
+    minY,
+    maxRight,
+    maxBottom,
+    spriteBoxes,
+    placedLabelBoxes,
+    true
+  );
+
+  if (!chosenSlot && isAlert && !mustShow) {
+    chosenSlot = findAvailableLabelSlot(
+      slots,
+      minX,
+      minY,
+      maxRight,
+      maxBottom,
+      spriteBoxes,
+      placedLabelBoxes,
+      false
+    );
+  }
+
+  let lx = 0;
+  let ly = 0;
+  if (chosenSlot) {
+    lx = chosenSlot.x;
+    ly = chosenSlot.y;
+  } else {
+    if (!mustShow) return null;
+    const preferLeft = px + offset + boxW > maxRight;
+    lx = Math.max(
+      minX,
+      Math.min(maxRight - boxW, preferLeft ? px - offset - boxW : px + offset)
+    );
+    ly = Math.max(minY, Math.min(maxBottom - boxH, py - boxH / 2));
+  }
+
+  const target = outBox ?? { x: 0, y: 0, w: 0, h: 0 };
+  target.x = lx;
+  target.y = ly;
+  target.w = boxW;
+  target.h = boxH;
+  return target;
 }
 
 function traceRoundedRect(
@@ -301,57 +510,316 @@ const ZERO_CAMERA_PADDING: maplibregl.PaddingOptions = {
   right: 0,
 };
 
-export function computeLayoutCameraPadding(
+function resolveMobileBreakpointFallback(
+  containerWidth: number,
+  effectiveWidth: number,
+  explicitIsMobile?: boolean
+): boolean {
+  if (typeof explicitIsMobile === 'boolean') {
+    return explicitIsMobile;
+  }
+  let mqlMatches: boolean | undefined;
+  if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+    try {
+      mqlMatches = Boolean(window.matchMedia('(max-width: 767px)').matches);
+    } catch {
+      mqlMatches = undefined;
+    }
+  }
+  if (!(Number.isFinite(containerWidth) && containerWidth > 0)) {
+    if (typeof mqlMatches === 'boolean') return mqlMatches;
+    return effectiveWidth <= 767;
+  }
+  if (
+    typeof mqlMatches === 'boolean' &&
+    typeof window !== 'undefined' &&
+    Number.isFinite(window.innerWidth) &&
+    window.innerWidth > 0 &&
+    Math.abs(containerWidth - window.innerWidth) <= 2
+  ) {
+    return mqlMatches;
+  }
+  return effectiveWidth <= 767;
+}
+
+function queryLiveSplitDomeRect(): Partial<ViewportRectLike> | null {
+  if (typeof document === 'undefined') return null;
+  const domeEl = document.querySelector('[data-pane="dome"]');
+  if (!domeEl) return null;
+  const stageEl = domeEl.closest('[data-layout]');
+  const stageLayout = stageEl?.getAttribute('data-layout');
+  if (stageLayout && stageLayout !== 'split') {
+    return null;
+  }
+  return domeEl.getBoundingClientRect();
+}
+
+function isFiniteNum(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function computeSplitPaddingInto(
   layout: LayoutMode,
   containerWidth: number,
-  containerHeight: number
-): maplibregl.PaddingOptions {
+  containerHeight: number,
+  outPadding: maplibregl.PaddingOptions,
+  options?: LayoutViewportOptions
+): boolean {
+  outPadding.top = 0;
+  outPadding.bottom = 0;
+  outPadding.left = 0;
+  outPadding.right = 0;
+
   if (layout !== 'split') {
-    return ZERO_CAMERA_PADDING;
+    return true;
   }
 
-  const width =
+  const rawMapRect =
+    options?.mapRect !== undefined
+      ? options.mapRect
+      : options?.domeRect !== undefined
+        ? null
+        : typeof document !== 'undefined'
+          ? (document.querySelector('[data-pane="map"]')?.getBoundingClientRect() ?? null)
+          : null;
+
+  const width: number =
     Number.isFinite(containerWidth) && containerWidth > 0
       ? containerWidth
-      : typeof window !== 'undefined' && Number.isFinite(window.innerWidth) && window.innerWidth > 0
-        ? window.innerWidth
-        : 1280;
-  const height =
+      : rawMapRect && isFiniteNum(rawMapRect.width) && rawMapRect.width > 0
+        ? rawMapRect.width
+        : typeof window !== 'undefined' && Number.isFinite(window.innerWidth) && window.innerWidth > 0
+          ? window.innerWidth
+          : 1280;
+
+  const height: number =
     Number.isFinite(containerHeight) && containerHeight > 0
       ? containerHeight
-      : typeof window !== 'undefined' && Number.isFinite(window.innerHeight) && window.innerHeight > 0
-        ? window.innerHeight
-        : 720;
+      : rawMapRect && isFiniteNum(rawMapRect.height) && rawMapRect.height > 0
+        ? rawMapRect.height
+        : typeof window !== 'undefined' && Number.isFinite(window.innerHeight) && window.innerHeight > 0
+          ? window.innerHeight
+          : 720;
 
-  const isMobile = width <= 767;
+  const isMobile = resolveMobileBreakpointFallback(containerWidth, width, options?.isMobile);
+
   const domeRect =
-    typeof document !== 'undefined'
-      ? document.querySelector('[data-pane="dome"]')?.getBoundingClientRect()
-      : undefined;
+    options?.domeRect !== undefined ? options.domeRect : queryLiveSplitDomeRect();
+
+  const mapLeft = rawMapRect && isFiniteNum(rawMapRect.left) ? rawMapRect.left : 0;
+  const mapTop = rawMapRect && isFiniteNum(rawMapRect.top) ? rawMapRect.top : 0;
+  const mapRight =
+    rawMapRect && isFiniteNum(rawMapRect.right) ? rawMapRect.right : mapLeft + width;
+  const mapBottom =
+    rawMapRect && isFiniteNum(rawMapRect.bottom) ? rawMapRect.bottom : mapTop + height;
+
+  if (
+    domeRect &&
+    isFiniteNum(domeRect.width) &&
+    domeRect.width > 0 &&
+    isFiniteNum(domeRect.height) &&
+    domeRect.height > 0
+  ) {
+    const domeW = domeRect.width;
+    const domeH = domeRect.height;
+    const domeBottom = domeRect.bottom;
+    const domeTop = domeRect.top;
+    const hasBottomEdge = isFiniteNum(domeBottom) && domeBottom > 0;
+    const bottomAligned =
+      !hasBottomEdge || Math.abs(domeBottom - mapBottom) <= Math.max(12, height * 0.06);
+    const isBottomDocked =
+      domeW >= width * 0.85 && domeH <= height * 0.85 && bottomAligned;
+
+    if (isBottomDocked && (options?.domeRect !== undefined || isMobile || width <= 767)) {
+      const rawBottom =
+        isFiniteNum(domeTop) && hasBottomEdge && domeBottom > domeTop && domeTop > mapTop
+          ? mapBottom - domeTop
+          : domeH;
+      outPadding.bottom = Math.max(
+        0,
+        Math.min(Math.round(height * 0.85), Math.ceil(rawBottom - 1e-6))
+      );
+      return true;
+    }
+
+    const domeRight = domeRect.right;
+    const domeLeft = domeRect.left;
+    const hasRightEdge = isFiniteNum(domeRight) && domeRight > 0;
+    const rightAligned =
+      !hasRightEdge || Math.abs(domeRight - mapRight) <= Math.max(12, width * 0.06);
+    const isRightDocked =
+      domeH >= height * 0.85 && domeW <= width * 0.85 && rightAligned;
+
+    if (isRightDocked && (options?.domeRect !== undefined || (!isMobile && width > 767))) {
+      const rawRight =
+        isFiniteNum(domeLeft) && hasRightEdge && domeRight > domeLeft && domeLeft > mapLeft
+          ? mapRight - domeLeft
+          : domeW;
+      outPadding.right = Math.max(
+        0,
+        Math.min(Math.round(width * 0.85), Math.ceil(rawRight - 1e-6))
+      );
+      return true;
+    }
+  }
 
   if (isMobile) {
     const fallbackH = Math.round(height * 0.48);
-    const measuredH =
-      domeRect &&
-      Number.isFinite(domeRect.height) &&
-      domeRect.height > 0 &&
-      domeRect.height < height * 0.85
-        ? Math.round(domeRect.height)
-        : fallbackH;
-    const domeH = Math.max(0, Math.min(Math.round(height * 0.85), measuredH));
-    return { top: 0, bottom: domeH, left: 0, right: 0 };
+    outPadding.bottom = Math.max(0, Math.min(Math.round(height * 0.85), fallbackH));
+    return false;
   }
 
   const fallbackW = Math.round(Math.min(680, Math.max(340, width * 0.42)));
-  const measuredW =
-    domeRect &&
-    Number.isFinite(domeRect.width) &&
-    domeRect.width > 0 &&
-    domeRect.width < width * 0.85
-      ? Math.round(domeRect.width)
-      : fallbackW;
-  const domeW = Math.max(0, Math.min(Math.round(width * 0.85), measuredW));
-  return { top: 0, bottom: 0, left: 0, right: domeW };
+  outPadding.right = Math.max(0, Math.min(Math.round(width * 0.85), fallbackW));
+  return false;
+}
+
+export function computeLayoutCameraPadding(
+  layout: LayoutMode,
+  containerWidth: number,
+  containerHeight: number,
+  options?: LayoutViewportOptions
+): maplibregl.PaddingOptions {
+  if (layout !== 'split') {
+    return { ...ZERO_CAMERA_PADDING };
+  }
+  const out: maplibregl.PaddingOptions = { top: 0, bottom: 0, left: 0, right: 0 };
+  computeSplitPaddingInto(layout, containerWidth, containerHeight, out, options);
+  return out;
+}
+
+function computeExposedMapViewportInto(
+  layout: LayoutMode,
+  containerWidth: number,
+  containerHeight: number,
+  outViewport: ExposedMapViewport,
+  options?: LayoutViewportOptions
+): boolean {
+  if (
+    !Number.isFinite(containerWidth) ||
+    !Number.isFinite(containerHeight) ||
+    containerWidth <= 0 ||
+    containerHeight <= 0 ||
+    layout === 'dome'
+  ) {
+    outViewport.width = 0;
+    outViewport.height = 0;
+    outViewport.seam = 'none';
+    outViewport.padding.top = 0;
+    outViewport.padding.bottom = 0;
+    outViewport.padding.left = 0;
+    outViewport.padding.right = 0;
+    return true;
+  }
+
+  if (layout === 'map') {
+    outViewport.width = containerWidth;
+    outViewport.height = containerHeight;
+    outViewport.seam = 'none';
+    outViewport.padding.top = 0;
+    outViewport.padding.bottom = 0;
+    outViewport.padding.left = 0;
+    outViewport.padding.right = 0;
+    return true;
+  }
+
+  const measured = computeSplitPaddingInto(
+    'split',
+    containerWidth,
+    containerHeight,
+    outViewport.padding,
+    options
+  );
+  outViewport.seam =
+    outViewport.padding.bottom > 0
+      ? 'bottom'
+      : outViewport.padding.right > 0
+        ? 'right'
+        : 'none';
+  outViewport.width = Math.max(
+    0,
+    containerWidth - outViewport.padding.left - outViewport.padding.right
+  );
+  outViewport.height = Math.max(
+    0,
+    containerHeight - outViewport.padding.top - outViewport.padding.bottom
+  );
+  return measured;
+}
+
+export function computeExposedMapViewport(
+  layout: LayoutMode,
+  containerWidth: number,
+  containerHeight: number,
+  options?: LayoutViewportOptions
+): ExposedMapViewport {
+  const out: ExposedMapViewport = {
+    width: 0,
+    height: 0,
+    seam: 'none',
+    padding: { top: 0, bottom: 0, left: 0, right: 0 },
+  };
+  computeExposedMapViewportInto(layout, containerWidth, containerHeight, out, options);
+  return out;
+}
+
+export function clampMapTooltipPosition(
+  pointerX: number,
+  pointerY: number,
+  layout: LayoutMode,
+  containerWidth: number,
+  containerHeight: number,
+  options?: LayoutViewportOptions
+): ClampedTooltipRect {
+  const vp = computeExposedMapViewport(layout, containerWidth, containerHeight, options);
+  if (
+    layout === 'dome' ||
+    vp.width <= 0 ||
+    vp.height <= 0 ||
+    !Number.isFinite(pointerX) ||
+    !Number.isFinite(pointerY)
+  ) {
+    return { left: 0, top: 0, width: 0, maxHeight: 0, visible: false };
+  }
+
+  if (layout === 'split' && !isPointInExposedMapViewport(pointerX, pointerY, vp.width, vp.height)) {
+    return { left: 0, top: 0, width: 0, maxHeight: 0, visible: false };
+  }
+
+  const leftMargin = MAP_TOOLTIP_EDGE_MARGIN_PX;
+  const rightMargin =
+    vp.seam === 'right' ? MAP_TOOLTIP_SEAM_MARGIN_PX : MAP_TOOLTIP_EDGE_MARGIN_PX;
+  const topMargin = MAP_TOOLTIP_EDGE_MARGIN_PX;
+  const bottomMargin =
+    vp.seam === 'bottom' ? MAP_TOOLTIP_SEAM_MARGIN_PX : MAP_TOOLTIP_EDGE_MARGIN_PX;
+
+  const availW = vp.width - leftMargin - rightMargin;
+  const availH = vp.height - topMargin - bottomMargin;
+  if (availW < 110 || availH < 60) {
+    return { left: 0, top: 0, width: 0, maxHeight: 0, visible: false };
+  }
+
+  const width = Math.min(MAP_TOOLTIP_WIDTH_PX, availW);
+  const maxHeight = Math.min(MAP_TOOLTIP_MAX_HEIGHT_PX, availH);
+  const maxLeft = vp.width - rightMargin - width;
+  const maxTop = vp.height - bottomMargin - maxHeight;
+
+  const rawLeft =
+    pointerX + MAP_TOOLTIP_CURSOR_OFFSET_PX + width <= vp.width - rightMargin
+      ? pointerX + MAP_TOOLTIP_CURSOR_OFFSET_PX
+      : pointerX - MAP_TOOLTIP_CURSOR_OFFSET_PX - width;
+  const rawTop =
+    pointerY + MAP_TOOLTIP_CURSOR_OFFSET_PX + maxHeight <= vp.height - bottomMargin
+      ? pointerY + MAP_TOOLTIP_CURSOR_OFFSET_PX
+      : pointerY - MAP_TOOLTIP_CURSOR_OFFSET_PX - maxHeight;
+
+  return {
+    left: Math.max(leftMargin, Math.min(maxLeft, rawLeft)),
+    top: Math.max(topMargin, Math.min(maxTop, rawTop)),
+    width,
+    maxHeight,
+    visible: true,
+  };
 }
 
 function resolveEntityColor(entity: SkyEntity): string {
@@ -1388,7 +1856,27 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
   const [webglError, setWebglError] = useState<string | null>(null);
   const [hoverTip, setHoverTip] = useState<HoverTooltipState | null>(null);
+  const [, setTooltipViewportTick] = useState(0);
   const hoverCoordsRef = useRef<{ id: string; x: number; y: number } | null>(null);
+  const liveViewportRef = useRef<
+    ExposedMapViewport & {
+      layout: LayoutMode;
+      containerWidth: number;
+      containerHeight: number;
+      isMobile: boolean;
+      measuredDome: boolean;
+    }
+  >({
+    layout: useSkyStore.getState().layout,
+    containerWidth: 0,
+    containerHeight: 0,
+    isMobile: false,
+    measuredDome: false,
+    width: 0,
+    height: 0,
+    seam: 'none',
+    padding: { top: 0, bottom: 0, left: 0, right: 0 },
+  });
 
   const prevObserverRef = useRef<{ lat: number; lon: number }>({
     lat: observer.lat,
@@ -1459,22 +1947,131 @@ export function TacticalMap({ className }: TacticalMapProps) {
     map.addControl(new maplibregl.NavigationControl({ showCompass: true, showZoom: true }), 'bottom-right');
     map.addControl(scaleControl, 'bottom-right');
 
+    const mobileMql =
+      typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+        ? window.matchMedia('(max-width: 767px)')
+        : null;
+    let domePaneEl: Element | null =
+      typeof document !== 'undefined' ? document.querySelector('[data-pane="dome"]') : null;
+    let domeResizeObserver: ResizeObserver | null = null;
+    let breakpointRafId = 0;
+
+    const clearObstructedHover = (targetLayout: LayoutMode, expW: number, expH: number) => {
+      const hc = hoverCoordsRef.current;
+      if (!hc) return;
+      if (
+        targetLayout === 'dome' ||
+        (targetLayout === 'split' && !isPointInExposedMapViewport(hc.x, hc.y, expW, expH))
+      ) {
+        hoverCoordsRef.current = null;
+        setHoverTip(null);
+        try {
+          map.getCanvas().style.cursor = '';
+        } catch {
+          // Ignore if canvas unavailable
+        }
+        if (useSkyStore.getState().hoveredId === hc.id) {
+          useSkyStore.getState().setHoveredId(null);
+        }
+      }
+    };
+
+    const refreshExposedViewport = (
+      targetLayout: LayoutMode,
+      fallbackW?: number,
+      fallbackH?: number
+    ) => {
+      const vp = liveViewportRef.current;
+      const prevExpW = vp.width;
+      const prevExpH = vp.height;
+
+      const mapRect = container.getBoundingClientRect();
+      const w =
+        Number.isFinite(mapRect.width) && mapRect.width > 0
+          ? mapRect.width
+          : (fallbackW ?? labelMetricsRef.current.width);
+      const h =
+        Number.isFinite(mapRect.height) && mapRect.height > 0
+          ? mapRect.height
+          : (fallbackH ?? labelMetricsRef.current.height);
+      const isMobile = resolveMobileBreakpointFallback(w, w, mobileMql ? mobileMql.matches : undefined);
+
+      if (typeof document !== 'undefined' && (!domePaneEl || !domePaneEl.isConnected)) {
+        const foundDome = document.querySelector('[data-pane="dome"]');
+        if (foundDome && foundDome !== domePaneEl) {
+          domePaneEl = foundDome;
+          domeResizeObserver?.observe(foundDome);
+        }
+      }
+
+      let domeRect: Partial<ViewportRectLike> | null = null;
+      if (targetLayout === 'split' && domePaneEl) {
+        const stageLayout = domePaneEl.closest('[data-layout]')?.getAttribute('data-layout');
+        if (!stageLayout || stageLayout === 'split') {
+          domeRect = domePaneEl.getBoundingClientRect();
+        }
+      }
+
+      const measured = computeExposedMapViewportInto(targetLayout, w, h, vp, {
+        mapRect,
+        domeRect,
+        isMobile,
+      });
+      vp.layout = targetLayout;
+      vp.containerWidth = w;
+      vp.containerHeight = h;
+      vp.isMobile = isMobile;
+      vp.measuredDome = measured;
+
+      clearObstructedHover(targetLayout, vp.width, vp.height);
+      if (
+        hoverCoordsRef.current !== null &&
+        (Math.abs(prevExpW - vp.width) > 0.5 || Math.abs(prevExpH - vp.height) > 0.5)
+      ) {
+        setTooltipViewportTick((n) => n + 1);
+      }
+      return vp;
+    };
+
     const applyCameraPadding = (
       targetMap: maplibregl.Map,
       targetLayout: LayoutMode,
       animate: boolean,
       force = false
     ) => {
-      const rect = container.getBoundingClientRect();
-      const next = computeLayoutCameraPadding(targetLayout, rect.width, rect.height);
+      const vp = refreshExposedViewport(targetLayout);
+      const next = computeLayoutCameraPadding(targetLayout, vp.containerWidth, vp.containerHeight, {
+        isMobile: vp.isMobile,
+      });
+      // Prefer exact live-measured viewport padding when available
+      next.top = vp.padding.top;
+      next.bottom = vp.padding.bottom;
+      next.left = vp.padding.left;
+      next.right = vp.padding.right;
+
       const prev = appliedPaddingRef.current;
-      if (
-        !force &&
+      const prevMatches =
         prev.top === next.top &&
         prev.bottom === next.bottom &&
         prev.left === next.left &&
-        prev.right === next.right
-      ) {
+        prev.right === next.right;
+
+      let mapPadMatches = prevMatches;
+      if (typeof targetMap.getPadding === 'function') {
+        try {
+          const mp = targetMap.getPadding();
+          mapPadMatches =
+            Math.round(mp.top) === next.top &&
+            Math.round(mp.bottom) === next.bottom &&
+            Math.round(mp.left) === next.left &&
+            Math.round(mp.right) === next.right;
+        } catch {
+          mapPadMatches = prevMatches;
+        }
+      }
+
+      const easeInFlight = performance.now() - lastEaseMsRef.current < 260;
+      if (!force && prevMatches && (mapPadMatches || (animate && easeInFlight))) {
         return;
       }
       appliedPaddingRef.current = next;
@@ -1541,7 +2138,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
     const placedBoxPool: LabelBox[] = [];
     const placedLabelBoxes: LabelBox[] = [];
     const labelProjCoord: [number, number] = [0, 0];
-    const slotCandidates: readonly [LabelBox, LabelBox, LabelBox, LabelBox] = [
+    const slotCandidates: [LabelBox, LabelBox, LabelBox, LabelBox] = [
       { x: 0, y: 0, w: 0, h: 0 },
       { x: 0, y: 0, w: 0, h: 0 },
       { x: 0, y: 0, w: 0, h: 0 },
@@ -1615,11 +2212,28 @@ export function TacticalMap({ className }: TacticalMapProps) {
         return;
       }
 
-      const activePad = appliedPaddingRef.current;
-      const exposedWidth =
-        state.layout === 'split' ? Math.max(0, width - activePad.right) : width;
-      const exposedHeight =
-        state.layout === 'split' ? Math.max(0, height - activePad.bottom) : height;
+      const vp = liveViewportRef.current;
+      const currentIsMobile = mobileMql ? Boolean(mobileMql.matches) : width <= 767;
+      if (
+        vp.layout !== state.layout ||
+        Math.abs(vp.containerWidth - width) > 0.5 ||
+        Math.abs(vp.containerHeight - height) > 0.5 ||
+        vp.isMobile !== currentIsMobile ||
+        (state.layout === 'split' && !vp.measuredDome)
+      ) {
+        refreshExposedViewport(state.layout, width, height);
+        if (
+          state.layout === 'split' &&
+          (appliedPaddingRef.current.bottom !== vp.padding.bottom ||
+            appliedPaddingRef.current.right !== vp.padding.right)
+        ) {
+          applyCameraPadding(activeMap, state.layout, false);
+        }
+      }
+
+      const exposedWidth = vp.width;
+      const exposedHeight = vp.height;
+      const activeSeam = vp.seam;
       if (exposedWidth <= 0 || exposedHeight <= 0) {
         return;
       }
@@ -1647,22 +2261,26 @@ export function TacticalMap({ className }: TacticalMapProps) {
         if (
           !Number.isFinite(pt.x) ||
           !Number.isFinite(pt.y) ||
-          pt.x < 0 ||
-          pt.x > exposedWidth ||
-          pt.y < 0 ||
-          pt.y > exposedHeight
+          pt.x < -MAP_SPRITE_EXCLUSION_RADIUS_PX ||
+          pt.x > exposedWidth + MAP_SPRITE_EXCLUSION_RADIUS_PX ||
+          pt.y < -MAP_SPRITE_EXCLUSION_RADIUS_PX ||
+          pt.y > exposedHeight + MAP_SPRITE_EXCLUSION_RADIUS_PX
         ) {
           continue;
         }
 
-        // Reserve each sprite's central 26x26 icon exclusion bounding box
+        // Reserve each sprite's central 26x26 icon exclusion bounding box inside or adjacent to the seam
         const sBox = acquirePooledBox(spriteBoxPool, spriteIdx);
-        sBox.x = pt.x - 13;
-        sBox.y = pt.y - 13;
-        sBox.w = 26;
-        sBox.h = 26;
+        sBox.x = pt.x - MAP_SPRITE_EXCLUSION_RADIUS_PX;
+        sBox.y = pt.y - MAP_SPRITE_EXCLUSION_RADIUS_PX;
+        sBox.w = MAP_SPRITE_EXCLUSION_RADIUS_PX * 2;
+        sBox.h = MAP_SPRITE_EXCLUSION_RADIUS_PX * 2;
         spriteBoxes[spriteIdx] = sBox;
         spriteIdx += 1;
+
+        if (!isMapLabelAnchorEligible(pt.x, pt.y, exposedWidth, exposedHeight, activeSeam)) {
+          continue;
+        }
 
         const isSelected = entity.id === state.selectedId;
         const isHovered = entity.id === state.hoveredId;
@@ -1700,6 +2318,9 @@ export function TacticalMap({ className }: TacticalMapProps) {
       let autoDrawn = 0;
 
       ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, exposedWidth, exposedHeight);
+      ctx.clip();
       ctx.font = `600 9.5px ${MONO_FONT}`;
       ctx.textAlign = 'left';
       ctx.textBaseline = 'middle';
@@ -1733,68 +2354,27 @@ export function TacticalMap({ className }: TacticalMapProps) {
         const boxH = 15;
         const offset = 14;
 
-        slotCandidates[0].x = item.px + offset;
-        slotCandidates[0].y = item.py - boxH / 2;
-        slotCandidates[0].w = boxW;
-        slotCandidates[0].h = boxH;
-
-        slotCandidates[1].x = item.px - offset - boxW;
-        slotCandidates[1].y = item.py - boxH / 2;
-        slotCandidates[1].w = boxW;
-        slotCandidates[1].h = boxH;
-
-        slotCandidates[2].x = item.px - boxW / 2;
-        slotCandidates[2].y = item.py - offset - boxH;
-        slotCandidates[2].w = boxW;
-        slotCandidates[2].h = boxH;
-
-        slotCandidates[3].x = item.px - boxW / 2;
-        slotCandidates[3].y = item.py + offset;
-        slotCandidates[3].w = boxW;
-        slotCandidates[3].h = boxH;
-
-        let chosenSlot = findAvailableLabelSlot(
-          slotCandidates,
+        const placedBox = acquirePooledBox(placedBoxPool, placedIdx);
+        const solved = solveMapLabelBox(
+          item.px,
+          item.py,
+          boxW,
+          boxH,
           exposedWidth,
           exposedHeight,
+          activeSeam,
+          mustShow,
+          item.isAlert,
           spriteBoxes,
           placedLabelBoxes,
-          true
+          slotCandidates,
+          placedBox,
+          offset
         );
+        if (!solved) continue;
 
-        if (!chosenSlot && item.isAlert && !mustShow) {
-          chosenSlot = findAvailableLabelSlot(
-            slotCandidates,
-            exposedWidth,
-            exposedHeight,
-            spriteBoxes,
-            placedLabelBoxes,
-            false
-          );
-        }
-
-        let lx = 0;
-        let ly = 0;
-        if (chosenSlot) {
-          lx = chosenSlot.x;
-          ly = chosenSlot.y;
-        } else {
-          if (!mustShow) continue;
-          const preferLeft = item.px + offset + boxW > exposedWidth - 6;
-          const maxLx = Math.max(6, exposedWidth - boxW - 6);
-          const maxLy = Math.max(6, exposedHeight - boxH - 6);
-          lx = Math.max(
-            6,
-            Math.min(maxLx, preferLeft ? item.px - offset - boxW : item.px + offset)
-          );
-          ly = Math.max(6, Math.min(maxLy, item.py - boxH / 2));
-        }
-
-        const placedBox = acquirePooledBox(placedBoxPool, placedIdx);
-        placedBox.x = lx;
-        placedBox.y = ly;
-        placedBox.w = boxW;
-        placedBox.h = boxH;
+        const lx = solved.x;
+        const ly = solved.y;
         placedLabelBoxes[placedIdx] = placedBox;
         placedIdx += 1;
         placedLabelBoxes.length = placedIdx;
@@ -1842,11 +2422,32 @@ export function TacticalMap({ className }: TacticalMapProps) {
       ev.preventDefault();
     };
 
+    const handleMouseLeave = () => {
+      map.getCanvas().style.cursor = '';
+      hoverCoordsRef.current = null;
+      setHoverTip(null);
+      if (useSkyStore.getState().hoveredId !== null) {
+        useSkyStore.getState().setHoveredId(null);
+      }
+    };
+
     const handleMouseMove = (
       ev: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
     ) => {
       const store = useSkyStore.getState();
       if (store.layout === 'dome') return;
+      if (store.layout === 'split') {
+        const vp =
+          liveViewportRef.current.layout === 'split' && liveViewportRef.current.measuredDome
+            ? liveViewportRef.current
+            : refreshExposedViewport('split');
+        if (!isPointInExposedMapViewport(ev.point.x, ev.point.y, vp.width, vp.height)) {
+          if (hoverCoordsRef.current !== null) {
+            handleMouseLeave();
+          }
+          return;
+        }
+      }
       const feat = ev.features?.[0];
       const id = feat?.properties?.id;
       if (typeof id !== 'string' || !id) return;
@@ -1861,22 +2462,24 @@ export function TacticalMap({ className }: TacticalMapProps) {
       }
     };
 
-    const handleMouseLeave = () => {
-      map.getCanvas().style.cursor = '';
-      hoverCoordsRef.current = null;
-      setHoverTip(null);
-      if (useSkyStore.getState().hoveredId !== null) {
-        useSkyStore.getState().setHoveredId(null);
-      }
-    };
-
     const handleClick = (
       ev: maplibregl.MapMouseEvent & { features?: maplibregl.MapGeoJSONFeature[] }
     ) => {
+      const store = useSkyStore.getState();
+      if (store.layout === 'dome') return;
+      if (store.layout === 'split') {
+        const vp =
+          liveViewportRef.current.layout === 'split' && liveViewportRef.current.measuredDome
+            ? liveViewportRef.current
+            : refreshExposedViewport('split');
+        if (!isPointInExposedMapViewport(ev.point.x, ev.point.y, vp.width, vp.height)) {
+          return;
+        }
+      }
       const feat = ev.features?.[0];
       const id = feat?.properties?.id;
       if (typeof id === 'string' && id) {
-        useSkyStore.getState().selectEntity(id, true);
+        store.selectEntity(id, true);
       }
     };
 
@@ -1937,6 +2540,7 @@ export function TacticalMap({ className }: TacticalMapProps) {
         map.jumpTo({
           center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
           zoom: zoomForRadiusKm(st.radiusKm, st.observer.lat),
+          padding: appliedPaddingRef.current,
         });
       }
       prevObserverRef.current = { lat: st.observer.lat, lon: st.observer.lon };
@@ -2006,6 +2610,45 @@ export function TacticalMap({ className }: TacticalMapProps) {
       drawMapLabels();
     });
     resizeObserver.observe(container);
+
+    domeResizeObserver = new ResizeObserver(() => {
+      if (cancelled) return;
+      const currentLayout = useSkyStore.getState().layout;
+      if (mapRef.current) {
+        applyCameraPadding(mapRef.current, currentLayout, false);
+      }
+      drawMapLabels();
+    });
+    if (domePaneEl) {
+      domeResizeObserver.observe(domePaneEl);
+    }
+
+    const handleBreakpointChange = () => {
+      if (cancelled) return;
+      const rect = container.getBoundingClientRect();
+      syncLabelCanvasSize(rect.width, rect.height);
+      const currentLayout = useSkyStore.getState().layout;
+      if (mapRef.current) {
+        try {
+          mapRef.current.resize();
+        } catch {
+          // Ignore transient resize errors
+        }
+        applyCameraPadding(mapRef.current, currentLayout, false, true);
+      }
+      drawMapLabels();
+      window.cancelAnimationFrame(breakpointRafId);
+      breakpointRafId = window.requestAnimationFrame(() => {
+        if (cancelled) return;
+        const r2 = container.getBoundingClientRect();
+        syncLabelCanvasSize(r2.width, r2.height);
+        if (mapRef.current) {
+          applyCameraPadding(mapRef.current, useSkyStore.getState().layout, false, true);
+        }
+        drawMapLabels();
+      });
+    };
+    mobileMql?.addEventListener?.('change', handleBreakpointChange);
 
     const handleWindowResize = () => {
       const rect = container.getBoundingClientRect();
@@ -2149,9 +2792,20 @@ export function TacticalMap({ className }: TacticalMapProps) {
 
       // Refresh active hover tooltip numbers smoothly at ~5Hz while hovered
       const hc = hoverCoordsRef.current;
-      if (hc && nowMs - lastTipSyncMs >= 200) {
+      const hoverObstructedInSplit =
+        hc !== null &&
+        state.layout === 'split' &&
+        !isPointInExposedMapViewport(
+          hc.x,
+          hc.y,
+          liveViewportRef.current.width,
+          liveViewportRef.current.height
+        );
+      if (hc && (hoverObstructedInSplit || nowMs - lastTipSyncMs >= 200)) {
         lastTipSyncMs = nowMs;
-        const hoveredEntity = liveKinematicsRegistry.entities.get(hc.id);
+        const hoveredEntity = hoverObstructedInSplit
+          ? undefined
+          : liveKinematicsRegistry.entities.get(hc.id);
         if (hoveredEntity && state.layers[hoveredEntity.category]) {
           setHoverTip(buildHoverTooltip(hoveredEntity, hc.x, hc.y, state.units));
         } else {
@@ -2170,7 +2824,10 @@ export function TacticalMap({ className }: TacticalMapProps) {
     return () => {
       cancelled = true;
       window.cancelAnimationFrame(rafId);
+      window.cancelAnimationFrame(breakpointRafId);
       resizeObserver.disconnect();
+      domeResizeObserver?.disconnect();
+      mobileMql?.removeEventListener?.('change', handleBreakpointChange);
       window.removeEventListener('resize', handleWindowResize);
       drawMapLabelsRef.current = null;
       syncCameraPaddingRef.current = null;
@@ -2244,15 +2901,18 @@ export function TacticalMap({ className }: TacticalMapProps) {
       Math.abs(normalizeLonDeg(observer.lon - prevObserverRef.current.lon)) > 1e-6;
 
     if (wasPending || nonceChanged || radiusChanged || observerShifted) {
+      syncCameraPaddingRef.current?.(useSkyStore.getState().layout, false);
       if (wasPending || shiftKm > 250) {
         map.jumpTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
+          padding: appliedPaddingRef.current,
         });
       } else {
         map.flyTo({
           center: [normalizeLonDeg(observer.lon), observer.lat],
           zoom: zoomForRadiusKm(radiusKm, observer.lat),
+          padding: appliedPaddingRef.current,
           duration: 650,
           essential: true,
         });
@@ -2325,15 +2985,19 @@ export function TacticalMap({ className }: TacticalMapProps) {
     } else if (atmosphericScope === 'local' && prevScope === 'global') {
       if (st.observer.source === 'pending') return;
       if (!st.followSelected) {
+        syncCameraPaddingRef.current?.(st.layout, false);
         map.flyTo({
           center: [normalizeLonDeg(st.observer.lon), st.observer.lat],
           zoom: zoomForRadiusKm(st.radiusKm, st.observer.lat),
+          padding: appliedPaddingRef.current,
           duration: 650,
           essential: true,
         });
       } else {
+        syncCameraPaddingRef.current?.(st.layout, false);
         map.easeTo({
           zoom: zoomForRadiusKm(st.radiusKm, st.observer.lat),
+          padding: appliedPaddingRef.current,
           duration: 650,
           essential: true,
         });
@@ -2380,8 +3044,38 @@ export function TacticalMap({ className }: TacticalMapProps) {
         // Ignore transient resize errors
       }
       syncCameraPaddingRef.current?.(layout, true);
+      drawMapLabelsRef.current?.();
     }
-    const timer = window.setTimeout(() => {
+
+    let postLayoutRaf2 = 0;
+    const postLayoutRaf1 = window.requestAnimationFrame(() => {
+      try {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (
+          rect &&
+          (Math.abs(rect.width - labelMetricsRef.current.width) > 0.5 ||
+            Math.abs(rect.height - labelMetricsRef.current.height) > 0.5)
+        ) {
+          map.resize();
+        }
+        syncCameraPaddingRef.current?.(layout, layoutChanged);
+        drawMapLabelsRef.current?.();
+        if (layout === 'split') {
+          postLayoutRaf2 = window.requestAnimationFrame(() => {
+            try {
+              syncCameraPaddingRef.current?.(layout, layoutChanged);
+              drawMapLabelsRef.current?.();
+            } catch {
+              // Ignore if unmounted
+            }
+          });
+        }
+      } catch {
+        // Ignore if unmounted
+      }
+    });
+
+    const settleTimer = window.setTimeout(() => {
       try {
         const rect = containerRef.current?.getBoundingClientRect();
         if (
@@ -2396,8 +3090,14 @@ export function TacticalMap({ className }: TacticalMapProps) {
       } catch {
         // Ignore if unmounted
       }
-    }, 60);
-    return () => window.clearTimeout(timer);
+    }, layoutChanged ? 250 : 60);
+
+    const cleanupLayoutSync = () => {
+      window.cancelAnimationFrame(postLayoutRaf1);
+      window.cancelAnimationFrame(postLayoutRaf2);
+      window.clearTimeout(settleTimer);
+    };
+    return cleanupLayoutSync;
   }, [layout]);
 
   // Keep hover tooltip units and ScaleControl synced when user switches AVIATION <-> METRIC
@@ -2411,17 +3111,22 @@ export function TacticalMap({ className }: TacticalMapProps) {
     }
   }, [units, hoveredId]);
 
-  const containerWidth = containerRef.current?.clientWidth ?? 800;
-  const containerHeight = containerRef.current?.clientHeight ?? 600;
-  const activePad = appliedPaddingRef.current;
-  const exposedTooltipWidth =
-    layout === 'split' && activePad.right > 0
-      ? Math.max(240, containerWidth - activePad.right)
-      : containerWidth;
-  const exposedTooltipHeight =
-    layout === 'split' && activePad.bottom > 0
-      ? Math.max(120, containerHeight - activePad.bottom)
-      : containerHeight;
+  const containerWidth =
+    (containerRef.current?.clientWidth ?? 0) > 0
+      ? containerRef.current!.clientWidth
+      : liveViewportRef.current.containerWidth > 0
+        ? liveViewportRef.current.containerWidth
+        : 800;
+  const containerHeight =
+    (containerRef.current?.clientHeight ?? 0) > 0
+      ? containerRef.current!.clientHeight
+      : liveViewportRef.current.containerHeight > 0
+        ? liveViewportRef.current.containerHeight
+        : 600;
+  const tooltipRect =
+    !webglError && layout !== 'dome' && hoverTip
+      ? clampMapTooltipPosition(hoverTip.x, hoverTip.y, layout, containerWidth, containerHeight)
+      : null;
 
   return (
     <div
@@ -2564,14 +3269,17 @@ export function TacticalMap({ className }: TacticalMapProps) {
         </div>
       )}
 
-      {!webglError && layout !== 'dome' && hoverTip && (
+      {!webglError && layout !== 'dome' && hoverTip && tooltipRect && tooltipRect.visible && (
         <div
+          data-testid="map-hover-tooltip"
           style={{
             position: 'absolute',
-            left: Math.max(8, Math.min(hoverTip.x + 14, exposedTooltipWidth - 232)),
-            top: Math.max(8, Math.min(hoverTip.y + 14, exposedTooltipHeight - 96)),
-            width: 220,
-            maxWidth: 'calc(100% - 16px)',
+            left: tooltipRect.left,
+            top: tooltipRect.top,
+            width: tooltipRect.width,
+            maxWidth: tooltipRect.width,
+            maxHeight: tooltipRect.maxHeight,
+            overflow: 'hidden',
             pointerEvents: 'none',
             zIndex: 20,
             padding: '8px 10px',
