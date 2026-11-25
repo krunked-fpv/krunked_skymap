@@ -165,9 +165,187 @@ interface CanvasMetrics {
 interface VaultCache {
   key: string;
   vault: CanvasGradient | null;
+  outerSeat: CanvasGradient | null;
   bezel: CanvasGradient | null;
   sweep: CanvasGradient | null;
   glow: CanvasGradient | null;
+}
+
+export interface VaultGradientStop {
+  readonly offset: number;
+  readonly color: string;
+  readonly alpha: number;
+}
+
+/**
+ * Deep obsidian-cobalt radial glass gradient for the circular Sky-Dome vault.
+ * Substantially less translucent (0.78 center -> 0.93 horizon rim) than the 0.30
+ * `.stage-dome-pane` outer backdrop so the circular dome element contrasts boldly
+ * across SPLIT, DOME, and PIP views while retaining a subtle smoked-glass depth.
+ */
+export const SKY_DOME_VAULT_STOPS: readonly VaultGradientStop[] = [
+  { offset: 0, color: 'rgba(18, 44, 76, 0.78)', alpha: 0.78 },
+  { offset: 0.42, color: 'rgba(10, 23, 42, 0.85)', alpha: 0.85 },
+  { offset: 0.82, color: 'rgba(6, 13, 25, 0.90)', alpha: 0.9 },
+  { offset: 1, color: 'rgba(4, 8, 17, 0.93)', alpha: 0.93 },
+] as const;
+
+export interface MoonVisualMetrics {
+  discRadius: number;
+  diameterPx: number;
+  glowRadius: number;
+  glowPeakAlpha: number;
+  rimAlpha: number;
+  markerAlpha: number;
+  labelFontPx: number;
+  labelOffsetY: number;
+  showLabel: boolean;
+}
+
+/**
+ * Compute proportional lunar disc radius, silvery glow, and label metrics
+ * scaled cleanly for full/split domes versus compact PIP radar panes.
+ */
+export function getMoonVisualMetrics(
+  outerRadius: number,
+  isPipFrame: boolean,
+  illuminationFraction: number,
+  limbFadeFactor = 1
+): MoonVisualMetrics {
+  const safeR = Number.isFinite(outerRadius) && outerRadius > 0 ? outerRadius : 160;
+  const illum = Number.isFinite(illuminationFraction) ? clamp01(illuminationFraction) : 0.5;
+  const limb = Number.isFinite(limbFadeFactor) ? clamp01(limbFadeFactor) : 1;
+
+  const discRadius = isPipFrame
+    ? Math.max(6.8, Math.min(8.4, safeR * 0.072))
+    : Math.max(9.5, Math.min(11.5, safeR * 0.045));
+  const glowRadius = discRadius * (1.85 + 0.65 * illum);
+  const glowPeakAlpha = 0.16 + 0.28 * illum;
+  const rimAlpha = 0.46 + 0.36 * illum;
+  const markerAlpha = (0.72 + 0.28 * illum) * (0.58 + 0.42 * limb);
+  const labelFontPx = 8.5;
+  const labelOffsetY = discRadius + 8.5;
+
+  return {
+    discRadius,
+    diameterPx: discRadius * 2,
+    glowRadius,
+    glowPeakAlpha,
+    rimAlpha,
+    markerAlpha,
+    labelFontPx,
+    labelOffsetY,
+    showLabel: !isPipFrame,
+  };
+}
+
+/**
+ * Render a crisp, phase-shaded canvas lunar disc with subtle silvery glow,
+ * earthshine silhouette, and clean `'MOON'` label spacing.
+ */
+export function drawMoonMarker(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  outerRadius: number,
+  illuminationFraction: number,
+  phaseFraction: number,
+  limbFadeFactor: number,
+  isPipFrame: boolean
+): void {
+  const safeIllum = Number.isFinite(illuminationFraction) ? clamp01(illuminationFraction) : 0.5;
+  const safePhase = Number.isFinite(phaseFraction) ? ((phaseFraction % 1) + 1) % 1 : 0.25;
+  const mm = getMoonVisualMetrics(outerRadius, isPipFrame, safeIllum, limbFadeFactor);
+  const r = mm.discRadius;
+  const waxing = safePhase <= 0.5;
+
+  ctx.save();
+  ctx.globalAlpha = mm.markerAlpha;
+  ctx.translate(x, y);
+
+  // Subtle silvery lunar aura reflecting current illumination fraction
+  const aura = ctx.createRadialGradient(0, 0, r * 0.45, 0, 0, mm.glowRadius);
+  aura.addColorStop(0, `rgba(226, 238, 255, ${mm.glowPeakAlpha.toFixed(3)})`);
+  aura.addColorStop(0.52, `rgba(186, 214, 248, ${(mm.glowPeakAlpha * 0.36).toFixed(3)})`);
+  aura.addColorStop(1, 'rgba(148, 184, 232, 0)');
+  ctx.fillStyle = aura;
+  ctx.beginPath();
+  ctx.arc(0, 0, mm.glowRadius, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Earthshine dark lunar hemisphere silhouette
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(20, 32, 52, 0.94)';
+  ctx.fill();
+
+  // Phase-shaded sunlit lunar face clipped strictly to the circular disc
+  if (safeIllum > 0.02) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
+    ctx.clip();
+
+    const litOffsetX = waxing ? r * 0.24 : -r * 0.24;
+    const litGrad = ctx.createRadialGradient(litOffsetX, -r * 0.2, r * 0.08, 0, 0, r * 1.15);
+    litGrad.addColorStop(0, '#F8FAFC');
+    litGrad.addColorStop(0.58, '#DCE7F5');
+    litGrad.addColorStop(1, '#9CB3CC');
+    ctx.fillStyle = litGrad;
+
+    ctx.beginPath();
+    if (safeIllum >= 0.97) {
+      ctx.arc(0, 0, r, 0, Math.PI * 2);
+    } else {
+      const terminatorDelta = Math.abs(1 - 2 * safeIllum);
+      const gibbous = safeIllum > 0.5;
+      if (waxing) {
+        // Illuminated right limb: top -> right -> bottom
+        ctx.arc(0, 0, r, -Math.PI / 2, Math.PI / 2, false);
+        if (terminatorDelta >= 0.005) {
+          ctx.ellipse(0, 0, terminatorDelta * r, r, 0, Math.PI / 2, -Math.PI / 2, !gibbous);
+        }
+      } else {
+        // Illuminated left limb: bottom -> left -> top
+        ctx.arc(0, 0, r, Math.PI / 2, -Math.PI / 2, false);
+        if (terminatorDelta >= 0.005) {
+          ctx.ellipse(0, 0, terminatorDelta * r, r, 0, -Math.PI / 2, Math.PI / 2, !gibbous);
+        }
+      }
+      ctx.closePath();
+    }
+    ctx.fill();
+
+    // Subtle lunar maria clipped exclusively inside the sunlit portion
+    ctx.clip();
+    ctx.fillStyle = 'rgba(71, 85, 105, 0.18)';
+    ctx.beginPath();
+    ctx.arc(-r * 0.24, -r * 0.16, r * 0.25, 0, Math.PI * 2);
+    ctx.moveTo(r * 0.42, -r * 0.08);
+    ctx.arc(r * 0.22, -r * 0.08, r * 0.2, 0, Math.PI * 2);
+    ctx.moveTo(r * 0.22, r * 0.26);
+    ctx.arc(r * 0.04, r * 0.26, r * 0.18, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  // Crisp silver-slate limb outline
+  ctx.beginPath();
+  ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.strokeStyle = `rgba(226, 238, 255, ${mm.rimAlpha.toFixed(3)})`;
+  ctx.lineWidth = isPipFrame ? 0.9 : 1.05;
+  ctx.stroke();
+
+  if (mm.showLabel) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `600 ${mm.labelFontPx}px ${MONO_FONT}`;
+    ctx.fillStyle = 'rgba(226, 238, 255, 0.90)';
+    ctx.fillText('MOON', 0, mm.labelOffsetY);
+  }
+
+  ctx.restore();
 }
 
 interface CelestialCache {
@@ -934,19 +1112,27 @@ function ensureVaultCache(
   const { cx, cy, outerRadius: R } = m;
   cache.key = key;
 
-  // Translucent glass dome wash (0.24–0.38 alpha) so live MapLibre traffic stays visible underneath
+  // Deep obsidian-cobalt smoked-glass dome vault (0.78–0.93 alpha) for bold separation
+  // against the translucent 0.30 outer pane backdrop while keeping a subtle glass feel
   const vault = ctx.createRadialGradient(cx - R * 0.22, cy - R * 0.3, R * 0.04, cx, cy, R);
-  vault.addColorStop(0, 'rgba(24, 58, 92, 0.24)');
-  vault.addColorStop(0.4, 'rgba(12, 28, 48, 0.30)');
-  vault.addColorStop(0.82, 'rgba(6, 13, 24, 0.36)');
-  vault.addColorStop(1, 'rgba(4, 8, 16, 0.38)');
+  for (let i = 0; i < SKY_DOME_VAULT_STOPS.length; i += 1) {
+    vault.addColorStop(SKY_DOME_VAULT_STOPS[i].offset, SKY_DOME_VAULT_STOPS[i].color);
+  }
   cache.vault = vault;
 
+  // Tight recessed drop-seat around the bezel rim so the circular vault lifts cleanly off the backdrop
+  const seatSpread = Math.max(5, Math.min(11, R * 0.055));
+  const outerSeat = ctx.createRadialGradient(cx, cy, Math.max(1, R - 1), cx, cy, R + seatSpread);
+  outerSeat.addColorStop(0, 'rgba(2, 5, 12, 0.52)');
+  outerSeat.addColorStop(0.55, 'rgba(2, 5, 12, 0.20)');
+  outerSeat.addColorStop(1, 'rgba(2, 5, 12, 0)');
+  cache.outerSeat = outerSeat;
+
   const bezel = ctx.createLinearGradient(cx - R, cy - R, cx + R, cy + R);
-  bezel.addColorStop(0, 'rgba(255, 255, 255, 0.84)');
-  bezel.addColorStop(0.3, 'rgba(180, 225, 255, 0.28)');
-  bezel.addColorStop(0.62, 'rgba(70, 110, 150, 0.12)');
-  bezel.addColorStop(1, 'rgba(255, 255, 255, 0.44)');
+  bezel.addColorStop(0, 'rgba(255, 255, 255, 0.92)');
+  bezel.addColorStop(0.28, 'rgba(186, 230, 253, 0.42)');
+  bezel.addColorStop(0.62, 'rgba(70, 118, 165, 0.20)');
+  bezel.addColorStop(1, 'rgba(255, 255, 255, 0.58)');
   cache.bezel = bezel;
 
   if (typeof ctx.createConicGradient === 'function') {
@@ -995,7 +1181,14 @@ function drawVault(
 
   ctx.globalAlpha = 1;
 
-  // Translucent spherical vault glass only inside the aperture (outside pixels stay 100% transparent)
+  // Tight dark drop-seat immediately outside the bezel to separate the circular vault from the translucent backdrop
+  const seatSpread = Math.max(5, Math.min(11, R * 0.055));
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + seatSpread, 0, Math.PI * 2);
+  ctx.fillStyle = cache.outerSeat as CanvasGradient;
+  ctx.fill();
+
+  // Deep smoked-glass spherical vault fill inside the aperture (outer pixels stay transparent)
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
   ctx.fillStyle = cache.vault as CanvasGradient;
@@ -1075,12 +1268,12 @@ function drawVault(
       ctx.moveTo(cx + r0 * cs, cy + r0 * sn);
       ctx.lineTo(cx + r1 * cs, cy + r1 * sn);
     }
-    ctx.strokeStyle = `rgba(120, 190, 255, ${(0.24 * fade * fade).toFixed(3)})`;
-    ctx.lineWidth = 0.8;
+    ctx.strokeStyle = `rgba(130, 198, 255, ${(0.3 * fade * fade).toFixed(3)})`;
+    ctx.lineWidth = 0.85;
     ctx.stroke();
   }
 
-  // Recessed elevation rings (100% opaque foreground contrast)
+  // Recessed elevation rings (crisp foreground readability over deep obsidian-cobalt vault)
   const rings = zoom === 'zenith' ? [75, 60, 45] : [60, 30];
   ctx.beginPath();
   for (let i = 0; i < rings.length; i += 1) {
@@ -1088,8 +1281,8 @@ function drawVault(
     ctx.moveTo(cx + r, cy);
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
   }
-  ctx.strokeStyle = 'rgba(0, 0, 0, 0.58)';
-  ctx.lineWidth = 1.05;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.68)';
+  ctx.lineWidth = 1.1;
   ctx.stroke();
   ctx.beginPath();
   for (let i = 0; i < rings.length; i += 1) {
@@ -1097,25 +1290,30 @@ function drawVault(
     ctx.moveTo(cx + r, cy);
     ctx.arc(cx, cy, r, 0, Math.PI * 2);
   }
-  ctx.strokeStyle = 'rgba(120, 190, 255, 0.30)';
-  ctx.lineWidth = 0.9;
+  ctx.strokeStyle = 'rgba(130, 200, 255, 0.38)';
+  ctx.lineWidth = 0.95;
   ctx.stroke();
 
-  // Bezel: dark seat, limb ring, 1px specular glass edge
+  // Bezel: subtle inner glass chamfer, deep dark seat, crisp cyan limb ring, specular glass edge
   ctx.beginPath();
-  ctx.arc(cx, cy, R + 1.5, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(2, 5, 10, 0.92)';
-  ctx.lineWidth = 3;
+  ctx.arc(cx, cy, Math.max(1, R - 1.2), 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(186, 230, 253, 0.16)';
+  ctx.lineWidth = 0.9;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R + 1.8, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(2, 5, 12, 0.96)';
+  ctx.lineWidth = 3.6;
   ctx.stroke();
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.62)';
-  ctx.lineWidth = 1.3;
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.78)';
+  ctx.lineWidth = 1.5;
   ctx.stroke();
   ctx.beginPath();
-  ctx.arc(cx, cy, R + 0.5, 0, Math.PI * 2);
+  ctx.arc(cx, cy, R + 0.6, 0, Math.PI * 2);
   ctx.strokeStyle = cache.bezel as CanvasGradient;
-  ctx.lineWidth = 1;
+  ctx.lineWidth = 1.1;
   ctx.stroke();
 
   // Exterior 15° ticks (5° minors outside PIP), rotated cohesively with dome heading
@@ -1129,8 +1327,8 @@ function drawVault(
     ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
     ctx.lineTo(cx + (R + 7) * cs, cy + (R + 7) * sn);
   }
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.65)';
-  ctx.lineWidth = 1.05;
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.78)';
+  ctx.lineWidth = 1.15;
   ctx.stroke();
   if (!isPipGrid) {
     ctx.beginPath();
@@ -1142,8 +1340,8 @@ function drawVault(
       ctx.moveTo(cx + (R + 3) * cs, cy + (R + 3) * sn);
       ctx.lineTo(cx + (R + 5) * cs, cy + (R + 5) * sn);
     }
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.32)';
-    ctx.lineWidth = 0.7;
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.42)';
+    ctx.lineWidth = 0.75;
     ctx.stroke();
   }
 
@@ -1679,7 +1877,14 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     let rafId = 0;
 
     // Persistent per-effect scratch state (zero per-frame allocation)
-    const vaultCache: VaultCache = { key: '', vault: null, bezel: null, sweep: null, glow: null };
+    const vaultCache: VaultCache = {
+      key: '',
+      vault: null,
+      outerSeat: null,
+      bezel: null,
+      sweep: null,
+      glow: null,
+    };
     const celestial: CelestialCache = { key: '', ts: -Infinity, pos: null };
     const tcaCache = new Map<string, TcaCacheEntry>();
     const visPool: VisItem[] = [];
@@ -1946,18 +2151,16 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             zoom,
             rotationDeg
           );
-          const illum = Number.isFinite(cel.moon.illuminationFraction)
-            ? cel.moon.illuminationFraction
-            : 0.5;
-          ctx.globalAlpha = (0.4 + 0.6 * illum) * (0.5 + 0.5 * limbFade(cel.moon.elevationDeg, minEl));
-          ctx.font = `600 13px ${MONO_FONT}`;
-          ctx.fillStyle = '#E2E8F0';
-          ctx.fillText('☾', mp.x, mp.y);
-          if (!isPipFrame) {
-            ctx.font = `600 7px ${MONO_FONT}`;
-            ctx.fillStyle = 'rgba(226, 232, 240, 0.8)';
-            ctx.fillText('MOON', mp.x, mp.y + 11);
-          }
+          drawMoonMarker(
+            ctx,
+            mp.x,
+            mp.y,
+            R,
+            cel.moon.illuminationFraction,
+            cel.moon.phaseFraction,
+            limbFade(cel.moon.elevationDeg, minEl),
+            isPipFrame
+          );
         }
         ctx.globalAlpha = 1;
       }
