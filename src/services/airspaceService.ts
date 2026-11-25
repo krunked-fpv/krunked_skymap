@@ -5,6 +5,7 @@ import type {
 } from '../types/sky-contracts';
 import { pointInGeoJsonFeature } from './geoHelpers';
 import { fetchJsonWithTimeout } from './httpClient';
+import { resolveAdaptiveTimeoutMs } from './teslaCompat';
 
 const FT_TO_M = 0.3048;
 const ARCGIS_TIMEOUT_MS = 6000;
@@ -159,7 +160,7 @@ export async function fetchAirspace(
     };
   }
 
-  const timeoutMs = options.timeoutMs ?? ARCGIS_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(ARCGIS_TIMEOUT_MS);
   const cosLat = Math.max(0.15, Math.cos((observer.lat * Math.PI) / 180));
 
   // Cap UASFM query envelope to min(radiusKm, 50 km) and strictly <= ±0.35°
@@ -249,7 +250,7 @@ export async function fetchAirspace(
 
   try {
     const fallbackRaw = await fetchJsonWithTimeout<unknown>('./data/fallback-airspace.geojson', {
-      timeoutMs: 3500,
+      timeoutMs: resolveAdaptiveTimeoutMs(3500),
       signal: options.signal,
     });
     const parsed = parseFallbackGeoJson(fallbackRaw);

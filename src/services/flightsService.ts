@@ -27,6 +27,7 @@ import {
   isLocalDevOrLanRuntime,
   throwIfUpstreamErrorField,
 } from './httpClient';
+import { isTeslaBrowser, resolveAdaptiveTimeoutMs } from './teslaCompat';
 
 export { isLocalDevOrLanRuntime } from './httpClient';
 
@@ -1286,22 +1287,27 @@ export async function fetchFlightsCascade(
   prevEntities?: Map<string, FlightEntity> | FlightEntity[],
   options: FlightsFetchOptions = {}
 ): Promise<FlightsFetchResult> {
-  if (options.resetBreakers === true) {
-    flightsCircuitBreaker.reset();
-    viteProxyUnavailable = false;
-  }
-
   const prevMap = toPrevMap(prevEntities);
   const prevDrones = toPrevMap(options.prevDrones);
   const prevBalloons = toPrevMap(options.prevBalloons);
-  const timeoutMs = options.timeoutMs ?? DEFAULT_ADSB_TIMEOUT_MS;
-  const relayTimeoutMs = options.timeoutMs ?? RELAY_ADSB_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(DEFAULT_ADSB_TIMEOUT_MS);
+  const relayTimeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(RELAY_ADSB_TIMEOUT_MS);
   const latStr = observer.lat.toFixed(4);
   const lonStr = observer.lon.toFixed(4);
   const radiusNm = Math.max(1, Math.min(250, Math.ceil(radiusKm / 1.852)));
   const rateKey =
     options.rateLimitKey ??
     `adsb:${observer.lat.toFixed(2)},${observer.lon.toFixed(2)}:r${Math.round(radiusKm)}`;
+
+  if (options.resetBreakers === true) {
+    flightsCircuitBreaker.reset();
+    viteProxyUnavailable = false;
+    adsbRateLimiter.reset(rateKey);
+    const cachedEntry = lastCachedFlightsByKey.get(rateKey);
+    if (cachedEntry && cachedEntry.status !== 'live') {
+      lastCachedFlightsByKey.delete(rateKey);
+    }
+  }
 
   const rateAllowed = adsbRateLimiter.tryConsume(rateKey);
   if (!options.force && !rateAllowed) {
@@ -1443,6 +1449,9 @@ export async function fetchFlightsCascade(
         },
       };
     } catch (err) {
+      if (options.signal?.aborted) {
+        throw err;
+      }
       if (
         opts.isViteProxy &&
         (err instanceof StaticProxyUnavailableError ||
@@ -1491,7 +1500,10 @@ export async function fetchFlightsCascade(
   }
 
   // Stage 2: Zero-preflight CORS simple-GET relays (works on GitHub Pages & static servers)
-  const cacheBucket = Math.floor(Date.now() / 10_000);
+  const cacheBucket =
+    options.force || options.resetBreakers || isTeslaBrowser()
+      ? Date.now()
+      : Math.floor(Date.now() / 10_000);
   const relayFi = await tryAdsbxEndpoint(
     'cors-relay-adsb-fi',
     'cors-relay:adsb.fi',
@@ -1587,6 +1599,9 @@ export async function fetchFlightsCascade(
         timestampMs: nowMs,
       };
     } catch (err) {
+      if (options.signal?.aborted) {
+        throw err;
+      }
       recordFailure('opensky-network', err);
     }
   } else if (openSkyPlan) {
@@ -1687,17 +1702,22 @@ export async function fetchGlobalSpecialFlights(
   prevEntities?: Map<string, FlightEntity> | FlightEntity[],
   options: FlightsFetchOptions = {}
 ): Promise<GlobalFlightsFetchResult> {
-  if (options.resetBreakers === true) {
-    globalFlightsCircuitBreaker.reset();
-    globalViteProxyUnavailable = false;
-  }
-
   const prevMap = toPrevMap(prevEntities);
   const prevDrones = toPrevMap(options.prevDrones);
   const prevBalloons = toPrevMap(options.prevBalloons);
-  const timeoutMs = options.timeoutMs ?? DEFAULT_ADSB_TIMEOUT_MS;
-  const relayTimeoutMs = options.timeoutMs ?? RELAY_ADSB_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(DEFAULT_ADSB_TIMEOUT_MS);
+  const relayTimeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(RELAY_ADSB_TIMEOUT_MS);
   const rateKey = options.rateLimitKey ?? 'global-special';
+
+  if (options.resetBreakers === true) {
+    globalFlightsCircuitBreaker.reset();
+    globalViteProxyUnavailable = false;
+    globalAdsbRateLimiter.reset(rateKey);
+    const cachedEntry = lastCachedGlobalFlightsByKey.get(rateKey);
+    if (cachedEntry && cachedEntry.status !== 'live') {
+      lastCachedGlobalFlightsByKey.delete(rateKey);
+    }
+  }
 
   const rateAllowed = globalAdsbRateLimiter.tryConsume(rateKey);
   if (!options.force && !rateAllowed) {
@@ -1744,7 +1764,10 @@ export async function fetchGlobalSpecialFlights(
     };
   }
 
-  const cacheBucket = Math.floor(Date.now() / 15_000);
+  const cacheBucket =
+    options.force || options.resetBreakers || isTeslaBrowser()
+      ? Date.now()
+      : Math.floor(Date.now() / 15_000);
   const isLocal = isLocalDevOrLanRuntime();
 
   const buildFeedEndpoints = (feed: GlobalSpecialFeedType): GlobalEndpointSpec[] => {
@@ -1864,6 +1887,9 @@ export async function fetchGlobalSpecialFlights(
           lastHttpStatus,
         };
       } catch (err) {
+        if (options.signal?.aborted) {
+          throw err;
+        }
         if (
           ep.isViteProxy &&
           (err instanceof StaticProxyUnavailableError ||

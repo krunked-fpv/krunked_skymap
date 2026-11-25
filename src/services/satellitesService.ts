@@ -4,6 +4,9 @@ import type {
   TleRecord,
 } from '../types/sky-contracts';
 import { fetchTextWithTimeout } from './httpClient';
+import { resolveAdaptiveTimeoutMs } from './teslaCompat';
+
+const IDB_OPERATION_TIMEOUT_MS = 2500;
 
 export const TLE_DB_NAME = 'krunked_tle_v1';
 export const TLE_STORE_NAME = 'tle_cache';
@@ -163,10 +166,11 @@ export function deduplicateTleRecords(records: TleRecord[]): TleRecord[] {
  * Load build-seeded TLE files from ./data/tle/{stations,visual,starlink}.tle for 0ms cold boot.
  */
 export async function loadInitialTles(signal?: AbortSignal): Promise<TleRecord[]> {
+  const timeoutMs = resolveAdaptiveTimeoutMs(4000);
   const results = await Promise.allSettled(
     GROUPS.map(async (group) => {
       const text = await fetchTextWithTimeout(`./data/tle/${group}.tle`, {
-        timeoutMs: 4000,
+        timeoutMs,
         signal,
       });
       return parseTleText(text, group);
@@ -186,6 +190,15 @@ async function openTleDb(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return null;
 
   return new Promise<IDBDatabase | null>((resolve) => {
+    let settled = false;
+    const finish = (val: IDBDatabase | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const req = indexedDB.open(TLE_DB_NAME, 1);
       req.onupgradeneeded = () => {
@@ -194,11 +207,21 @@ async function openTleDb(): Promise<IDBDatabase | null> {
           db.createObjectStore(TLE_STORE_NAME, { keyPath: 'key' });
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-      req.onblocked = () => resolve(null);
+      req.onsuccess = () => {
+        if (settled) {
+          try {
+            req.result.close();
+          } catch {
+            // Ignore close failure
+          }
+          return;
+        }
+        finish(req.result);
+      };
+      req.onerror = () => finish(null);
+      req.onblocked = () => finish(null);
     } catch {
-      resolve(null);
+      finish(null);
     }
   });
 }
@@ -212,30 +235,40 @@ async function readCachedBundleFromIdb(): Promise<TleCacheBundle | null> {
   if (!db) return memoryTleCache;
 
   return new Promise<TleCacheBundle | null>((resolve) => {
+    let settled = false;
+    const finish = (val: TleCacheBundle | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        db.close();
+      } catch {
+        // Ignore close failure
+      }
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(memoryTleCache), IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const tx = db.transaction(TLE_STORE_NAME, 'readonly');
       const store = tx.objectStore(TLE_STORE_NAME);
       const req = store.get(TLE_CACHE_KEY);
       req.onsuccess = () => {
         const val = req.result as TleCacheBundle | undefined;
-        db.close();
         if (
           val &&
           typeof val.fetchedAtMs === 'number' &&
           Array.isArray(val.records)
         ) {
-          resolve(val);
+          finish(val);
         } else {
-          resolve(memoryTleCache);
+          finish(memoryTleCache);
         }
       };
-      req.onerror = () => {
-        db.close();
-        resolve(memoryTleCache);
-      };
+      req.onerror = () => finish(memoryTleCache);
+      tx.onabort = () => finish(memoryTleCache);
     } catch {
-      db.close();
-      resolve(memoryTleCache);
+      finish(memoryTleCache);
     }
   });
 }
@@ -248,25 +281,29 @@ async function writeCachedBundleToIdb(bundle: TleCacheBundle): Promise<void> {
   if (!db) return;
 
   await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        db.close();
+      } catch {
+        // Ignore close failure
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const tx = db.transaction(TLE_STORE_NAME, 'readwrite');
       const store = tx.objectStore(TLE_STORE_NAME);
       store.put(bundle);
-      tx.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      tx.onerror = () => {
-        db.close();
-        resolve();
-      };
-      tx.onabort = () => {
-        db.close();
-        resolve();
-      };
+      tx.oncomplete = finish;
+      tx.onerror = finish;
+      tx.onabort = finish;
     } catch {
-      db.close();
-      resolve();
+      finish();
     }
   });
 }
@@ -280,13 +317,14 @@ export async function refreshTlesIfStale(
   options: RefreshTleOptions = {}
 ): Promise<TleRefreshResult> {
   const nowMs = options.nowMs ?? Date.now();
-  const timeoutMs = options.timeoutMs ?? 8000;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(8000);
   const cached = await readCachedBundleFromIdb();
 
   if (
     !force &&
     cached &&
     cached.records.length > 0 &&
+    nowMs >= cached.fetchedAtMs - 60_000 &&
     nowMs - cached.fetchedAtMs < TLE_TTL_MS
   ) {
     return {
