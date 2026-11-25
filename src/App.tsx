@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Crosshair, Search } from 'lucide-react';
 import {
-  OVERHEAD_FALLBACK_MIN_EL_DEG,
-  OVERHEAD_PRIMARY_MIN_EL_DEG,
   type AtmosphericScope,
   type BalloonEntity,
   type DroneEntity,
+  type FeedHealthStatus,
   type FlightEntity,
   type LayoutMode,
   type OrbitalScope,
@@ -14,7 +13,12 @@ import {
   type SkyEntity,
   type UnitSystem,
 } from './types/sky-contracts';
-import { liveKinematicsRegistry, useSkyStore, type UrlHydrationPatch } from './store/useSkyStore';
+import {
+  computeDisplayedSkyCounts,
+  liveKinematicsRegistry,
+  useSkyStore,
+  type UrlHydrationPatch,
+} from './store/useSkyStore';
 import {
   computeTopocentricLookAngles,
   extrapolateDeadReckoning,
@@ -47,6 +51,17 @@ import { PolarSkyDome } from './components/skydome/PolarSkyDome';
 
 const ALL_CATEGORIES: SkyCategory[] = ['flight', 'military', 'satellite', 'balloon', 'drone'];
 const PWA_DISMISS_STORAGE_KEY = 'krunked_pwa_dismissed';
+const STALE_INFLIGHT_LOCK_MS = 20_000;
+const WAKE_RECOVERY_DEBOUNCE_MS = 2_000;
+
+function isFeedDegradedStatus(status: FeedHealthStatus): boolean {
+  return (
+    status === 'error' ||
+    status === 'rate-limited' ||
+    status === 'delayed' ||
+    status === 'offline'
+  );
+}
 
 interface BeforeInstallPromptEvent extends Event {
   readonly platforms?: string[];
@@ -247,6 +262,12 @@ export default function App() {
   const globalFlightsInFlightRef = useRef(false);
   const balloonsInFlightRef = useRef(false);
   const airspaceInFlightRef = useRef(false);
+
+  const flightsInFlightSinceMsRef = useRef<number>(0);
+  const globalFlightsInFlightSinceMsRef = useRef<number>(0);
+  const balloonsInFlightSinceMsRef = useRef<number>(0);
+  const airspaceInFlightSinceMsRef = useRef<number>(0);
+  const lastWakeRecoveryMsRef = useRef<number>(0);
 
   const flightsAbortRef = useRef<AbortController | null>(null);
   const globalFlightsAbortRef = useRef<AbortController | null>(null);
@@ -748,15 +769,17 @@ export default function App() {
         flightsAbortRef.current.abort();
         flightsAbortRef.current = null;
         flightsInFlightRef.current = false;
+        flightsInFlightSinceMsRef.current = 0;
       }
       if (flightsInFlightRef.current) return;
 
       flightsInFlightRef.current = true;
+      const attemptNowMs = Date.now();
+      flightsInFlightSinceMsRef.current = attemptNowMs;
       const seq = ++flightsSeqRef.current;
       const controller = new AbortController();
       flightsAbortRef.current = controller;
 
-      const attemptNowMs = Date.now();
       lastFlightsAttemptMsRef.current = attemptNowMs;
       nextFlightsDueMsRef.current = attemptNowMs + 10_000;
 
@@ -832,6 +855,7 @@ export default function App() {
       } finally {
         if (seq === flightsSeqRef.current) {
           flightsInFlightRef.current = false;
+          flightsInFlightSinceMsRef.current = 0;
           if (flightsAbortRef.current === controller) {
             flightsAbortRef.current = null;
           }
@@ -851,15 +875,17 @@ export default function App() {
         globalFlightsAbortRef.current.abort();
         globalFlightsAbortRef.current = null;
         globalFlightsInFlightRef.current = false;
+        globalFlightsInFlightSinceMsRef.current = 0;
       }
       if (globalFlightsInFlightRef.current) return;
 
       globalFlightsInFlightRef.current = true;
+      const attemptNowMs = Date.now();
+      globalFlightsInFlightSinceMsRef.current = attemptNowMs;
       const seq = ++globalFlightsSeqRef.current;
       const controller = new AbortController();
       globalFlightsAbortRef.current = controller;
 
-      const attemptNowMs = Date.now();
       lastGlobalFlightsAttemptMsRef.current = attemptNowMs;
       nextGlobalFlightsDueMsRef.current = attemptNowMs + 18_000;
 
@@ -937,6 +963,7 @@ export default function App() {
       } finally {
         if (seq === globalFlightsSeqRef.current) {
           globalFlightsInFlightRef.current = false;
+          globalFlightsInFlightSinceMsRef.current = 0;
           if (globalFlightsAbortRef.current === controller) {
             globalFlightsAbortRef.current = null;
           }
@@ -953,10 +980,12 @@ export default function App() {
         balloonsAbortRef.current.abort();
         balloonsAbortRef.current = null;
         balloonsInFlightRef.current = false;
+        balloonsInFlightSinceMsRef.current = 0;
       }
       if (balloonsInFlightRef.current) return;
 
       balloonsInFlightRef.current = true;
+      balloonsInFlightSinceMsRef.current = Date.now();
       const seq = ++balloonsSeqRef.current;
       const controller = new AbortController();
       balloonsAbortRef.current = controller;
@@ -1014,6 +1043,7 @@ export default function App() {
       } finally {
         if (seq === balloonsSeqRef.current) {
           balloonsInFlightRef.current = false;
+          balloonsInFlightSinceMsRef.current = 0;
           if (balloonsAbortRef.current === controller) {
             balloonsAbortRef.current = null;
           }
@@ -1029,10 +1059,12 @@ export default function App() {
       airspaceAbortRef.current.abort();
       airspaceAbortRef.current = null;
       airspaceInFlightRef.current = false;
+      airspaceInFlightSinceMsRef.current = 0;
     }
     if (airspaceInFlightRef.current) return;
 
     airspaceInFlightRef.current = true;
+    airspaceInFlightSinceMsRef.current = Date.now();
     const seq = ++airspaceSeqRef.current;
     const controller = new AbortController();
     airspaceAbortRef.current = controller;
@@ -1069,11 +1101,84 @@ export default function App() {
     } finally {
       if (seq === airspaceSeqRef.current) {
         airspaceInFlightRef.current = false;
+        airspaceInFlightSinceMsRef.current = 0;
         if (airspaceAbortRef.current === controller) {
           airspaceAbortRef.current = null;
         }
       }
     }
+  }, []);
+
+  /**
+   * Safely abort and clear any in-flight feed locks that stalled across browser sleep,
+   * tab suspension, or BFCache restore so subsequent refresh sweeps are never permanently wedged.
+   */
+  const clearStaleInFlightLocks = useCallback((forceAbortAll = false) => {
+    const nowMs = Date.now();
+    const cleared = {
+      flights: false,
+      military: false,
+      balloons: false,
+      airspace: false,
+    };
+
+    if (
+      flightsInFlightRef.current &&
+      (forceAbortAll ||
+        flightsInFlightSinceMsRef.current === 0 ||
+        nowMs - flightsInFlightSinceMsRef.current >= STALE_INFLIGHT_LOCK_MS)
+    ) {
+      flightsAbortRef.current?.abort();
+      flightsAbortRef.current = null;
+      flightsInFlightRef.current = false;
+      flightsInFlightSinceMsRef.current = 0;
+      flightsSeqRef.current += 1;
+      cleared.flights = true;
+    }
+
+    if (
+      globalFlightsInFlightRef.current &&
+      (forceAbortAll ||
+        globalFlightsInFlightSinceMsRef.current === 0 ||
+        nowMs - globalFlightsInFlightSinceMsRef.current >= STALE_INFLIGHT_LOCK_MS)
+    ) {
+      globalFlightsAbortRef.current?.abort();
+      globalFlightsAbortRef.current = null;
+      globalFlightsInFlightRef.current = false;
+      globalFlightsInFlightSinceMsRef.current = 0;
+      globalFlightsSeqRef.current += 1;
+      cleared.military = true;
+    }
+
+    if (
+      balloonsInFlightRef.current &&
+      (forceAbortAll ||
+        balloonsInFlightSinceMsRef.current === 0 ||
+        nowMs - balloonsInFlightSinceMsRef.current >= STALE_INFLIGHT_LOCK_MS)
+    ) {
+      balloonsAbortRef.current?.abort();
+      balloonsAbortRef.current = null;
+      balloonsInFlightRef.current = false;
+      balloonsInFlightSinceMsRef.current = 0;
+      balloonsSeqRef.current += 1;
+      cleared.balloons = true;
+    }
+
+    if (
+      airspaceInFlightRef.current &&
+      (forceAbortAll ||
+        airspaceInFlightSinceMsRef.current === 0 ||
+        nowMs - airspaceInFlightSinceMsRef.current >= STALE_INFLIGHT_LOCK_MS)
+    ) {
+      airspaceAbortRef.current?.abort();
+      airspaceAbortRef.current = null;
+      airspaceInFlightRef.current = false;
+      airspaceInFlightSinceMsRef.current = 0;
+      airspaceSeqRef.current += 1;
+      cleared.airspace = true;
+    }
+
+    return cleared;
   }, []);
 
   // Abort active fetch controllers cleanly on App unmount
@@ -1159,6 +1264,7 @@ export default function App() {
       globalFlightsAbortRef.current?.abort();
       globalFlightsAbortRef.current = null;
       globalFlightsInFlightRef.current = false;
+      globalFlightsInFlightSinceMsRef.current = 0;
       liveKinematicsRegistry.rawGlobalFlights.clear();
       const stNow = useSkyStore.getState();
       for (const [bId, bEntity] of liveKinematicsRegistry.rawBalloons.entries()) {
@@ -1202,6 +1308,7 @@ export default function App() {
   useEffect(() => {
     if (sweepPulseCounter === 0) return;
     tacticalAudio.playSweepPulse();
+    clearStaleInFlightLocks(true);
     void runFlightsRefresh(true, true);
     void runBalloonsRefresh(true, true);
     void runAirspaceRefresh();
@@ -1213,16 +1320,18 @@ export default function App() {
     }
   }, [
     sweepPulseCounter,
+    clearStaleInFlightLocks,
     runFlightsRefresh,
     runGlobalFlightsRefresh,
     runBalloonsRefresh,
     runAirspaceRefresh,
   ]);
 
-  // 1Hz Wall-Clock Scheduler & Online/Offline/Visibility Recovery
+  // 1Hz Wall-Clock Scheduler & Online/Offline/Visibility/Wake Recovery
   useEffect(() => {
     const interval = window.setInterval(() => {
       if (typeof document !== 'undefined' && document.hidden) return;
+      clearStaleInFlightLocks(false);
       const store = useSkyStore.getState();
       store.tickCountdowns();
       const nowMs = Date.now();
@@ -1249,6 +1358,90 @@ export default function App() {
         void runAirspaceRefresh();
       }
     }, 1000);
+
+    const recoverFeedsOnWake = (forceAll: boolean) => {
+      if (!forceAll && typeof document !== 'undefined' && document.hidden) return;
+      const cleared = clearStaleInFlightLocks(forceAll);
+      const st = useSkyStore.getState();
+      if (st.observer.source === 'pending') return;
+
+      if (astroClientRef.current && st.workerReady && st.layers.satellite) {
+        astroClientRef.current.tick(Date.now());
+      }
+
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+
+      const nowMs = Date.now();
+      const anyCleared =
+        cleared.flights || cleared.military || cleared.balloons || cleared.airspace;
+      if (
+        !forceAll &&
+        !anyCleared &&
+        nowMs - lastWakeRecoveryMsRef.current < WAKE_RECOVERY_DEBOUNCE_MS
+      ) {
+        return;
+      }
+
+      const flightsNeedsWake =
+        (st.layers.flight || st.layers.military || st.layers.balloon || st.layers.drone) &&
+        (forceAll ||
+          cleared.flights ||
+          isFeedDegradedStatus(st.feeds.flights.status) ||
+          nowMs >= nextFlightsDueMsRef.current);
+
+      const globalNeedsWake =
+        st.atmosphericScope === 'global' &&
+        (st.layers.military || st.layers.balloon || st.layers.drone) &&
+        (forceAll ||
+          cleared.military ||
+          isFeedDegradedStatus(st.feeds.military.status) ||
+          nowMs >= nextGlobalFlightsDueMsRef.current);
+
+      const balloonsNeedsWake =
+        st.layers.balloon &&
+        (forceAll ||
+          cleared.balloons ||
+          isFeedDegradedStatus(st.feeds.balloons.status) ||
+          st.feeds.balloons.nextRefreshSec <= 0);
+
+      const airspaceNeedsWake =
+        st.layers.drone &&
+        (forceAll ||
+          cleared.airspace ||
+          isFeedDegradedStatus(st.feeds.airspace.status) ||
+          st.feeds.airspace.nextRefreshSec <= 0);
+
+      if (flightsNeedsWake || globalNeedsWake || balloonsNeedsWake || airspaceNeedsWake) {
+        lastWakeRecoveryMsRef.current = nowMs;
+      }
+
+      if (flightsNeedsWake) {
+        void runFlightsRefresh(
+          true,
+          true,
+          forceAll || cleared.flights || isFeedDegradedStatus(st.feeds.flights.status)
+        );
+      }
+      if (globalNeedsWake) {
+        void runGlobalFlightsRefresh(
+          true,
+          true,
+          forceAll || cleared.military || isFeedDegradedStatus(st.feeds.military.status)
+        );
+      }
+      if (balloonsNeedsWake) {
+        void runBalloonsRefresh(
+          true,
+          true,
+          forceAll || cleared.balloons || isFeedDegradedStatus(st.feeds.balloons.status)
+        );
+      }
+      if (airspaceNeedsWake) {
+        void runAirspaceRefresh(
+          forceAll || cleared.airspace || isFeedDegradedStatus(st.feeds.airspace.status)
+        );
+      }
+    };
 
     const handleOffline = () => {
       const nowMs = Date.now();
@@ -1280,6 +1473,7 @@ export default function App() {
     };
 
     const handleOnline = () => {
+      clearStaleInFlightLocks(true);
       const st = useSkyStore.getState();
       if (st.layers.flight || st.layers.military || st.layers.balloon || st.layers.drone) {
         void runFlightsRefresh(true, true);
@@ -1297,36 +1491,40 @@ export default function App() {
 
     const handleVisibilityChange = () => {
       if (typeof document !== 'undefined' && document.hidden) return;
-      const st = useSkyStore.getState();
-      if (astroClientRef.current && st.workerReady && st.layers.satellite) {
-        astroClientRef.current.tick(Date.now());
+      recoverFeedsOnWake(false);
+    };
+
+    const handlePageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) {
+        recoverFeedsOnWake(true);
       }
-      if (
-        Date.now() >= nextFlightsDueMsRef.current &&
-        (st.layers.flight || st.layers.military)
-      ) {
-        void runFlightsRefresh(true);
-      }
-      if (
-        st.atmosphericScope === 'global' &&
-        Date.now() >= nextGlobalFlightsDueMsRef.current &&
-        (st.layers.military || st.layers.balloon || st.layers.drone)
-      ) {
-        void runGlobalFlightsRefresh(true);
-      }
+    };
+
+    const handleWindowFocus = () => {
+      recoverFeedsOnWake(false);
     };
 
     window.addEventListener('offline', handleOffline);
     window.addEventListener('online', handleOnline);
+    window.addEventListener('pageshow', handlePageShow);
+    window.addEventListener('focus', handleWindowFocus);
     document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       window.clearInterval(interval);
       window.removeEventListener('offline', handleOffline);
       window.removeEventListener('online', handleOnline);
+      window.removeEventListener('pageshow', handlePageShow);
+      window.removeEventListener('focus', handleWindowFocus);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [runFlightsRefresh, runGlobalFlightsRefresh, runBalloonsRefresh, runAirspaceRefresh]);
+  }, [
+    clearStaleInFlightLocks,
+    runFlightsRefresh,
+    runGlobalFlightsRefresh,
+    runBalloonsRefresh,
+    runAirspaceRefresh,
+  ]);
 
   // 5. OpenDroneID Live Client & 1Hz Tactical Drone Simulator
   useEffect(() => {
@@ -1488,7 +1686,7 @@ export default function App() {
     let rafId = 0;
     let fpsFrameCount = 0;
     let fpsWindowStart = performance.now();
-    let lastSnapshotSyncMs = 0;
+    let lastSnapshotSyncMs = -Infinity;
 
     const stepKinematics = (perfNow: number) => {
       rafId = window.requestAnimationFrame(stepKinematics);
@@ -1503,31 +1701,9 @@ export default function App() {
         }
         return;
       }
-            const nextEntities = entityBuffersRef.current[bufferToggleRef.current];
+      const nextEntities = entityBuffersRef.current[bufferToggleRef.current];
       bufferToggleRef.current = bufferToggleRef.current === 0 ? 1 : 0;
       nextEntities.clear();
-
-      const counts: {
-        flight: number;
-        military: number;
-        satellite: number;
-        balloon: number;
-        drone: number;
-        overhead: number;
-        overheadConeDeg: 45 | 20;
-        total: number;
-      } = {
-        flight: 0,
-        military: 0,
-        satellite: 0,
-        balloon: 0,
-        drone: 0,
-        overhead: 0,
-        overheadConeDeg: 45,
-        total: 0,
-      };
-      let overheadPrimary = 0;
-      let overheadFallback = 0;
 
       const checkAcousticEvents = (entity: SkyEntity, enabled: boolean) => {
         if (!enabled) return;
@@ -1591,28 +1767,9 @@ export default function App() {
                 ? 'military'
                 : prevExisting.category;
 
-            if (nextCat !== prevExisting.category) {
-              if (st.layers[prevExisting.category]) {
-                counts[prevExisting.category] = Math.max(0, counts[prevExisting.category] - 1);
-                counts.total = Math.max(0, counts.total - 1);
-                if (prevExisting.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
-                  overheadPrimary = Math.max(0, overheadPrimary - 1);
-                } else if (prevExisting.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
-                  overheadFallback = Math.max(0, overheadFallback - 1);
-                }
-              }
-              if (st.layers[nextCat]) {
-                counts[nextCat] += 1;
-                counts.total += 1;
-                if (prevExisting.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
-                  overheadPrimary += 1;
-                } else if (prevExisting.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
-                  overheadFallback += 1;
-                }
-              } else {
-                nextEntities.delete(entity.id);
-                return;
-              }
+            if (nextCat !== prevExisting.category && !st.layers[nextCat]) {
+              nextEntities.delete(entity.id);
+              return;
             }
 
             nextEntities.set(entity.id, {
@@ -1633,13 +1790,6 @@ export default function App() {
 
         if (!st.layers[entity.category] || !isSublayerVisible(entity)) return;
         nextEntities.set(entity.id, entity);
-        counts[entity.category] += 1;
-        counts.total += 1;
-        if (entity.topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
-          overheadPrimary += 1;
-        } else if (entity.topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
-          overheadFallback += 1;
-        }
         checkAcousticEvents(entity, st.audioEnabled);
       };
 
@@ -1803,20 +1953,9 @@ export default function App() {
             topocentric,
           };
           nextEntities.set(id, updated);
-
-          counts.satellite += 1;
-          counts.total += 1;
-          if (topocentric.elevationDeg >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
-            overheadPrimary += 1;
-          } else if (topocentric.elevationDeg >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
-            overheadFallback += 1;
-          }
           checkAcousticEvents(updated, st.audioEnabled);
         }
       }
-
-      counts.overhead = overheadPrimary > 0 ? overheadPrimary : overheadFallback;
-      counts.overheadConeDeg = overheadPrimary > 0 ? 45 : 20;
 
       liveKinematicsRegistry.entities = nextEntities;
       liveKinematicsRegistry.version += 1;
@@ -1831,6 +1970,7 @@ export default function App() {
 
       if (perfNow - lastSnapshotSyncMs >= 200) {
         lastSnapshotSyncMs = perfNow;
+        const counts = computeDisplayedSkyCounts(nextEntities.values(), st);
         const prevCounts = st.counts;
         if (
           prevCounts.flight !== counts.flight ||
