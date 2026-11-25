@@ -637,5 +637,8 @@ describe('HUD tooltips & Tesla wake/cache-reload recovery wiring', () => {
     expect(appSourceRaw).toContain("window.addEventListener('focus', handleWindowFocus)");
     expect(appSourceRaw).toContain('event.persisted');
     expect(appSourceRaw).toContain('clearStaleInFlightLocks');
+    const lockMatch = appSourceRaw.match(/STALE_INFLIGHT_LOCK_MS\s*=\s*([\d_]+)/);
+    expect(lockMatch).not.toBeNull();
+    expect(Number(lockMatch![1].replaceAll('_', ''))).toBeGreaterThanOrEqual(50_000);
   });
 });

@@ -51,7 +51,7 @@ import { PolarSkyDome } from './components/skydome/PolarSkyDome';
 
 const ALL_CATEGORIES: SkyCategory[] = ['flight', 'military', 'satellite', 'balloon', 'drone'];
 const PWA_DISMISS_STORAGE_KEY = 'krunked_pwa_dismissed';
-const STALE_INFLIGHT_LOCK_MS = 20_000;
+const STALE_INFLIGHT_LOCK_MS = 50_000;
 const WAKE_RECOVERY_DEBOUNCE_MS = 2_000;
 
 function isFeedDegradedStatus(status: FeedHealthStatus): boolean {
