@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   Crosshair,
@@ -7,6 +7,7 @@ import {
   Radar,
   Radio,
   RefreshCw,
+  RotateCcw,
   Search,
   Settings,
   Volume2,
@@ -62,6 +63,50 @@ const FEED_ORDER: Array<{ key: FeedKey; label: string; accent: string }> = [
   { key: 'airspace', label: 'AIRSPACE', accent: '#38BDF8' },
   { key: 'drones', label: 'DRONES', accent: CATEGORY_COLORS.drone },
 ];
+
+export async function clearBrowserCachesAndReload(): Promise<void> {
+  if (
+    typeof navigator !== 'undefined' &&
+    'serviceWorker' in navigator &&
+    typeof navigator.serviceWorker?.getRegistrations === 'function'
+  ) {
+    try {
+      const registrations = await navigator.serviceWorker.getRegistrations();
+      await Promise.allSettled(registrations.map((reg) => reg.unregister()));
+    } catch {
+      // Ignore restricted or unsupported Service Worker environments
+    }
+  }
+
+  if (
+    typeof window !== 'undefined' &&
+    'caches' in window &&
+    typeof window.caches?.keys === 'function'
+  ) {
+    try {
+      const cacheNames = await window.caches.keys();
+      await Promise.allSettled(cacheNames.map((name) => window.caches.delete(name)));
+    } catch {
+      // Ignore restricted Cache Storage environments
+    }
+  }
+
+  if (typeof window !== 'undefined' && window.location) {
+    try {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('_cb', String(Date.now()));
+      window.location.replace(nextUrl.toString());
+      return;
+    } catch {
+      // Fall back to direct reload if URL manipulation fails
+    }
+    try {
+      window.location.reload();
+    } catch {
+      // Ignore non-reloadable environments
+    }
+  }
+}
 
 function resolveSystemBeacon(
   flights: FeedHealthStatus,
@@ -150,6 +195,8 @@ export function TopTelemetryBar({
   const pwaInstallDismissed = useSkyStore((s) => s.pwaInstallDismissed);
   const isStandalonePwa = useSkyStore((s) => s.isStandalonePwa);
 
+  const [clearingCache, setClearingCache] = useState(false);
+
   const diagTriggerRef = useRef<HTMLButtonElement | null>(null);
   const diagPopoverRef = useRef<HTMLDivElement | null>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -191,6 +238,14 @@ export function TopTelemetryBar({
     } else {
       triggerManualSweep();
     }
+  };
+
+  const handleClearCacheReload = () => {
+    if (clearingCache) return;
+    setClearingCache(true);
+    void clearBrowserCachesAndReload().finally(() => {
+      setClearingCache(false);
+    });
   };
 
   const handlePipClick = () => {
@@ -543,15 +598,27 @@ export function TopTelemetryBar({
             )}
           </div>
 
-          <div className="topbar-popover__footer">
+          <div className="topbar-popover__footer" style={{ flexWrap: 'wrap' }}>
             <button
               type="button"
               className="topbar-action-btn topbar-action-btn--sweep"
-              style={{ width: '100%' }}
+              style={{ flex: 1, minWidth: 0, width: 'auto', padding: '0 10px', whiteSpace: 'nowrap' }}
               onClick={handleSweepClick}
             >
               <RefreshCw size={12} aria-hidden="true" />
               <span>Reset Breakers &amp; Sweep</span>
+            </button>
+            <button
+              type="button"
+              className="topbar-action-btn"
+              data-testid="diag-clear-cache-reload"
+              style={{ flex: '0 0 auto', padding: '0 10px', whiteSpace: 'nowrap' }}
+              onClick={handleClearCacheReload}
+              disabled={clearingCache}
+              title="Unregister Service Workers, purge browser Cache Storage, and perform a cache-busted reload"
+            >
+              <RotateCcw size={12} aria-hidden="true" />
+              <span>{clearingCache ? 'Clearing…' : 'Clear Cache & Reload'}</span>
             </button>
           </div>
         </div>

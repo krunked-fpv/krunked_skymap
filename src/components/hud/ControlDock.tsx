@@ -758,6 +758,9 @@ export function ControlDock({
             const progressPct = computeRefreshProgressPct(feed);
             const isTrayOpen = expandable !== undefined && activeTrayCategory === expandable;
 
+            const countScopeLabel =
+              category === 'drone' ? 'global' : `within ${radiusKm} km`;
+
             return (
               <div
                 key={category}
@@ -768,7 +771,7 @@ export function ControlDock({
                   type="button"
                   className="dock-cat-chip__main"
                   aria-pressed={active}
-                  title={`Toggle ${CATEGORY_LABELS[category]} (${counts[category]} tracked · ${STATUS_LABEL[feed.status]})`}
+                  title={`Toggle ${CATEGORY_LABELS[category]} (${counts[category]} tracked ${countScopeLabel} · ${STATUS_LABEL[feed.status]})`}
                   onClick={() => toggleLayer(category)}
                 >
                   <span className="dock-cat-chip__head">
@@ -817,7 +820,7 @@ export function ControlDock({
           className={`dock-radius-scrubber${atmosphericScope === 'global' ? ' is-dimmed' : ''}`}
           title={
             atmosphericScope === 'global'
-              ? `Local ADS-B & airspace cylinder radius (${radiusKm} km) — Global scope active`
+              ? `Scan radius (${radiusKm} km) — scopes Flights, Military, Orbital & Balloon counts; UAS stays global`
               : `Local scan radius: ${radiusKm} km`
           }
         >

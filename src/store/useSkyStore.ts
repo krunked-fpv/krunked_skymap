@@ -376,6 +376,113 @@ export type OverheadSelectionContext = Pick<
   'layers' | 'satGroups' | 'balloonSublayers' | 'droneSublayers'
 >;
 
+export type DisplayCountContext = Pick<
+  SkyStoreState,
+  'observer' | 'radiusKm' | 'layers' | 'satGroups' | 'balloonSublayers' | 'droneSublayers'
+>;
+
+function isEntityVisibleForCounts(entity: SkyEntity, ctx: OverheadSelectionContext): boolean {
+  if (!ctx.layers[entity.category]) return false;
+  if (entity.category === 'satellite' && !ctx.satGroups[entity.group]) return false;
+  if (entity.category === 'balloon' && !isBalloonSublayerEnabled(entity, ctx.balloonSublayers)) {
+    return false;
+  }
+  if (entity.category === 'drone' && !isDroneSublayerEnabled(entity, ctx.droneSublayers)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Determine whether an active entity falls within the HUD displayed count scope.
+ * Flights, Military, Orbital satellites, and Balloons are strictly scoped to the selected
+ * ground radius (`groundDistKm <= radiusKm`), while UAS / Drones remain global.
+ */
+export function isEntityWithinDisplayCountScope(
+  entity: SkyEntity,
+  observer: Pick<ObserverLocation, 'lat' | 'lon'>,
+  radiusKm: number
+): boolean {
+  if (entity.category === 'drone') {
+    return true;
+  }
+  if (!Number.isFinite(radiusKm) || radiusKm < 0) {
+    return false;
+  }
+  const topoDist = entity.topocentric?.groundDistKm;
+  const groundDistKm =
+    typeof topoDist === 'number' && Number.isFinite(topoDist) && topoDist >= 0
+      ? topoDist
+      : haversineDistanceKm(observer.lat, observer.lon, entity.lat, entity.lon);
+  return Number.isFinite(groundDistKm) && groundDistKm <= radiusKm;
+}
+
+/**
+ * Compute displayed HUD counts from the live rendered entity collection.
+ * Global entities remain rendered in `liveKinematicsRegistry.entities`, while displayed counts
+ * for Flights, Military, Orbital satellites, and Balloons only count entities within `radiusKm`
+ * and UAS (`drone`) counts stay global.
+ */
+export function computeDisplayedSkyCounts(
+  entities: Iterable<SkyEntity>,
+  ctx: DisplayCountContext
+): SkyCounts {
+  let flight = 0;
+  let military = 0;
+  let satellite = 0;
+  let balloon = 0;
+  let drone = 0;
+  let overheadPrimary = 0;
+  let overheadFallback = 0;
+
+  for (const entity of entities) {
+    if (!isEntityVisibleForCounts(entity, ctx)) continue;
+
+    const el = entity.topocentric?.elevationDeg;
+    if (Number.isFinite(el)) {
+      if (el >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
+        overheadPrimary += 1;
+      } else if (el >= OVERHEAD_FALLBACK_MIN_EL_DEG) {
+        overheadFallback += 1;
+      }
+    }
+
+    if (!isEntityWithinDisplayCountScope(entity, ctx.observer, ctx.radiusKm)) {
+      continue;
+    }
+
+    switch (entity.category) {
+      case 'flight':
+        flight += 1;
+        break;
+      case 'military':
+        military += 1;
+        break;
+      case 'satellite':
+        satellite += 1;
+        break;
+      case 'balloon':
+        balloon += 1;
+        break;
+      case 'drone':
+        drone += 1;
+        break;
+    }
+  }
+
+  const total = flight + military + satellite + balloon + drone;
+  return {
+    flight,
+    military,
+    satellite,
+    balloon,
+    drone,
+    overhead: overheadPrimary > 0 ? overheadPrimary : overheadFallback,
+    overheadConeDeg: overheadPrimary > 0 ? 45 : 20,
+    total,
+  };
+}
+
 /**
  * Collect visible overhead targets sorted deterministically by descending elevation,
  * ascending slant range, and ID. Prefers targets in the high overhead cone (EL >= 45 deg),
@@ -389,14 +496,7 @@ export function getOverheadCandidates(ctx: OverheadSelectionContext): {
   const fallback: SkyEntity[] = [];
 
   for (const entity of liveKinematicsRegistry.entities.values()) {
-    if (!ctx.layers[entity.category]) continue;
-    if (entity.category === 'satellite' && !ctx.satGroups[entity.group]) continue;
-    if (entity.category === 'balloon' && !isBalloonSublayerEnabled(entity, ctx.balloonSublayers)) {
-      continue;
-    }
-    if (entity.category === 'drone' && !isDroneSublayerEnabled(entity, ctx.droneSublayers)) {
-      continue;
-    }
+    if (!isEntityVisibleForCounts(entity, ctx)) continue;
     const el = entity.topocentric?.elevationDeg;
     if (!Number.isFinite(el) || el < OVERHEAD_FALLBACK_MIN_EL_DEG) continue;
     if (el >= OVERHEAD_PRIMARY_MIN_EL_DEG) {
@@ -535,13 +635,32 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
   setLocationStatus: (locationStatus, locationError = null) =>
     set({ locationStatus, locationError }),
   setRadiusKm: (radiusKm) =>
-    set({ radiusKm: Math.max(10, Math.min(250, Math.round(radiusKm))) }),
+    set((state) => {
+      const nextRadiusKm = Math.max(10, Math.min(250, Math.round(radiusKm)));
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
+      return {
+        radiusKm: nextRadiusKm,
+        ...(hadEntities
+          ? {
+              counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), {
+                ...state,
+                radiusKm: nextRadiusKm,
+              }),
+            }
+          : {}),
+      };
+    }),
   toggleLayer: (category) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextLayers = { ...state.layers, [category]: !state.layers[category] };
-      pruneLiveKinematicsRegistry({ ...state, layers: nextLayers });
+      const nextCtx = { ...state, layers: nextLayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         layers: nextLayers,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -550,10 +669,15 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   setLayer: (category, enabled) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextLayers = { ...state.layers, [category]: enabled };
-      pruneLiveKinematicsRegistry({ ...state, layers: nextLayers });
+      const nextCtx = { ...state, layers: nextLayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         layers: nextLayers,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -562,10 +686,15 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   toggleSatGroup: (group) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextSatGroups = { ...state.satGroups, [group]: !state.satGroups[group] };
-      pruneLiveKinematicsRegistry({ ...state, satGroups: nextSatGroups });
+      const nextCtx = { ...state, satGroups: nextSatGroups };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         satGroups: nextSatGroups,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -574,13 +703,18 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   toggleBalloonSublayer: (key) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextBalloonSublayers = {
         ...state.balloonSublayers,
         [key]: !state.balloonSublayers[key],
       };
-      pruneLiveKinematicsRegistry({ ...state, balloonSublayers: nextBalloonSublayers });
+      const nextCtx = { ...state, balloonSublayers: nextBalloonSublayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         balloonSublayers: nextBalloonSublayers,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -589,10 +723,15 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   setBalloonSublayer: (key, enabled) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextBalloonSublayers = { ...state.balloonSublayers, [key]: enabled };
-      pruneLiveKinematicsRegistry({ ...state, balloonSublayers: nextBalloonSublayers });
+      const nextCtx = { ...state, balloonSublayers: nextBalloonSublayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         balloonSublayers: nextBalloonSublayers,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -601,46 +740,63 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   toggleDroneSublayer: (key) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextVal = !state.droneSublayers[key];
       const nextDroneSublayers = { ...state.droneSublayers, [key]: nextVal };
-      pruneLiveKinematicsRegistry({ ...state, droneSublayers: nextDroneSublayers });
+      const nextCtx = { ...state, droneSublayers: nextDroneSublayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       const nextHoveredId =
         state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
           ? null
           : state.hoveredId;
+      const countPatch = hadEntities
+        ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+        : {};
       if (key === 'simOdid') {
         return {
           droneSublayers: nextDroneSublayers,
           odidConfig: { ...state.odidConfig, simulatorEnabled: nextVal },
           hoveredId: nextHoveredId,
+          ...countPatch,
         };
       }
-      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId };
+      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId, ...countPatch };
     }),
   setDroneSublayer: (key, enabled) =>
     set((state) => {
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextDroneSublayers = { ...state.droneSublayers, [key]: enabled };
-      pruneLiveKinematicsRegistry({ ...state, droneSublayers: nextDroneSublayers });
+      const nextCtx = { ...state, droneSublayers: nextDroneSublayers };
+      pruneLiveKinematicsRegistry(nextCtx);
       const nextHoveredId =
         state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
           ? null
           : state.hoveredId;
+      const countPatch = hadEntities
+        ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+        : {};
       if (key === 'simOdid') {
         return {
           droneSublayers: nextDroneSublayers,
           odidConfig: { ...state.odidConfig, simulatorEnabled: enabled },
           hoveredId: nextHoveredId,
+          ...countPatch,
         };
       }
-      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId };
+      return { droneSublayers: nextDroneSublayers, hoveredId: nextHoveredId, ...countPatch };
     }),
   setFullConstellation: (fullConstellation) => set({ fullConstellation }),
   setOrbitalScope: (orbitalScope) => set({ orbitalScope }),
   setAtmosphericScope: (atmosphericScope) =>
     set((state) => {
-      pruneLiveKinematicsRegistry({ ...state, atmosphericScope });
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
+      const nextCtx = { ...state, atmosphericScope };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         atmosphericScope,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -649,10 +805,15 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
     }),
   toggleAtmosphericScope: () =>
     set((state) => {
-      const nextScope = state.atmosphericScope === 'global' ? 'local' : 'global';
-      pruneLiveKinematicsRegistry({ ...state, atmosphericScope: nextScope });
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
+      const nextScope: AtmosphericScope = state.atmosphericScope === 'global' ? 'local' : 'global';
+      const nextCtx = { ...state, atmosphericScope: nextScope };
+      pruneLiveKinematicsRegistry(nextCtx);
       return {
         atmosphericScope: nextScope,
+        ...(hadEntities
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         hoveredId:
           state.hoveredId && !liveKinematicsRegistry.entities.has(state.hoveredId)
             ? null
@@ -798,16 +959,18 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
         patch.radiusKm !== undefined
           ? Math.max(10, Math.min(250, Math.round(patch.radiusKm)))
           : state.radiusKm;
+      const hadEntities = liveKinematicsRegistry.entities.size > 0;
       const nextLayers = patch.layers ? { ...state.layers, ...patch.layers } : state.layers;
       const nextScope = patch.atmosphericScope ?? state.atmosphericScope;
+      const nextCtx = {
+        ...state,
+        observer: nextObserver,
+        radiusKm: nextRadiusKm,
+        layers: nextLayers,
+        atmosphericScope: nextScope,
+      };
       if (patch.layers || patch.atmosphericScope !== undefined || patch.observer || patch.radiusKm !== undefined) {
-        pruneLiveKinematicsRegistry({
-          ...state,
-          observer: nextObserver,
-          radiusKm: nextRadiusKm,
-          layers: nextLayers,
-          atmosphericScope: nextScope,
-        });
+        pruneLiveKinematicsRegistry(nextCtx);
       }
       return {
         observer: nextObserver,
@@ -816,6 +979,9 @@ export const useSkyStore = create<SkyStoreState>((set, get) => ({
         recenterNonce: patch.observer ? state.recenterNonce + 1 : state.recenterNonce,
         radiusKm: nextRadiusKm,
         layers: nextLayers,
+        ...(hadEntities && !patch.observer
+          ? { counts: computeDisplayedSkyCounts(liveKinematicsRegistry.entities.values(), nextCtx) }
+          : {}),
         units: patch.units ?? state.units,
         layout: patch.layout ?? state.layout,
         orbitalScope: patch.orbitalScope ?? state.orbitalScope,
