@@ -1369,7 +1369,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
 
-    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v5'");
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v6'");
     expect(swSource).toContain("addEventListener('install'");
     expect(swSource).toContain("addEventListener('activate'");
     expect(swSource).toContain("addEventListener('fetch'");
@@ -1421,6 +1421,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
           'krunked-skymap-v3',
           'krunked-skymap-v4',
           'krunked-skymap-v5',
+          'krunked-skymap-v6',
         ];
       },
       async delete(key: string) {
@@ -1442,7 +1443,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       Promise,
     });
 
-    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v5)
+    // Activate deletes old cache versions while keeping current CACHE_VERSION (krunked-skymap-v6)
     const activateTasks: Array<Promise<unknown>> = [];
     listeners.get('activate')?.({
       waitUntil(p: Promise<unknown>) {
@@ -1455,8 +1456,9 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
       'krunked-skymap-v2',
       'krunked-skymap-v3',
       'krunked-skymap-v4',
+      'krunked-skymap-v5',
     ]);
-    expect(deletedCaches).not.toContain('krunked-skymap-v5');
+    expect(deletedCaches).not.toContain('krunked-skymap-v6');
 
     // Telemetry, CORS relays (r.jina.ai), and /api-proxy/ URLs MUST bypass respondWith()
     const fetchListener = listeners.get('fetch')!;
@@ -1500,7 +1502,7 @@ describe('Challenge 6 — PWA Manifest, Binary Raster PNGs & Service Worker Inte
     expect(indexHtml).toContain('href="./manifest.json"');
     expect(indexHtml).toContain('href="./icons/apple-touch-icon.png"');
     expect(indexHtml).toContain('name="theme-color" content="#06090F"');
-    expect(indexHtml).toContain("navigator.serviceWorker.register('./sw.js', { scope: './' })");
+    expect(indexHtml).toContain("register('./sw.js', { scope: './', updateViaCache: 'none' })");
 
     const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8').replace(/\r\n/g, '\n');
     expect(viteConfig).toContain("base: './'");
@@ -2798,13 +2800,13 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
     ).toBe(true);
   });
 
-  it('verifies sw.js krunked-skymap-v5 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
+  it('verifies sw.js krunked-skymap-v6 bypass of /api-proxy/windborne and same-origin .json data while caching manifest.json', async () => {
     const fs = await loadNodeFs();
     const vm = await loadNodeVm();
     const swSource = fs.readFileSync(repoFileUrl('public/sw.js'), 'utf8');
     const viteConfig = fs.readFileSync(repoFileUrl('vite.config.ts'), 'utf8').replace(/\r\n/g, '\n');
 
-    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v5'");
+    expect(swSource).toContain("const CACHE_VERSION = 'krunked-skymap-v6'");
     expect(viteConfig).toContain("'/api-proxy/windborne': createAdsbProxyEntry('/api-proxy/windborne', 'https://a.windbornesystems.com')");
 
     const listeners = new Map<string, (ev: unknown) => void>();
@@ -2838,7 +2840,7 @@ describe('Challenge 8 — Sprint 03 Global WindBorne, Mil/LADD/PIA, ATC UAS/LTA,
         };
       },
       async keys() {
-        return ['krunked-skymap-v5'];
+        return ['krunked-skymap-v6'];
       },
       async delete() {
         return true;
