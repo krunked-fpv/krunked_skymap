@@ -243,7 +243,7 @@ select {
 
 .skymap-stage[data-layout='split'] .stage-dome-pane .skydome-bezel-controls,
 .skymap-stage[data-layout='dome'] .stage-dome-pane .skydome-bezel-controls {
-  bottom: 66px !important;
+  bottom: var(--skydome-dock-lift, 66px) !important;
 }
 
 /* ==========================================================================
@@ -2329,7 +2329,7 @@ select {
 @media (max-width: 767px) {
   .top-telemetry-bar {
     flex-wrap: wrap;
-    gap: 4px 6px;
+    gap: 4px;
     padding:
       max(5px, env(safe-area-inset-top))
       max(8px, env(safe-area-inset-right))
@@ -2340,12 +2340,14 @@ select {
   .topbar-zone--left {
     flex: 1 1 0;
     min-width: 0;
-    gap: 5px;
+    overflow: hidden;
+    gap: 4px;
   }
 
   .topbar-zone--right {
     flex: 0 0 auto;
-    gap: 5px;
+    min-width: 0;
+    gap: 3px;
   }
 
   .topbar-zone--center {
@@ -2357,15 +2359,17 @@ select {
   }
 
   .topbar-crest {
-    height: 34px;
-    padding: 0 8px;
+    display: none;
   }
 
   .topbar-omnibox-btn {
     height: 34px;
     flex: 1 1 0;
+    min-width: 54px;
     max-width: none;
-    padding: 0 8px;
+    gap: 4px;
+    padding: 0 6px;
+    overflow: hidden;
   }
 
   .topbar-action-btn,
@@ -2377,10 +2381,10 @@ select {
   }
 
   .topbar-overhead-btn {
-    padding: 0 6px;
-    gap: 4px;
-    font-size: 8.5px;
-    letter-spacing: 0.03em;
+    padding: 0 5px;
+    gap: 3px;
+    font-size: 8px;
+    letter-spacing: 0.02em;
   }
 
   .topbar-overhead-btn__dot {
@@ -2388,11 +2392,25 @@ select {
   }
 
   .topbar-beacon-pill {
-    max-width: 82px;
+    max-width: 62px;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    padding: 0 7px;
-    font-size: 9px;
+    gap: 4px;
+    padding: 0 5px;
+    font-size: 8px;
+    letter-spacing: 0.02em;
+  }
+
+  .topbar-beacon-pill__dot {
+    width: 5px;
+    height: 5px;
+  }
+
+  .topbar-beacon-pill > span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .pwa-install-btn span {
@@ -2400,7 +2418,12 @@ select {
   }
 
   .pwa-install-btn {
-    padding: 0 7px;
+    padding: 0 5px;
+  }
+
+  .pwa-dismiss-btn {
+    width: 20px;
+    font-size: 12px;
   }
 
   .topbar-action-btn--sweep .topbar-sweep-text {
@@ -2408,12 +2431,14 @@ select {
   }
 
   .topbar-action-btn--sweep {
-    width: 34px;
+    width: 29px;
     padding: 0;
+    flex-shrink: 0;
   }
 
   .topbar-action-btn--icon {
-    width: 34px;
+    width: 29px;
+    flex-shrink: 0;
   }
 
   .segmented-control,
@@ -2442,7 +2467,7 @@ select {
     top: calc(88px + env(safe-area-inset-top));
   }
 
-  /* Split view overlays translucent Sky-Dome across bottom 48% on <= 767px */
+  /* Split view overlays translucent Sky-Dome across bottom 54% on <= 767px for generous mobile radar radius */
   .skymap-stage[data-layout='split'] .stage-dome-pane,
   .skymap-stage.skymap-stage--split .stage-dome-pane,
   [data-layout='split'] [data-pane='dome'] {
@@ -2451,7 +2476,7 @@ select {
     bottom: 0;
     top: auto;
     width: 100%;
-    height: 48%;
+    height: 54%;
     z-index: 12;
     border-left: none;
     border-top: 1px solid var(--border-hairline-strong);
@@ -2478,14 +2503,50 @@ select {
   /* Lift SkyDome bezel micro-controls & MapLibre controls clear of mobile split pane & bottom dock */
   .skymap-stage[data-layout='split'] .stage-map-pane .maplibregl-ctrl-bottom-right {
     right: max(8px, env(safe-area-inset-right));
-    bottom: calc(48% + 8px);
+    bottom: calc(54% + 8px);
+  }
+
+  .skymap-stage .stage-dome-pane .skydome-corner-title {
+    top: 6px !important;
+    left: max(8px, env(safe-area-inset-left)) !important;
+    padding: 3px 6px !important;
+  }
+
+  .skymap-stage .stage-dome-pane .skydome-readout {
+    top: 6px !important;
+    right: max(8px, env(safe-area-inset-right)) !important;
+    padding: 3px 6px !important;
+    font-size: 8.5px !important;
+    letter-spacing: 0.02em !important;
+    max-width: calc(100% - 124px);
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .skymap-stage[data-layout='split'] .stage-dome-pane .skydome-bezel-controls,
   .skymap-stage[data-layout='dome'] .stage-dome-pane .skydome-bezel-controls,
-  .skymap-stage .stage-dome-pane .skydome-bezel-controls,
+  .skymap-stage .stage-dome-pane .skydome-bezel-controls {
+    bottom: var(--skydome-dock-lift, calc(104px + env(safe-area-inset-bottom))) !important;
+    left: max(8px, env(safe-area-inset-left)) !important;
+    max-width: calc(100% - 82px) !important;
+    flex-wrap: nowrap !important;
+    gap: 3px !important;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .skymap-stage .stage-dome-pane .skydome-bezel-controls::-webkit-scrollbar {
+    display: none;
+  }
+
   .skymap-stage .stage-dome-pane .skydome-legend {
-    bottom: 118px !important;
+    bottom: var(--skydome-dock-lift, calc(104px + env(safe-area-inset-bottom))) !important;
+    right: max(8px, env(safe-area-inset-right)) !important;
+    height: 27px;
+    padding: 0 6px !important;
+    font-size: 8px !important;
+    gap: 4px !important;
+    white-space: nowrap;
   }
 
   .skymap-stage[data-layout='map'] .maplibregl-ctrl-bottom-right {
@@ -2505,8 +2566,8 @@ select {
     width: 100%;
     flex-direction: column;
     align-items: stretch;
-    gap: 6px;
-    padding: 6px;
+    gap: 4px;
+    padding: 5px 6px;
     border-radius: 12px;
   }
 
@@ -2556,12 +2617,12 @@ select {
 
   .dock-radius-scrubber {
     width: 100%;
-    height: 30px;
+    height: 26px;
     padding: 0 4px;
     margin-left: 0;
     border-left: none;
     border-top: 1px solid var(--border-hairline);
-    padding-top: 4px;
+    padding-top: 3px;
   }
 
   .dock-range {

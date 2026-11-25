@@ -160,6 +160,200 @@ interface CanvasMetrics {
   cx: number;
   cy: number;
   outerRadius: number;
+  badgeRadius: number;
+  topInset: number;
+  bottomInset: number;
+  leftInset: number;
+  rightInset: number;
+}
+
+export interface SkyDomeApertureInput {
+  /** Width of the Sky-Dome canvas stage in CSS px. */
+  width: number;
+  /** Height of the Sky-Dome canvas stage in CSS px. */
+  height: number;
+  /** Layout mode of the Sky-Dome pane ('split' | 'dome' | 'pip'). */
+  mode: DomeLabelMode;
+  /** Browser viewport width in CSS px (defaults to `width` when omitted). */
+  viewportWidth?: number;
+  /** Whether the floating bottom ControlDock is mounted in the parent stage (defaults to true outside PIP). */
+  hasStageDock?: boolean;
+  /** Live measured bottom edge of top header/readout pills relative to canvas stage top (px). */
+  measuredTopHudBottomPx?: number | null;
+  /** Live measured top edge of bottom HUD (bezel controls, legend, ControlDock) relative to canvas stage top (px). */
+  measuredBottomHudTopPx?: number | null;
+}
+
+export interface SkyDomeApertureMetrics {
+  width: number;
+  height: number;
+  isPip: boolean;
+  isMobile: boolean;
+  isCompact: boolean;
+  badgeRadius: number;
+  /** Exterior clearance beyond `outerRadius` reserved for bezel, lubber tick, and `N/E/S/W` badges (`>= 24` outside PIP). */
+  exteriorClearancePx: number;
+  topInset: number;
+  bottomInset: number;
+  leftInset: number;
+  rightInset: number;
+  availWidth: number;
+  availHeight: number;
+  cx: number;
+  cy: number;
+  outerRadius: number;
+}
+
+/**
+ * Determine exterior cardinal compass badge circle radius (`N/E/S/W`), shared between
+ * `computeSkyDomeApertureMetrics` and `drawVault` so layout math and canvas rendering match to the pixel.
+ */
+export function getSkyDomeBadgeRadius(
+  isPip: boolean,
+  isMobile: boolean,
+  minStageDim: number
+): number {
+  if (isPip) return 6.5;
+  if (isMobile || minStageDim < 420) return 8;
+  return 9;
+}
+
+/**
+ * Deterministically compute safe HUD aperture insets (`topInset`, `bottomInset`, `leftInset`, `rightInset`),
+ * vault center (`cx`, `cy`), and `outerRadius` so the circular Polar Sky-Dome, lubber triangle, and exterior
+ * `N/E/S/W` compass badges (`R + 8 + 2 * badgeRadius`) never touch or overlap top header/readout pills,
+ * `.skydome-bezel-controls`, `.skydome-legend`, or the floating `.control-dock-wrap`.
+ */
+export function computeSkyDomeApertureMetrics(
+  input: SkyDomeApertureInput
+): SkyDomeApertureMetrics {
+  const width = Number.isFinite(input.width) && input.width > 0 ? input.width : 0;
+  const height = Number.isFinite(input.height) && input.height > 0 ? input.height : 0;
+  const isPip = input.mode === 'pip';
+  const vpW =
+    typeof input.viewportWidth === 'number' &&
+    Number.isFinite(input.viewportWidth) &&
+    input.viewportWidth > 0
+      ? input.viewportWidth
+      : width;
+  const isMobile = !isPip && vpW <= 767;
+  const minDim = Math.min(width, height);
+  const isCompact = isPip || isMobile || minDim < 360 || width < 420;
+  const badgeRadius = getSkyDomeBadgeRadius(isPip, isMobile, minDim);
+  const hasStageDock = isPip ? false : input.hasStageDock !== false;
+
+  if (width <= 0 || height <= 0) {
+    return {
+      width: 0,
+      height: 0,
+      isPip,
+      isMobile,
+      isCompact,
+      badgeRadius,
+      exteriorClearancePx: isPip ? 24 : 26,
+      topInset: 0,
+      bottomInset: 0,
+      leftInset: 0,
+      rightInset: 0,
+      availWidth: 0,
+      availHeight: 0,
+      cx: 0,
+      cy: 0,
+      outerRadius: 0,
+    };
+  }
+
+  if (isPip) {
+    const exteriorClearancePx = 24;
+    const outerRadius = Math.max(16, minDim / 2 - exteriorClearancePx);
+    return {
+      width,
+      height,
+      isPip: true,
+      isMobile: false,
+      isCompact: true,
+      badgeRadius,
+      exteriorClearancePx,
+      topInset: 0,
+      bottomInset: 0,
+      leftInset: 0,
+      rightInset: 0,
+      availWidth: width,
+      availHeight: height,
+      cx: width / 2,
+      cy: height / 2,
+      outerRadius,
+    };
+  }
+
+  // Fallback safe HUD reservations when DOM rects are unmeasured (unit tests / initial layout pass)
+  const fallbackTopInset = isMobile ? 31 : hasStageDock ? 56 : 44;
+  const fallbackBottomInset = isMobile
+    ? 136
+    : hasStageDock
+    ? width < 640
+      ? 138
+      : 106
+    : 44;
+
+  let topInset = fallbackTopInset;
+  if (
+    typeof input.measuredTopHudBottomPx === 'number' &&
+    Number.isFinite(input.measuredTopHudBottomPx) &&
+    input.measuredTopHudBottomPx > 0
+  ) {
+    topInset = Math.max(fallbackTopInset, Math.ceil(input.measuredTopHudBottomPx) + 5);
+  }
+  topInset = Math.min(Math.round(height * 0.36), topInset);
+
+  let bottomInset = fallbackBottomInset;
+  if (
+    typeof input.measuredBottomHudTopPx === 'number' &&
+    Number.isFinite(input.measuredBottomHudTopPx) &&
+    input.measuredBottomHudTopPx > 0 &&
+    input.measuredBottomHudTopPx < height
+  ) {
+    const measuredFromBottom = Math.ceil(height - input.measuredBottomHudTopPx) + 5;
+    bottomInset = Math.max(fallbackBottomInset, measuredFromBottom);
+  }
+  bottomInset = Math.min(Math.round(height * 0.64), bottomInset);
+
+  const leftInset = isMobile ? 6 : 8;
+  const rightInset = isMobile ? 6 : 8;
+
+  const availWidth = Math.max(0, width - leftInset - rightInset);
+  const availHeight = Math.max(0, height - topInset - bottomInset);
+  const availMin = Math.min(availWidth, availHeight);
+
+  // Exterior compass badges reach `R + 8 + 2 * badgeRadius + 0.55` from center (`24.55px` mobile, `26.55px` desktop).
+  // Keep `exteriorClearancePx >= 26` on mobile and `>= 30` on desktop (`>= 24` everywhere outside PIP).
+  const minExteriorMargin = isMobile || badgeRadius <= 8 ? 26 : 30;
+  const exteriorClearancePx = isMobile
+    ? minExteriorMargin
+    : Math.max(minExteriorMargin, Math.min(44, Math.round(availMin * 0.075)));
+
+  const cx = leftInset + availWidth / 2;
+  const cy = topInset + availHeight / 2;
+  const outerRadius = Math.max(14, availMin / 2 - exteriorClearancePx);
+
+  return {
+    width,
+    height,
+    isPip: false,
+    isMobile,
+    isCompact,
+    badgeRadius,
+    exteriorClearancePx,
+    topInset,
+    bottomInset,
+    leftInset,
+    rightInset,
+    availWidth,
+    availHeight,
+    cx,
+    cy,
+    outerRadius,
+  };
 }
 
 interface VaultCache {
@@ -423,6 +617,14 @@ export interface DomeLabelLayoutOptions {
   cx: number;
   cy: number;
   radius: number;
+  /** Safe top HUD inset in px; placed labels stay strictly at `y >= max(8, topInset)`. */
+  topInset?: number;
+  /** Safe bottom HUD inset in px; placed labels stay strictly at `y + h <= height - max(8, bottomInset)`. */
+  bottomInset?: number;
+  /** Safe left inset in px; placed labels stay strictly at `x >= max(8, leftInset)`. */
+  leftInset?: number;
+  /** Safe right inset in px; placed labels stay strictly at `x + w <= width - max(8, rightInset)`. */
+  rightInset?: number;
   mode: DomeLabelMode;
   zoomMode: SkyDomeZoomMode;
   labelsEnabled: boolean;
@@ -464,8 +666,16 @@ function labelBoxValid(
   h: number,
   o: DomeLabelLayoutOptions
 ): boolean {
+  if (w <= 0 || h <= 0) return false;
   const m = LABEL_EDGE_MARGIN;
-  if (x < m || y < m || x + w > o.width - m || y + h > o.height - m) return false;
+  const minX = Math.max(m, typeof o.leftInset === 'number' && Number.isFinite(o.leftInset) ? o.leftInset : 0);
+  const maxX =
+    o.width - Math.max(m, typeof o.rightInset === 'number' && Number.isFinite(o.rightInset) ? o.rightInset : 0);
+  const minY = Math.max(m, typeof o.topInset === 'number' && Number.isFinite(o.topInset) ? o.topInset : 0);
+  const maxY =
+    o.height -
+    Math.max(m, typeof o.bottomInset === 'number' && Number.isFinite(o.bottomInset) ? o.bottomInset : 0);
+  if (x < minX || y < minY || x + w > maxX || y + h > maxY) return false;
   const lim = o.radius - 8;
   if (lim <= 0) return false;
   const l2 = lim * lim;
@@ -525,7 +735,7 @@ export function solveDomeLabelLayout(o: DomeLabelLayoutOptions): DomeLabelLayout
       if (c.elDeg < minPassiveEl) continue;
       if (passive >= cap) continue;
     }
-    const w = c.w;
+    let w = c.w;
     const h = c.h;
     let bx = 0;
     let by = 0;
@@ -570,12 +780,40 @@ export function solveDomeLabelLayout(o: DomeLabelLayoutOptions): DomeLabelLayout
       }
     }
     if (!found && mustShow) {
-      // Pull the pill toward the dome center until it satisfies the aperture constraints.
+      // Pull the pill toward the dome center until it satisfies both circular aperture and HUD safe bounds.
       for (let s = 1; s <= 12 && !found; s += 1) {
         const t = s / 12;
         bx = c.x + (o.cx - c.x) * t - w / 2;
         by = c.y + (o.cy - c.y) * t - h / 2;
-        if (labelBoxValid(bx, by, w, h, o)) found = true;
+        if (labelBoxValid(bx, by, w, h, o) && !labelOverlaps(bx, by, w, h, labels, placedCount)) {
+          found = true;
+        }
+      }
+      if (!found) {
+        for (let s = 1; s <= 12 && !found; s += 1) {
+          const t = s / 12;
+          bx = c.x + (o.cx - c.x) * t - w / 2;
+          by = c.y + (o.cy - c.y) * t - h / 2;
+          if (labelBoxValid(bx, by, w, h, o)) found = true;
+        }
+      }
+      if (!found) {
+        // On ultra-compact mobile split domes, clamp pill width to maximum valid chord inside `radius - 8`.
+        const lim = o.radius - 8;
+        const halfH = h / 2;
+        const maxChordW = lim > halfH ? Math.floor(2 * Math.sqrt(lim * lim - halfH * halfH) - 2) : 0;
+        if (maxChordW >= 24 && w > maxChordW) {
+          const clampedW = maxChordW;
+          for (let s = 1; s <= 12 && !found; s += 1) {
+            const t = s / 12;
+            bx = c.x + (o.cx - c.x) * t - clampedW / 2;
+            by = c.y + (o.cy - c.y) * t - h / 2;
+            if (labelBoxValid(bx, by, clampedW, h, o)) {
+              w = clampedW;
+              found = true;
+            }
+          }
+        }
       }
     }
     if (!found) continue;
@@ -1107,7 +1345,7 @@ function ensureVaultCache(
   zoom: SkyDomeZoomMode,
   cache: VaultCache
 ): VaultCache {
-  const key = `${m.width}x${m.height}@${m.dpr}:${zoom}:${m.outerRadius.toFixed(2)}`;
+  const key = `${m.width}x${m.height}@${m.dpr}:${zoom}:${m.cx.toFixed(2)},${m.cy.toFixed(2)}:${m.outerRadius.toFixed(2)}`;
   if (cache.key === key && cache.vault) return cache;
   const { cx, cy, outerRadius: R } = m;
   cache.key = key;
@@ -1175,7 +1413,7 @@ function drawVault(
   const { cx, cy, outerRadius: R, width, height } = m;
   const minDim = Math.min(width, height);
   const isPipGrid = isPipFrame;
-  const compact = minDim < 360;
+  const compact = minDim < 360 || (!isPipGrid && m.badgeRadius <= 8);
   const minEl = minElevationFor(zoom);
   ensureVaultCache(ctx, m, zoom, cache);
 
@@ -1404,7 +1642,7 @@ function drawVault(
   ctx.globalAlpha = 1;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  const badgeR = isPipGrid ? 6.5 : compact ? 8 : 9;
+  const badgeR = m.badgeRadius > 0 ? m.badgeRadius : isPipGrid ? 6.5 : compact ? 8 : 9;
   for (let i = 0; i < COMPASS_BEACONS.length; i += 1) {
     const beacon = COMPASS_BEACONS[i];
     if (isPipGrid && !beacon.cardinal) continue;
@@ -1631,6 +1869,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const cursorReadoutRef = useRef<HTMLSpanElement | null>(null);
+  const topTitleRef = useRef<HTMLDivElement | null>(null);
+  const topReadoutRef = useRef<HTMLDivElement | null>(null);
+  const bezelControlsRef = useRef<HTMLDivElement | null>(null);
+  const legendRef = useRef<HTMLDivElement | null>(null);
 
   const metricsRef = useRef<CanvasMetrics>({
     width: 0,
@@ -1639,6 +1881,11 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     cx: 0,
     cy: 0,
     outerRadius: 100,
+    badgeRadius: 9,
+    topInset: 0,
+    bottomInset: 0,
+    leftInset: 0,
+    rightInset: 0,
   });
 
   const renderedHitsRef = useRef<HitPool>({ items: [], count: 0 });
@@ -1665,8 +1912,13 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   const lastFrameMsRef = useRef<number>(0);
   const pulseWaveStartRef = useRef<number | null>(null);
 
+  const [isMobileViewport, setIsMobileViewport] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false;
+    return (window.innerWidth || 1024) <= 767;
+  });
   const [isCompact, setIsCompact] = useState(false);
   const [showFullLegend, setShowFullLegend] = useState(true);
+  const [dockLiftPx, setDockLiftPx] = useState<number | null>(null);
   const [compassStatusMsg, setCompassStatusMsg] = useState<string | null>(null);
 
   const layout = useSkyStore((s) => s.layout);
@@ -1723,6 +1975,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const updateCanvasSize = useCallback((width: number, height: number) => {
     const canvas = canvasRef.current;
+    const container = containerRef.current;
     if (!canvas) return;
     if (width <= 0 || height <= 0) {
       metricsRef.current = { ...metricsRef.current, width: 0, height: 0 };
@@ -1735,19 +1988,129 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       canvas.width = targetW;
       canvas.height = targetH;
     }
-    const minDim = Math.min(width, height);
-    const padding = isPipRef.current ? 24 : Math.max(32, Math.min(48, minDim * 0.1));
-    const outerRadius = Math.max(36, minDim / 2 - padding);
+
+    const vpW =
+      typeof window !== 'undefined' && Number.isFinite(window.innerWidth) && window.innerWidth > 0
+        ? window.innerWidth
+        : width;
+    const pipNow = isPipRef.current;
+    const modeNow: DomeLabelMode = pipNow
+      ? 'pip'
+      : useSkyStore.getState().layout === 'split'
+      ? 'split'
+      : 'dome';
+    const mobileNow = !pipNow && vpW <= 767;
+
+    let hasStageDock = false;
+    let measuredTopHudBottomPx: number | null = null;
+    let measuredBottomHudTopPx: number | null = null;
+    let nextDockLiftPx: number | null = null;
+
+    if (!pipNow && container) {
+      const containerRect = container.getBoundingClientRect();
+      const stageEl = container.closest('.skymap-stage');
+      hasStageDock = stageEl !== null;
+
+      if (containerRect.width > 0 && containerRect.height > 0) {
+        // Measure top title & readout strip (reject synthetic/full-container mock rects in headless DOM tests)
+        const topEls = [topTitleRef.current, topReadoutRef.current];
+        for (let i = 0; i < topEls.length; i += 1) {
+          const el = topEls[i];
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0 || r.height > 96 || r.height >= height * 0.4) continue;
+          const relBottom = r.bottom - containerRect.top;
+          if (relBottom > 0 && relBottom <= Math.min(110, height * 0.4)) {
+            measuredTopHudBottomPx =
+              measuredTopHudBottomPx === null ? relBottom : Math.max(measuredTopHudBottomPx, relBottom);
+          }
+        }
+
+        // Measure floating ControlDock persistent bar & degraded retry banner relative to dome pane bottom
+        let dockOverlapPx = 0;
+        if (stageEl) {
+          const dockParts = [
+            stageEl.querySelector('.dock-pill'),
+            stageEl.querySelector('.dock-retry-banner'),
+          ];
+          for (let i = 0; i < dockParts.length; i += 1) {
+            const el = dockParts[i];
+            if (!el) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width <= 0 || r.height <= 0 || r.height >= height * 0.55) continue;
+            const horizIntersects = r.right > containerRect.left && r.left < containerRect.right;
+            if (!horizIntersects) continue;
+            const overlap = containerRect.bottom - r.top;
+            if (overlap > 0 && overlap <= height * 0.58) {
+              dockOverlapPx = Math.max(dockOverlapPx, overlap);
+            }
+          }
+        }
+
+        const baseBezelBottom = mobileNow ? 104 : 66;
+        let projectedBezelTopPx: number | null = null;
+        if (dockOverlapPx > baseBezelBottom - 4) {
+          nextDockLiftPx = Math.ceil(dockOverlapPx) + 6;
+          const estBezelH = mobileNow ? 27 : 32;
+          projectedBezelTopPx = height - (nextDockLiftPx + estBezelH);
+        }
+
+        if (dockOverlapPx > 0) {
+          const dockRelTop = height - dockOverlapPx;
+          measuredBottomHudTopPx =
+            measuredBottomHudTopPx === null ? dockRelTop : Math.min(measuredBottomHudTopPx, dockRelTop);
+        }
+        if (projectedBezelTopPx !== null && projectedBezelTopPx > 0) {
+          measuredBottomHudTopPx =
+            measuredBottomHudTopPx === null
+              ? projectedBezelTopPx
+              : Math.min(measuredBottomHudTopPx, projectedBezelTopPx);
+        }
+
+        const bottomEls = [bezelControlsRef.current, legendRef.current];
+        for (let i = 0; i < bottomEls.length; i += 1) {
+          const el = bottomEls[i];
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width <= 0 || r.height <= 0 || r.height > 110 || r.height >= height * 0.45) continue;
+          const relTop = r.top - containerRect.top;
+          if (relTop >= height * 0.32 && relTop < height) {
+            measuredBottomHudTopPx =
+              measuredBottomHudTopPx === null ? relTop : Math.min(measuredBottomHudTopPx, relTop);
+          }
+        }
+      }
+    }
+
+    const ap = computeSkyDomeApertureMetrics({
+      width,
+      height,
+      mode: modeNow,
+      viewportWidth: vpW,
+      hasStageDock,
+      measuredTopHudBottomPx,
+      measuredBottomHudTopPx,
+    });
+
     metricsRef.current = {
       width,
       height,
       dpr,
-      cx: width / 2,
-      cy: height / 2,
-      outerRadius,
+      cx: ap.cx,
+      cy: ap.cy,
+      outerRadius: ap.outerRadius,
+      badgeRadius: ap.badgeRadius,
+      topInset: ap.topInset,
+      bottomInset: ap.bottomInset,
+      leftInset: ap.leftInset,
+      rightInset: ap.rightInset,
     };
-    setIsCompact(minDim < 360 || width < 420);
-    setShowFullLegend(width >= 680);
+
+    setIsMobileViewport((prev) => (prev === mobileNow ? prev : mobileNow));
+    setIsCompact((prev) => (prev === ap.isCompact ? prev : ap.isCompact));
+    const nextFullLegend = !mobileNow && width >= 680;
+    setShowFullLegend((prev) => (prev === nextFullLegend ? prev : nextFullLegend));
+    setDockLiftPx((prev) => (prev === nextDockLiftPx ? prev : nextDockLiftPx));
   }, []);
 
   useEffect(() => {
@@ -1759,6 +2122,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     }
   }, [sweepPulseCounter]);
 
+  const showNorthReset =
+    Math.abs(shortestAngleDeltaDeg(0, domeRotationDeg)) >= 0.5 || domeCompassActive;
+
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -1768,8 +2134,27 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     };
     syncLayoutSize();
     const rafId = requestAnimationFrame(syncLayoutSize);
-    return () => cancelAnimationFrame(rafId);
-  }, [layout, skyDomePip, updateCanvasSize]);
+
+    let hudRO: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      hudRO = new ResizeObserver(() => {
+        syncLayoutSize();
+      });
+      if (bezelControlsRef.current) hudRO.observe(bezelControlsRef.current);
+      const dockEl = container.closest('.skymap-stage')?.querySelector('.control-dock-wrap');
+      if (dockEl) hudRO.observe(dockEl);
+    }
+
+    const mql =
+      typeof window !== 'undefined' ? window.matchMedia?.('(max-width: 767px)') ?? null : null;
+    mql?.addEventListener?.('change', syncLayoutSize);
+
+    return () => {
+      cancelAnimationFrame(rafId);
+      hudRO?.disconnect();
+      mql?.removeEventListener?.('change', syncLayoutSize);
+    };
+  }, [layout, skyDomePip, showNorthReset, isMobileViewport, dockLiftPx, updateCanvasSize]);
 
   useEffect(() => {
     if (layout === 'map' && !skyDomePip && pointerInsideRef.current) {
@@ -2506,8 +2891,12 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
         const tw = ctx.measureText(text).width + 8;
-        const px = Math.max(8, Math.min(metrics.width - tw - 8, peakMarkerX + 8));
-        const py = Math.max(8, Math.min(metrics.height - 21, peakMarkerY - 18));
+        const minPx = Math.max(8, metrics.leftInset, cx - R + 4);
+        const maxPx = Math.max(minPx, Math.min(metrics.width - tw - Math.max(8, metrics.rightInset), cx + R - tw - 4));
+        const minPy = Math.max(8, metrics.topInset, cy - R + 4);
+        const maxPy = Math.max(minPy, Math.min(metrics.height - Math.max(8, metrics.bottomInset) - 13, cy + R - 17));
+        const px = Math.max(minPx, Math.min(maxPx, peakMarkerX + 8));
+        const py = Math.max(minPy, Math.min(maxPy, peakMarkerY - 18));
         ctx.fillStyle = 'rgba(15, 10, 30, 0.9)';
         ctx.strokeStyle = 'rgba(232, 121, 249, 0.72)';
         ctx.lineWidth = 0.85;
@@ -2564,7 +2953,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       }
 
       // Labels: build candidates from highest priority downward, then solve layout
-      const compactDome = metrics.width < 420 || metrics.height < 360;
+      const compactDome = metrics.width < 420 || metrics.height < 360 || R < 110;
       candCount = 0;
       for (let i = sorted.length - 1; i >= 0 && candCount < 40; i -= 1) {
         const item = sorted[i];
@@ -2574,8 +2963,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         const isHigh = mustShow || item.isEmergency || item.isBreach || item.priority >= 58;
         const elRounded = Math.round(item.elDeg);
         let text: string;
-        if (isPipFrame) {
+        if (isPipFrame || R < 58) {
           text = item.entity.callsign;
+        } else if (R < 88) {
+          text = isHigh ? `${item.entity.callsign} · ${elRounded}°` : item.entity.callsign;
         } else if (isHigh) {
           const altStr = formatCompactDomeAltitude(item.entity, activeUnits);
           text = altStr
@@ -2585,8 +2976,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           text = item.entity.callsign;
         }
         ctx.font = mustShow
-          ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
-          : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
+          ? `700 ${compactDome ? 9 : 10}px ${MONO_FONT}`
+          : `600 ${compactDome ? 8.5 : 9.5}px ${MONO_FONT}`;
         let cand = candPool[candCount];
         if (!cand) {
           cand = {
@@ -2611,7 +3002,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         cand.x = item.x;
         cand.y = item.y;
         cand.w = ctx.measureText(text).width + 10;
-        cand.h = 15;
+        cand.h = compactDome ? 14 : 15;
         cand.elDeg = item.elDeg;
         cand.slantRangeKm = item.entity.topocentric.slantRangeKm;
         cand.isSelected = item.isSelected;
@@ -2630,6 +3021,10 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         cx,
         cy,
         radius: R,
+        topInset: metrics.topInset,
+        bottomInset: metrics.bottomInset,
+        leftInset: metrics.leftInset,
+        rightInset: metrics.rightInset,
         mode: labelMode,
         zoomMode: zoom,
         labelsEnabled: state.domeLabelsEnabled,
@@ -2657,8 +3052,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
           ctx.stroke();
         }
         ctx.font = lb.mustShow
-          ? `700 ${compactDome ? 9.5 : 10}px ${MONO_FONT}`
-          : `600 ${compactDome ? 9 : 9.5}px ${MONO_FONT}`;
+          ? `700 ${compactDome ? 9 : 10}px ${MONO_FONT}`
+          : `600 ${compactDome ? 8.5 : 9.5}px ${MONO_FONT}`;
         ctx.fillStyle = lb.mustShow ? 'rgba(7, 10, 17, 0.94)' : 'rgba(7, 10, 17, 0.88)';
         ctx.strokeStyle = lb.mustShow ? lb.color : 'rgba(255, 255, 255, 0.18)';
         ctx.lineWidth = lb.mustShow ? 1.15 : 0.8;
@@ -2667,7 +3062,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         ctx.fill();
         ctx.stroke();
         ctx.fillStyle = lb.mustShow ? '#F8FAFC' : '#E2E8F0';
-        ctx.fillText(lb.text, lb.x + 5, lb.y + lb.h / 2 + 0.5);
+        ctx.fillText(lb.text, lb.x + 5, lb.y + lb.h / 2 + 0.5, Math.max(12, lb.w - 10));
       }
       ctx.restore();
     };
@@ -2984,10 +3379,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const displayHeadingInt = ((Math.round(domeRotationDeg) % 360) + 360) % 360;
   const headingStr = String(displayHeadingInt).padStart(3, '0');
-  const showNorthReset =
-    Math.abs(shortestAngleDeltaDeg(0, domeRotationDeg)) >= 0.5 || domeCompassActive;
 
-  const rootStyle: CSSProperties = {
+  const rootStyle: CSSProperties & { '--skydome-dock-lift'?: string } = {
     position: 'relative',
     display: 'flex',
     flexDirection: 'column',
@@ -2997,6 +3390,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     backgroundColor: 'transparent',
     userSelect: 'none',
     fontFamily: MONO_FONT,
+    ...(dockLiftPx !== null ? { '--skydome-dock-lift': `${dockLiftPx}px` } : {}),
   };
 
   const canvasStageStyle: CSSProperties = {
@@ -3050,47 +3444,56 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
 
   const cornerTitleStyle: CSSProperties = {
     position: 'absolute',
-    top: isCompact ? 8 : 12,
-    left: isCompact ? 8 : 12,
+    top: isMobileViewport ? 6 : isCompact ? 8 : 12,
+    left: isMobileViewport ? 8 : isCompact ? 8 : 12,
     pointerEvents: 'none',
     display: 'flex',
     flexDirection: 'column',
     gap: 2,
-    padding: isCompact ? '4px 7px' : '5px 9px',
+    padding: isMobileViewport ? '3px 6px' : isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
     border: '1px solid rgba(255, 255, 255, 0.1)',
     backdropFilter: 'blur(12px)',
     WebkitBackdropFilter: 'blur(12px)',
+    zIndex: 10,
   };
 
   const readoutStyle: CSSProperties = {
     position: 'absolute',
-    top: isCompact ? 8 : 12,
-    right: isCompact ? 8 : 12,
+    top: isMobileViewport ? 6 : isCompact ? 8 : 12,
+    right: isMobileViewport ? 8 : isCompact ? 8 : 12,
+    maxWidth: isMobileViewport ? 'calc(100% - 124px)' : undefined,
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
     pointerEvents: 'none',
-    padding: isCompact ? '4px 7px' : '5px 9px',
+    padding: isMobileViewport ? '3px 6px' : isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
     border: '1px solid rgba(255, 255, 255, 0.1)',
     backdropFilter: 'blur(12px)',
     WebkitBackdropFilter: 'blur(12px)',
     color: '#CBD5E1',
-    fontSize: isCompact ? 9.5 : 10.5,
+    fontSize: isMobileViewport ? 8.5 : isCompact ? 9.5 : 10.5,
     fontVariantNumeric: 'tabular-nums',
-    letterSpacing: '0.04em',
+    letterSpacing: isMobileViewport ? '0.02em' : '0.04em',
     whiteSpace: 'nowrap',
+    zIndex: 10,
   };
 
   const bezelControlsStyle: CSSProperties = {
     position: 'absolute',
     bottom: isCompact ? 'max(8px, env(safe-area-inset-bottom))' : 'max(12px, env(safe-area-inset-bottom))',
     left: isCompact ? 'max(8px, env(safe-area-inset-left))' : 'max(12px, env(safe-area-inset-left))',
-    maxWidth: showFullLegend && !isCompact ? 'calc(100% - 230px)' : 'calc(100% - 96px)',
+    maxWidth: isMobileViewport
+      ? 'calc(100% - 82px)'
+      : showFullLegend && !isCompact
+      ? 'calc(100% - 230px)'
+      : 'calc(100% - 96px)',
     display: 'flex',
-    flexWrap: 'wrap',
+    flexWrap: isMobileViewport ? 'nowrap' : 'wrap',
     alignItems: 'center',
-    gap: 6,
+    gap: isMobileViewport ? 3 : 6,
     pointerEvents: 'auto',
     zIndex: 10,
   };
@@ -3102,16 +3505,19 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     pointerEvents: 'none',
     display: 'flex',
     alignItems: 'center',
-    gap: isCompact ? 6 : 9,
-    padding: isCompact ? '4px 7px' : '5px 9px',
+    gap: isMobileViewport ? 4 : isCompact ? 6 : 9,
+    height: isMobileViewport ? 27 : undefined,
+    padding: isMobileViewport ? '0 6px' : isCompact ? '4px 7px' : '5px 9px',
     borderRadius: 6,
     backgroundColor: 'rgba(7, 10, 17, 0.84)',
     border: '1px solid rgba(255, 255, 255, 0.1)',
     backdropFilter: 'blur(12px)',
     WebkitBackdropFilter: 'blur(12px)',
-    fontSize: isCompact ? 8.5 : 9.5,
+    fontSize: isMobileViewport ? 8 : isCompact ? 8.5 : 9.5,
     color: '#94A3B8',
     fontVariantNumeric: 'tabular-nums',
+    whiteSpace: 'nowrap',
+    zIndex: 10,
   };
 
   const bezelButtonStyle = (
@@ -3137,19 +3543,21 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
       display: 'inline-flex',
       alignItems: 'center',
       justifyContent: 'center',
-      gap: 5,
-      minHeight: 32,
-      padding: isCompact ? '4px 8px' : '5px 10px',
+      gap: isMobileViewport ? 3.5 : 5,
+      minHeight: isMobileViewport ? 27 : 32,
+      height: isMobileViewport ? 27 : undefined,
+      padding: isMobileViewport ? '0 5px' : isCompact ? '4px 8px' : '5px 10px',
       borderRadius: 6,
       border: active ? activeBorder : '1px solid rgba(255, 255, 255, 0.1)',
       backgroundColor: active ? activeBg : 'rgba(7, 10, 17, 0.84)',
       color: active ? activeColor : '#CBD5E1',
       fontFamily: MONO_FONT,
-      fontSize: isCompact ? 9.5 : 10,
+      fontSize: isMobileViewport ? 8.5 : isCompact ? 9.5 : 10,
       fontWeight: 600,
       fontVariantNumeric: 'tabular-nums',
-      letterSpacing: '0.05em',
+      letterSpacing: isMobileViewport ? '0.03em' : '0.05em',
       whiteSpace: 'nowrap',
+      flexShrink: 0,
       cursor: 'pointer',
       touchAction: 'manipulation',
       backdropFilter: 'blur(12px)',
@@ -3159,8 +3567,8 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
   };
 
   const ledStyle = (active: boolean, color: string): CSSProperties => ({
-    width: 6,
-    height: 6,
+    width: isMobileViewport && !isPip ? 5 : 6,
+    height: isMobileViewport && !isPip ? 5 : 6,
     borderRadius: '50%',
     backgroundColor: active ? color : '#475569',
     boxShadow: active ? `0 0 6px ${color}` : 'none',
@@ -3187,7 +3595,7 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
     : {
         position: 'absolute',
         left: isCompact ? 8 : 12,
-        top: isCompact ? 42 : 58,
+        top: isMobileViewport ? 32 : isCompact ? 42 : 58,
         maxWidth: 'calc(100% - 24px)',
         pointerEvents: 'none',
         padding: '4px 9px',
@@ -3417,22 +3825,23 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
         {!isPip && (
           <>
             {/* Top-Left Scope Header */}
-            <div style={cornerTitleStyle}>
+            <div ref={topTitleRef} className="skydome-corner-title" style={cornerTitleStyle}>
               <div
                 style={{
                   display: 'flex',
                   alignItems: 'center',
-                  gap: 6,
-                  fontSize: isCompact ? 9.5 : 10.5,
+                  gap: isMobileViewport ? 5 : 6,
+                  fontSize: isMobileViewport ? 8.5 : isCompact ? 9.5 : 10.5,
                   fontWeight: 700,
-                  letterSpacing: '0.08em',
+                  letterSpacing: isMobileViewport ? '0.06em' : '0.08em',
                   color: '#E2E8F0',
+                  whiteSpace: 'nowrap',
                 }}
               >
                 <span style={ledStyle(true, '#22D3EE')} />
                 <span>POLAR SKY-DOME</span>
               </div>
-              {!isCompact && (
+              {!isCompact && !isMobileViewport && (
                 <div
                   style={{
                     fontSize: 9,
@@ -3450,12 +3859,13 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
             </div>
 
             {/* Top-Right Live Cursor AZ / EL / RNG Readout */}
-            <div style={readoutStyle}>
+            <div ref={topReadoutRef} className="skydome-readout" style={readoutStyle}>
               <span ref={cursorReadoutRef}>{DEFAULT_CURSOR_READOUT}</span>
             </div>
 
             {/* Bottom-Left Bezel Micro-Controls & Orientation Suite */}
             <div
+              ref={bezelControlsRef}
               className="skydome-bezel-controls"
               style={bezelControlsStyle}
               onPointerDown={(e) => e.stopPropagation()}
@@ -3493,18 +3903,28 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                     ? 'Overhead 2× lens (30°–90°) — click for Full Sky'
                     : 'Full Sky hemisphere (0°–90°) — click for Overhead 2×'
                 }
+                aria-label={skyDomeZoom === 'zenith' ? 'Switch to Full Sky' : 'Switch to Overhead 2x'}
                 style={bezelButtonStyle(skyDomeZoom === 'zenith')}
                 onClick={(e) => {
                   e.stopPropagation();
                   toggleSkyDomeZoom();
                 }}
               >
-                <span>{skyDomeZoom === 'zenith' ? 'OVERHEAD 2×' : 'FULL SKY'}</span>
+                <span>
+                  {isMobileViewport
+                    ? skyDomeZoom === 'zenith'
+                      ? '2×'
+                      : 'FULL'
+                    : skyDomeZoom === 'zenith'
+                    ? 'OVERHEAD 2×'
+                    : 'FULL SKY'}
+                </span>
               </button>
               <button
                 type="button"
                 data-testid="skydome-compass-toggle"
                 aria-pressed={domeCompassActive}
+                aria-label="Toggle Device Compass"
                 title={
                   domeCompassActive
                     ? 'Disable live device compass'
@@ -3528,12 +3948,15 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                   )}
                 />
                 <span aria-hidden="true">🧭</span>
-                <span>COMPASS</span>
+                {!isMobileViewport && <span>COMPASS</span>}
               </button>
               <button
                 type="button"
                 data-testid="skydome-lock-toggle"
                 aria-pressed={domeRotationLocked}
+                aria-label={
+                  domeRotationLocked ? 'Unlock Sky-Dome Rotation' : 'Lock Sky-Dome Rotation'
+                }
                 title={
                   domeRotationLocked
                     ? 'Rotation locked — click to unlock drag & compass rotation'
@@ -3546,7 +3969,9 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                 }}
               >
                 <span aria-hidden="true">{domeRotationLocked ? '🔒' : '🔓'}</span>
-                <span>{domeRotationLocked ? 'LOCKED' : 'UNLOCKED'}</span>
+                {!isMobileViewport && (
+                  <span>{domeRotationLocked ? 'LOCKED' : 'UNLOCKED'}</span>
+                )}
               </button>
               {showNorthReset && (
                 <button
@@ -3559,18 +3984,20 @@ export function PolarSkyDome({ className }: PolarSkyDomeProps) {
                     resetDomeNorth();
                   }}
                 >
-                  <span>{`HDG ${headingStr}° · N▲`}</span>
+                  <span>
+                    {isMobileViewport ? `${headingStr}° N▲` : `HDG ${headingStr}° · N▲`}
+                  </span>
                 </button>
               )}
             </div>
 
             {/* Bottom-Right Horizon & Orbital Legend */}
-            <div className="skydome-legend" style={legendStyle}>
+            <div ref={legendRef} className="skydome-legend" style={legendStyle}>
               <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                 <span style={{ width: 8, height: 2, backgroundColor: '#22D3EE', display: 'inline-block' }} />
                 <span>{skyDomeZoom === 'zenith' ? '30° LIMB' : '0° HRZ'}</span>
               </span>
-              {showFullLegend && !isCompact && (
+              {showFullLegend && !isCompact && !isMobileViewport && (
                 <>
                   <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <span style={ledStyle(true, SATELLITE_SUNLIT_COLOR)} />
