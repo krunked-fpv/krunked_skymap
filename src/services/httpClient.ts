@@ -1,3 +1,26 @@
+import { resolveAdaptiveTimeoutMs } from './teslaCompat';
+
+const DEFAULT_FETCH_TIMEOUT_MS = 5000;
+const externalAbortErrors = new WeakSet<object>();
+
+export function isExternalAbortError(error: unknown): boolean {
+  return Boolean(error && typeof error === 'object' && externalAbortErrors.has(error));
+}
+
+function isCrossOriginUrl(url: string): boolean {
+  if (!/^https?:\/\//i.test(url)) {
+    return false;
+  }
+  if (typeof window === 'undefined' || !window.location?.origin) {
+    return true;
+  }
+  try {
+    return new URL(url).origin !== window.location.origin;
+  } catch {
+    return true;
+  }
+}
+
 export class HttpError extends Error {
   readonly status: number;
   readonly url: string;
@@ -33,22 +56,27 @@ export interface FetchTimeoutOptions {
 
 /**
  * Execute fetch() guarded by an AbortController timeout and optional external AbortSignal.
+ * Defaults to `cache: 'no-store'` (and `credentials: 'omit'` for cross-origin live APIs)
+ * without injecting custom request headers that would trigger CORS OPTIONS preflights.
  * Throws HttpError on non-2xx responses so callers handle failures uniformly.
  */
 export async function fetchWithTimeout(
   url: string,
   options: FetchTimeoutOptions = {}
 ): Promise<Response> {
-  const timeoutMs = options.timeoutMs ?? 5000;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(DEFAULT_FETCH_TIMEOUT_MS);
   const controller = new AbortController();
   const externalSignal = options.signal;
+  let abortedExternally = false;
 
   const onExternalAbort = (): void => {
+    abortedExternally = true;
     controller.abort(externalSignal?.reason ?? new DOMException('Aborted', 'AbortError'));
   };
 
   if (externalSignal) {
     if (externalSignal.aborted) {
+      abortedExternally = true;
       controller.abort(externalSignal.reason ?? new DOMException('Aborted', 'AbortError'));
     } else {
       externalSignal.addEventListener('abort', onExternalAbort, { once: true });
@@ -59,12 +87,18 @@ export async function fetchWithTimeout(
     controller.abort(new DOMException(`Request timed out after ${timeoutMs}ms`, 'AbortError'));
   }, timeoutMs);
 
+  const fetchInit: RequestInit = {
+    cache: 'no-store',
+    ...(isCrossOriginUrl(url) ? { credentials: 'omit' as const } : {}),
+    ...options.init,
+    signal: controller.signal,
+  };
+  if (options.headers !== undefined) {
+    fetchInit.headers = options.headers;
+  }
+
   try {
-    const response = await fetch(url, {
-      ...options.init,
-      headers: options.headers,
-      signal: controller.signal,
-    });
+    const response = await fetch(url, fetchInit);
 
     if (!response.ok) {
       let preview: string | undefined;
@@ -83,6 +117,11 @@ export async function fetchWithTimeout(
     }
 
     return response;
+  } catch (err) {
+    if (abortedExternally && err && typeof err === 'object') {
+      externalAbortErrors.add(err);
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
     if (externalSignal) {
@@ -165,6 +204,14 @@ export class TokenBucketRateLimiter {
       };
       this.buckets.set(key, fresh);
       return fresh;
+    }
+
+    if (now < existing.lastRefillMs) {
+      existing.lastRefillMs = now;
+    }
+    if (Number.isFinite(existing.lastConsumedMs) && now < existing.lastConsumedMs) {
+      existing.lastConsumedMs = -Infinity;
+      existing.tokens = this.capacity;
     }
 
     if (this.minIntervalMs > 0 && now > existing.lastRefillMs) {
@@ -276,7 +323,7 @@ export class CircuitBreaker {
     const entry = this.getEntry(key);
     if (entry.state === 'open') {
       const elapsed = this.nowFn() - entry.openedAtMs;
-      if (elapsed >= this.resetTimeoutMs) {
+      if (elapsed >= this.resetTimeoutMs || elapsed < 0) {
         entry.state = 'half-open';
         entry.halfOpenInFlight = 0;
       }
@@ -347,6 +394,12 @@ export class CircuitBreaker {
       this.recordSuccess(key);
       return result;
     } catch (error) {
+      if (isExternalAbortError(error)) {
+        if (state === 'half-open') {
+          entry.halfOpenInFlight = Math.max(0, entry.halfOpenInFlight - 1);
+        }
+        throw error;
+      }
       this.recordFailure(key, error);
       throw error;
     }

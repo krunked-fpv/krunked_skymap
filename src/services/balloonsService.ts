@@ -22,6 +22,9 @@ import {
   isHtmlPayload,
   isLocalDevOrLanRuntime,
 } from './httpClient';
+import { isTeslaBrowser, resolveAdaptiveTimeoutMs } from './teslaCompat';
+
+const IDB_OPERATION_TIMEOUT_MS = 2500;
 
 const MAX_TRAIL_POINTS = 24;
 const SONDE_TIMEOUT_MS = 5000;
@@ -529,6 +532,15 @@ async function openWindborneDb(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return null;
 
   return new Promise<IDBDatabase | null>((resolve) => {
+    let settled = false;
+    const finish = (val: IDBDatabase | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const req = indexedDB.open(WINDBORNE_DB_NAME, 1);
       req.onupgradeneeded = () => {
@@ -537,11 +549,21 @@ async function openWindborneDb(): Promise<IDBDatabase | null> {
           db.createObjectStore(WINDBORNE_STORE_NAME, { keyPath: 'key' });
         }
       };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => resolve(null);
-      req.onblocked = () => resolve(null);
+      req.onsuccess = () => {
+        if (settled) {
+          try {
+            req.result.close();
+          } catch {
+            // Ignore close failure
+          }
+          return;
+        }
+        finish(req.result);
+      };
+      req.onerror = () => finish(null);
+      req.onblocked = () => finish(null);
     } catch {
-      resolve(null);
+      finish(null);
     }
   });
 }
@@ -558,27 +580,37 @@ async function readWindborneCacheFromIdb(): Promise<WindborneCacheBundle | null>
   if (!db) return null;
 
   return new Promise<WindborneCacheBundle | null>((resolve) => {
+    let settled = false;
+    const finish = (val: WindborneCacheBundle | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        db.close();
+      } catch {
+        // Ignore close failure
+      }
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const tx = db.transaction(WINDBORNE_STORE_NAME, 'readonly');
       const store = tx.objectStore(WINDBORNE_STORE_NAME);
       const req = store.get(WINDBORNE_CACHE_KEY);
       req.onsuccess = () => {
         const val = req.result as WindborneCacheBundle | undefined;
-        db.close();
         if (val && typeof val.fetchedAtMs === 'number' && Array.isArray(val.t0)) {
           memoryWindborneCache = val;
-          resolve(val);
+          finish(val);
         } else {
-          resolve(null);
+          finish(null);
         }
       };
-      req.onerror = () => {
-        db.close();
-        resolve(null);
-      };
+      req.onerror = () => finish(null);
+      tx.onabort = () => finish(null);
     } catch {
-      db.close();
-      resolve(null);
+      finish(null);
     }
   });
 }
@@ -591,25 +623,29 @@ async function writeWindborneCacheToIdb(bundle: WindborneCacheBundle): Promise<v
   if (!db) return;
 
   await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        db.close();
+      } catch {
+        // Ignore close failure
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, IDB_OPERATION_TIMEOUT_MS);
+
     try {
       const tx = db.transaction(WINDBORNE_STORE_NAME, 'readwrite');
       const store = tx.objectStore(WINDBORNE_STORE_NAME);
       store.put(bundle);
-      tx.oncomplete = () => {
-        db.close();
-        resolve();
-      };
-      tx.onerror = () => {
-        db.close();
-        resolve();
-      };
-      tx.onabort = () => {
-        db.close();
-        resolve();
-      };
+      tx.oncomplete = finish;
+      tx.onerror = finish;
+      tx.onabort = finish;
     } catch {
-      db.close();
-      resolve();
+      finish();
     }
   });
 }
@@ -628,14 +664,16 @@ async function fetchWindBorneConstellation(
   options: BalloonsFetchOptions
 ): Promise<WindBorneFetchResult> {
   const nowMs = options.nowMs ?? Date.now();
-  const timeoutMs = options.timeoutMs ?? WINDBORNE_TIMEOUT_MS;
-  const relayTimeoutMs = options.timeoutMs ?? WINDBORNE_RELAY_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(WINDBORNE_TIMEOUT_MS);
+  const relayTimeoutMs =
+    options.timeoutMs ?? resolveAdaptiveTimeoutMs(WINDBORNE_RELAY_TIMEOUT_MS);
 
   const cached = await readWindborneCacheFromIdb();
   const hasFreshCache =
     Boolean(cached) &&
     Array.isArray(cached!.t0) &&
     cached!.t0.length > 0 &&
+    nowMs >= cached!.fetchedAtMs - 60_000 &&
     nowMs - cached!.fetchedAtMs < WINDBORNE_TTL_MS;
 
   if (!options.force && hasFreshCache && cached) {
@@ -731,7 +769,10 @@ async function fetchWindBorneConstellation(
 
   // Tier 2a: Zero-preflight CORS simple-GET relay via r.jina.ai (no custom headers!)
   if (windborneCircuitBreaker.canExecute('windborne-relay')) {
-    const bucket5m = Math.floor(nowMs / WINDBORNE_TTL_MS);
+    const bucket5m =
+      options.force || options.resetBreakers || isTeslaBrowser()
+        ? nowMs
+        : Math.floor(nowMs / WINDBORNE_TTL_MS);
     const fetchRelayedSnapshot = async (
       fileName: string
     ): Promise<{ arr: unknown[]; publishedTimeMs?: number }> => {
@@ -865,7 +906,7 @@ async function fetchWindBorneConstellation(
   // Tier 3: Fallback build-time seed ONLY when live + relay fail and IDB/memory cache is empty or expired
   try {
     const seedRaw = await fetchJsonWithTimeout<unknown>('./data/windborne-balloons.json', {
-      timeoutMs: 4000,
+      timeoutMs: resolveAdaptiveTimeoutMs(4000),
       signal: options.signal,
     });
     if (seedRaw && typeof seedRaw === 'object' && !Array.isArray(seedRaw)) {
@@ -948,7 +989,7 @@ export async function fetchBalloons(
   const includeSondeHub = options.includeSondeHub ?? true;
 
   const prevMap = toPrevBalloonMap(prevEntities);
-  const timeoutMs = options.timeoutMs ?? SONDE_TIMEOUT_MS;
+  const timeoutMs = options.timeoutMs ?? resolveAdaptiveTimeoutMs(SONDE_TIMEOUT_MS);
   const radiusM = Math.max(10_000, Math.round(radiusKm * 1000));
   const sondeDistanceM =
     scope === 'global' ? Math.max(radiusKm, 600) * 1000 : radiusM;
@@ -1086,7 +1127,7 @@ export async function fetchBalloons(
         const widenedPayload = await balloonsCircuitBreaker.execute(
           () =>
             fetchJsonWithTimeout<unknown>(widenedUrl, {
-              timeoutMs: 3500,
+              timeoutMs: resolveAdaptiveTimeoutMs(3500),
               signal: options.signal,
             }),
           'sondehub-widened'

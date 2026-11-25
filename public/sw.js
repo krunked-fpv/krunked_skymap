@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'krunked-skymap-v5';
+const CACHE_VERSION = 'krunked-skymap-v6';
 
 const PRECACHE_URLS = [
   './',
@@ -51,7 +51,29 @@ function shouldBypassCache(request, url) {
 
 async function networkFirst(request) {
   try {
-    const networkResponse = await fetch(request);
+    const fetchTarget =
+      typeof request === 'string'
+        ? request
+        : request && typeof request.url === 'string'
+          ? request.url
+          : request;
+    const networkResponse = await fetch(fetchTarget, {
+      cache: 'no-store',
+      credentials: 'same-origin',
+    });
+
+    const isRedirectedNavigation =
+      Boolean(networkResponse && networkResponse.redirected) &&
+      Boolean(request && (request.mode === 'navigate' || request.destination === 'document'));
+
+    const responseToReturn = isRedirectedNavigation
+      ? new Response(networkResponse.body, {
+          status: networkResponse.status,
+          statusText: networkResponse.statusText,
+          headers: networkResponse.headers,
+        })
+      : networkResponse;
+
     if (
       networkResponse &&
       networkResponse.status === 200 &&
@@ -59,19 +81,23 @@ async function networkFirst(request) {
     ) {
       try {
         const cache = await caches.open(CACHE_VERSION);
-        await cache.put(request, networkResponse.clone());
+        await cache.put(request, responseToReturn.clone());
       } catch {
         // Ignore Cache Storage quota or write errors so live response still returns
       }
     }
-    return networkResponse;
+    return responseToReturn;
   } catch {
-    const cachedResponse = await caches.match(request);
+    const cachedResponse =
+      (await caches.match(request)) ||
+      (request && typeof request.url === 'string'
+        ? await caches.match(request.url, { ignoreSearch: true })
+        : undefined);
     if (cachedResponse) {
       return cachedResponse;
     }
 
-    if (request.mode === 'navigate' || request.destination === 'document') {
+    if (request && (request.mode === 'navigate' || request.destination === 'document')) {
       const fallbackShell =
         (await caches.match('./index.html')) ||
         (await caches.match('./')) ||
@@ -91,7 +117,7 @@ self.addEventListener('install', (event) => {
       .open(CACHE_VERSION)
       .then((cache) =>
         Promise.allSettled(
-          PRECACHE_URLS.map((url) => cache.add(new Request(url, { cache: 'reload' })))
+          PRECACHE_URLS.map((url) => cache.add(new Request(url, { cache: 'no-store' })))
         )
       )
       .then(() => self.skipWaiting())
@@ -111,6 +137,23 @@ self.addEventListener('activate', (event) => {
       )
       .then(() => self.clients.claim())
   );
+});
+
+self.addEventListener('message', (event) => {
+  const data = event && event.data;
+  if (!data || typeof data !== 'object') {
+    return;
+  }
+  if (data.type === 'SKIP_WAITING' && typeof self.skipWaiting === 'function') {
+    self.skipWaiting();
+  } else if (data.type === 'PURGE_CACHES') {
+    event.waitUntil(
+      caches
+        .keys()
+        .then((keys) => Promise.all(keys.map((key) => caches.delete(key))))
+        .catch(() => {})
+    );
+  }
 });
 
 self.addEventListener('fetch', (event) => {

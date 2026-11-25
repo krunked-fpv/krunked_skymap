@@ -2,6 +2,9 @@
 <html lang="en" style="background:#06090F;color-scheme:dark;">
   <head>
     <meta charset="UTF-8" />
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="color-scheme" content="dark" />
     <meta name="theme-color" content="#06090F" />
@@ -41,14 +44,75 @@
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
     <script>
-      if (
-        'serviceWorker' in navigator &&
-        (window.location.protocol === 'https:' || window.location.protocol === 'http:')
-      ) {
-        window.addEventListener('load', function () {
-          navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(function () {});
-        });
-      }
+      (function () {
+        if (window.location.protocol !== 'https:' && window.location.protocol !== 'http:') {
+          return;
+        }
+        var ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+        var isTesla = /(?:Tesla\/|QtCarBrowser)/i.test(ua);
+        if (isTesla) {
+          var purgeTasks = [];
+          if (
+            'serviceWorker' in navigator &&
+            typeof navigator.serviceWorker.getRegistrations === 'function'
+          ) {
+            purgeTasks.push(
+              navigator.serviceWorker
+                .getRegistrations()
+                .then(function (regs) {
+                  return Promise.all(
+                    regs.map(function (reg) {
+                      return reg.unregister();
+                    })
+                  );
+                })
+                .catch(function () {})
+            );
+          }
+          if (typeof caches !== 'undefined' && typeof caches.keys === 'function') {
+            purgeTasks.push(
+              caches
+                .keys()
+                .then(function (keys) {
+                  return Promise.all(
+                    keys.map(function (key) {
+                      return caches.delete(key);
+                    })
+                  );
+                })
+                .catch(function () {})
+            );
+          }
+          var hadController = Boolean(
+            'serviceWorker' in navigator && navigator.serviceWorker.controller
+          );
+          Promise.all(purgeTasks).then(function () {
+            if (!hadController) return;
+            try {
+              if (!window.sessionStorage.getItem('krunked_tesla_sw_purged')) {
+                window.sessionStorage.setItem('krunked_tesla_sw_purged', '1');
+                var nextUrl = new URL(window.location.href);
+                nextUrl.searchParams.set('_refresh', String(Date.now()));
+                window.location.replace(nextUrl.toString());
+              }
+            } catch (e) {}
+          });
+          return;
+        }
+        if ('serviceWorker' in navigator) {
+          window.__krunkedSwBootstrapped = true;
+          window.addEventListener('load', function () {
+            navigator.serviceWorker
+              .register('./sw.js', { scope: './', updateViaCache: 'none' })
+              .then(function (reg) {
+                if (reg && typeof reg.update === 'function') {
+                  reg.update().catch(function () {});
+                }
+              })
+              .catch(function () {});
+          });
+        }
+      })();
     </script>
   </body>
 </html>
