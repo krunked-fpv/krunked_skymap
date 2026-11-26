@@ -22,3 +22,5 @@ Thumbs.db
 desktop.ini
 *.swp
 *.swo
+*.md
+!README.md
