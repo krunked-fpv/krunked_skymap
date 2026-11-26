@@ -24,3 +24,4 @@ desktop.ini
 *.swo
 *.md
 !README.md
+dna/
